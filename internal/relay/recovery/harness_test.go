@@ -251,6 +251,7 @@ func runScenarios(t *testing.T, newEnv func(t *testing.T) env) {
 		{"StagingWithRealSidecarIsDeleted", testStagingWithRealSidecar},
 		{"StagingAloneIsDeleted", testStagingAlone},
 		{"DescriptorMismatchLeavesVideoWithoutSidecar", testMismatch},
+		{"PromoteMismatchLeavesVideoWithoutSidecar", testPromoteMismatch},
 		{"EmptyUploadDiscardsThePair", testEmptyUpload},
 		{"YoungerThanOlderThanIsUntouched", testYounger},
 		{"OnlyTodayAndYesterdayOfListedCameras", testScope},
@@ -402,8 +403,26 @@ func testMismatch(t *testing.T, e env) {
 	if got := e.staged(t); len(got) != 0 {
 		t.Errorf("staging sidecar not deleted: %q", got)
 	}
-	if got := e.visible(t, "clips"); len(got) != 0 {
-		t.Errorf("visible = %q, want none (video without sidecar is invisible)", got)
+	// A video is visible iff its sidecar exists (Contract §7.3): the listing
+	// holds the video and nothing else, so no reader will show it.
+	if got, want := e.visible(t, "clips"), []string{c.keys.Video}; !slices.Equal(got, want) {
+		t.Errorf("listing = %q, want only the sidecar-less video %q", got, want)
+	}
+}
+
+func testPromoteMismatch(t *testing.T, e env) {
+	c := newClip(t, camera, hourAgo(), 14)
+	e.putStaging(t, c, "other-cam")
+	e.commitVideo(t, c, camera)
+	e.age(t, c.keys.Video, c.keys.StagingSidecar)
+
+	wantReport(t, e.mustRun(t, camera), recovery.Report{Orphaned: 1})
+
+	if !e.exists(t, c.keys.Video) || e.exists(t, c.keys.Sidecar) {
+		t.Error("want the committed video left in place without a sidecar")
+	}
+	if got := e.staged(t); len(got) != 0 {
+		t.Errorf("staging sidecar not deleted: %q", got)
 	}
 }
 

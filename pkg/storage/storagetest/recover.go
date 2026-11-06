@@ -259,7 +259,7 @@ func testListStaging(t *testing.T, p storage.Provider, r storage.Recoverer, cras
 	if got, want := keys("clips/front/2026/11/06"), []string{mine}; !slices.Equal(got, want) {
 		t.Errorf("ListStaging(day) = %q, want %q", got, want)
 	}
-	if got, want := keys(""), []string{mineOther, mine, other}; !slices.Equal(got, want) {
+	if got, want := keys(""), []string{other, mineOther, mine}; !slices.Equal(got, want) {
 		t.Errorf("ListStaging(\"\") = %q, want %q", got, want)
 	}
 	if got := keys("clips/missing"); len(got) != 0 {

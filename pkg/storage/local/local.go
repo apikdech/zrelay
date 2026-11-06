@@ -578,6 +578,30 @@ func (d *Driver) ListIncomplete(ctx context.Context, prefix string, olderThan ti
 	return out, nil
 }
 
+// ListStaging implements storage.Recoverer: every staging sidecar
+// ".<name>.json.part" under prefix (by whole path element). List omits these
+// dot-names; ".<name>.zrec.part" streams and other dot-files are not returned.
+func (d *Driver) ListStaging(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	if err := cleanPrefix(prefix); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var out []storage.ObjectInfo
+	err := d.walk(ctx, prefix, func(key string, fi fs.FileInfo) bool {
+		_, name := splitKey(key)
+		if x := finalName(name); strings.HasSuffix(x, ".json") && len(x) > len(".json") {
+			out = append(out, objectInfo(key, fi))
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func splitKey(key string) (dir, name string) {
 	i := strings.LastIndexByte(key, '/')
 	if i < 0 {
