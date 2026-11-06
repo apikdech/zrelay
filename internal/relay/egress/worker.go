@@ -60,7 +60,17 @@ func (e *Egress) runJob(j *job) {
 		e.abort(j, ow, staged, err)
 		return
 	}
-	e.complete(jctx, j)
+	// complete runs on the hard-stop context, not on jctx: an eviction that
+	// raced a Commit the server nevertheless completed must not cost the clip
+	// its final sidecar (the video is committed and visible after recovery).
+	// An evicted stream bounds it in real time, since nothing else ends it.
+	cctx := e.hctx
+	if c.Stream.isEvicted() {
+		var ccancel context.CancelFunc
+		cctx, ccancel = context.WithTimeout(e.hctx, abortTimeout)
+		defer ccancel()
+	}
+	e.complete(cctx, j)
 }
 
 // upload runs the protocol up to and including the video commit.
@@ -101,6 +111,7 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 			return rerr // evicted
 		}
 		if n > 0 {
+			before := w.DurableOffset()
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				fails++
 				e.failure(werr)
@@ -114,10 +125,18 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 				c.Stream.Release(w.DurableOffset())
 				continue
 			}
-			fails = 0
-			e.success()
 			off += int64(n)
-			c.Stream.Release(w.DurableOffset())
+			// A Write that only buffered in the driver (the S3 driver copies
+			// into its part buffer and touches the network once per part)
+			// says nothing about storage. Only durable progress proves a
+			// request reached it, so only that resets the breaker count and
+			// the backoff; otherwise buffering Writes between failed part
+			// uploads would mask an outage and spin on UploadPart.
+			if durable := w.DurableOffset(); durable > before {
+				fails = 0
+				e.success()
+				c.Stream.Release(durable)
+			}
 		}
 		if rerr == io.EOF {
 			break
@@ -132,10 +151,13 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 	if err := e.persist(ctx, w.Commit); err != nil {
 		return err
 	}
+	// The video is durable: mark it first so the accountant skips the clip,
+	// then release its tail so it no longer counts as backlog. Neither the
+	// accountant nor Shutdown evicts or reports the clip while the final
+	// sidecar is still being stored. (An eviction that lands while Commit is
+	// in flight is a legitimate drop at that moment; see runJob.)
+	c.Committed.Store(true)
 	j.committed.Store(true)
-	// The video is durable: its tail no longer counts as backlog, so the
-	// accountant can neither evict nor report the clip while the final
-	// sidecar is still being stored.
 	c.Stream.Release(off)
 	return nil
 }

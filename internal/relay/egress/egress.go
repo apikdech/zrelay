@@ -111,6 +111,12 @@ func (e *Egress) approxMs(c *Clip) int64 {
 }
 
 func (e *Egress) reportDrop(c *Clip, reason string) {
+	if c.Committed.Load() {
+		// The video was committed before the drop was recorded: recovery
+		// promotes it, so coverage must not report a gap.
+		slog.Warn("egress: eviction raced a commit; clip kept", "camera", c.Camera, "key", c.Keys.Video, "reason", reason)
+		return
+	}
 	slog.Warn("egress: clip dropped", "camera", c.Camera, "key", c.Keys.Video, "reason", reason)
 	if e.cfg.OnDrop != nil {
 		e.cfg.OnDrop(c.Camera, reason, e.approxMs(c))

@@ -60,8 +60,16 @@ type fakeStore struct {
 	resumeErrs []error
 	// commitErrs are returned, one per Commit call, before Commit succeeds.
 	commitErrs []error
+	// partSize > 0 makes the writers buffer like the S3 driver: a Write only
+	// copies into memory and touches "the network" when a whole part fills.
+	// That upload fails while down is set, which breaks the writer until
+	// Resume (local, always succeeds). Bytes become durable per part.
+	partSize int
+	// commitIgnoresCtx makes a gated Commit succeed even if ctx ended while it
+	// waited (the server completed the upload but the caller gave up).
+	commitIgnoresCtx bool
 
-	writeCalls, writeErrs, resumes int
+	writeCalls, writeErrs, resumes, partAttempts int
 }
 
 func newFakeStore() *fakeStore {
@@ -89,6 +97,9 @@ func (s *fakeStore) count(op string) int {
 }
 
 func (s *fakeStore) PutSmall(ctx context.Context, key string, data []byte, contentType string) error {
+	if err := ctx.Err(); err != nil { // a real driver does not send on a dead context
+		return err
+	}
 	s.mu.Lock()
 	if gate := s.finalGate; gate != nil && !strings.Contains(key, "/.") {
 		s.mu.Unlock()
@@ -134,6 +145,8 @@ type fakeObj struct {
 	key        string
 	data       []byte
 	durable    int
+	pending    []byte // buffered part (partSize mode)
+	broken     bool   // a part upload failed; Resume before writing again
 	createGoid uint64
 	abortGoid  uint64
 	aborted    bool
@@ -144,6 +157,9 @@ func (o *fakeObj) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writeCalls++
+	if s.partSize > 0 {
+		return o.writeBuffered(p)
+	}
 	if s.down {
 		s.writeErrs++
 		return 0, errors.New("storage down")
@@ -158,6 +174,27 @@ func (o *fakeObj) Write(p []byte) (int, error) {
 	if s.durableStep > 0 {
 		o.durable = len(o.data) - len(o.data)%s.durableStep
 	} else {
+		o.durable = len(o.data)
+	}
+	return len(p), nil
+}
+
+// writeBuffered mimics the S3 objectWriter; s.mu is held.
+func (o *fakeObj) writeBuffered(p []byte) (int, error) {
+	s := o.s
+	if o.broken {
+		return 0, errors.New("needs resume")
+	}
+	o.pending = append(o.pending, p...)
+	for len(o.pending) >= s.partSize {
+		s.partAttempts++
+		if s.down {
+			s.writeErrs++
+			o.broken = true
+			return len(p), errors.New("storage down")
+		}
+		o.data = append(o.data, o.pending[:s.partSize]...)
+		o.pending = o.pending[s.partSize:]
 		o.durable = len(o.data)
 	}
 	return len(p), nil
@@ -179,6 +216,7 @@ func (o *fakeObj) Resume(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	o.data = o.data[:o.durable] // the driver repairs its own position
+	o.pending, o.broken = nil, false
 	return int64(o.durable), nil
 }
 
@@ -198,12 +236,17 @@ func (o *fakeObj) Commit(ctx context.Context) error {
 		select {
 		case <-gate:
 		case <-ctx.Done():
-			return ctx.Err()
+			if !s.commitIgnoresCtx {
+				return ctx.Err()
+			}
+			<-gate
 		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("commit", o.key)
+	o.data = append(o.data, o.pending...)
+	o.pending = nil
 	o.durable = len(o.data)
 	s.objects[o.key] = bytes.Clone(o.data)
 	return nil
@@ -753,7 +796,8 @@ func TestWriteFailuresBackOff(t *testing.T) {
 }
 
 // A committed clip is no longer backlog: while its final sidecar is blocked,
-// another clip overflowing the limit must not evict it.
+// another clip overflowing the limit on its own must not evict it. The
+// overflow forces the finalization of the overflowing clip instead.
 func TestCommittedClipSurvivesBacklogOverflow(t *testing.T) {
 	st := newFakeStore()
 	st.durableStep = 4096 // the tail below one step stays buffered until Commit
@@ -766,7 +810,12 @@ func TestCommittedClipSurvivesBacklogOverflow(t *testing.T) {
 	r.clk.Advance(time.Second)
 
 	b := r.begin("back", "B")
-	b.write(t, make([]byte, 500)) // 500 <= 1000 once A no longer counts
+	b.write(t, make([]byte, 1500)) // over the 1000-byte limit on its own
+	eventually(t, "B force-finalized", func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return len(r.forced) == 1 && r.forced[0] == "back"
+	})
 	time.Sleep(30 * time.Millisecond)
 	if ds := r.dropList(); len(ds) != 0 {
 		t.Fatalf("drops = %+v, want none: A is already committed", ds)
@@ -783,6 +832,9 @@ func TestCommittedClipSurvivesBacklogOverflow(t *testing.T) {
 		return string(st.small[k.Sidecar]) == `{"final":"A"}`
 	})
 	eventually(t, "A's staging delete", func() bool { return st.count("delete") == 1 })
+	if ds := r.dropList(); len(ds) != 0 {
+		t.Fatalf("drops = %+v, want none", ds)
+	}
 }
 
 // The upload vanished (NotFound on Resume) while the stream still holds every
@@ -976,5 +1028,247 @@ func TestCommitNotFoundRestartsFromStream(t *testing.T) {
 	}
 	if ds := r.dropList(); len(ds) != 0 {
 		t.Fatalf("drops = %+v, want none", ds)
+	}
+}
+
+// With the S3 driver's buffering behaviour a Write that only copies into the
+// part buffer reaches no storage and says nothing about its health. During an
+// outage the part-filling Write fails, the following buffering Writes succeed
+// locally, and none of that may reset the breaker or the backoff: the breaker
+// opens after FailureThreshold part-upload failures and the worker parks.
+func TestBufferedWritesDoNotMaskOutage(t *testing.T) {
+	st := newFakeStore()
+	st.partSize = 4 * copyBufSize
+	st.down = true
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	c.write(t, make([]byte, 16*copyBufSize))
+
+	advanceUntil(t, r.clk, "breaker to open from part-upload failures", func() bool {
+		s, _ := r.br.State()
+		return s == Open
+	})
+	time.Sleep(30 * time.Millisecond)
+	st.mu.Lock()
+	parked := st.partAttempts
+	st.mu.Unlock()
+	if parked != 5 {
+		t.Fatalf("part uploads before the breaker opened = %d, want FailureThreshold (5)", parked)
+	}
+	for range 20 {
+		r.clk.Advance(2 * time.Second)
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(30 * time.Millisecond)
+	st.mu.Lock()
+	got := st.partAttempts
+	st.mu.Unlock()
+	if got != parked {
+		t.Fatalf("worker kept uploading parts while the breaker was open: %d -> %d", parked, got)
+	}
+	if got := r.e.BacklogBytes(); got != 16*copyBufSize {
+		t.Fatalf("BacklogBytes = %d, want the whole clip to stay buffered", got)
+	}
+	r.cancel()
+	select {
+	case <-r.runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+}
+
+// Part-upload attempts are paced by backoff on the clock, not retried in a
+// tight loop, even though the buffering Writes between them succeed.
+func TestBufferedWritesBackOffPartUploads(t *testing.T) {
+	st := newFakeStore()
+	st.partSize = 4 * copyBufSize
+	st.down = true
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	c.write(t, make([]byte, 16*copyBufSize))
+	eventually(t, "first failed part upload", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.partAttempts >= 1
+	})
+	time.Sleep(50 * time.Millisecond) // without backoff this spins thousands of times
+	st.mu.Lock()
+	n := st.partAttempts
+	st.mu.Unlock()
+	if n > 2 {
+		t.Fatalf("%d part uploads in 50 ms of real time without the clock advancing: no backoff", n)
+	}
+}
+
+// The S3-like writer works when storage is healthy: the object equals the
+// stream and nothing is dropped.
+func TestBufferedWritesCommitWhenHealthy(t *testing.T) {
+	st := newFakeStore()
+	st.partSize = 4 * copyBufSize
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	payload := randBytes(10*copyBufSize+123, 21)
+	c.write(t, payload)
+	c.finish()
+	eventually(t, "commit", func() bool { return st.count("commit") == 1 })
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !bytes.Equal(st.objects[c.pc.Keys.Video], payload) {
+		t.Fatal("object differs from the stream")
+	}
+}
+
+// Eviction can race a Commit that the server nevertheless completes (the
+// caller's context is cancelled but CompleteMultipartUpload went through). The
+// video is committed, so the final sidecar must still be stored and the
+// staging sidecar removed, or recovery would later promote a clip that is
+// still waiting for its final sidecar.
+func TestCommitSucceedsDespiteEvictionStillStoresFinalSidecar(t *testing.T) {
+	st := newFakeStore()
+	st.durableStep = 1 << 30 // nothing durable before Commit
+	st.commitGate = make(chan struct{})
+	st.commitIgnoresCtx = true
+	r := newEgressRig(t, 1, 1<<30, st)
+	a := r.begin("front", "A")
+	a.write(t, make([]byte, 100))
+	a.finish()
+	eventually(t, "A's Commit in flight", func() bool { return st.obj(a.pc.Keys.Video) != nil })
+	time.Sleep(30 * time.Millisecond)
+	r.e.mu.Lock()
+	var clip *Clip
+	for c := range r.e.jobs {
+		clip = c
+	}
+	r.e.mu.Unlock()
+	clip.Stream.Evict() // the accountant evicts it: Commit's ctx is cancelled
+	time.Sleep(30 * time.Millisecond)
+	close(st.commitGate)
+
+	k := a.pc.Keys
+	eventually(t, "final sidecar of the committed clip", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return string(st.small[k.Sidecar]) == `{"final":"A"}`
+	})
+	eventually(t, "staging delete", func() bool { return st.count("delete") == 1 })
+	eventually(t, "job finished", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		return len(r.e.jobs) == 0
+	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.committed) != 1 {
+		t.Fatalf("OnCommitted fired %d times, want 1", len(r.committed))
+	}
+}
+
+// A staging sidecar that cannot be deleted never un-commits the clip: the
+// video and the final sidecar stay, OnCommitted fired, and the job finishes
+// (recovery reaps the staging sidecar).
+func TestStagingDeleteKeepsFailingClipStaysCommitted(t *testing.T) {
+	st := newFakeStore()
+	st.deleteErr = errTransient
+	r := newEgressRigOpts(t, 1, 1<<30, st, false)
+	c := r.begin("front", "A")
+	payload := []byte("payload")
+	c.write(t, payload)
+	c.finish()
+	advanceUntil(t, r.clk, "job finished", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		return len(r.e.jobs) == 0
+	})
+	k := c.pc.Keys
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !bytes.Equal(st.objects[k.Video], payload) {
+		t.Fatal("video missing")
+	}
+	if string(st.small[k.Sidecar]) != `{"final":"A"}` {
+		t.Fatal("final sidecar missing")
+	}
+	if _, ok := st.small[k.StagingSidecar]; !ok {
+		t.Fatal("staging sidecar vanished although every delete failed")
+	}
+	var deletes int
+	for _, e := range st.events {
+		if strings.HasPrefix(e, "delete:") {
+			deletes++
+		}
+	}
+	if deletes != deleteStagingTries*retryAttempts {
+		t.Fatalf("delete attempts = %d, want %d", deletes, deleteStagingTries*retryAttempts)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.committed) != 1 || len(r.drops) != 0 {
+		t.Fatalf("committed = %v drops = %+v, want one commit and no drop", r.committed, r.drops)
+	}
+}
+
+// Shutdown's hard stop interrupts the final sidecar PutSmall. The video is
+// committed, so the clip is not dropped; the staging sidecar stays for the
+// recovery sweep and the job still finishes.
+func TestShutdownInterruptsFinalSidecarPut(t *testing.T) {
+	st := newFakeStore()
+	st.finalGate = make(chan struct{}) // never opened
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	c.write(t, []byte("payload"))
+	c.finish()
+	eventually(t, "A committed", func() bool { return st.count("commit") == 1 })
+
+	res := make(chan int, 1)
+	go func() { res <- r.e.Shutdown(30 * time.Second) }()
+	r.clk.BlockUntil(1) // Shutdown's grace timer
+	r.clk.Advance(30 * time.Second)
+	select {
+	case n := <-res:
+		if n != 0 {
+			t.Fatalf("Shutdown dropped %d clips, want 0: the video is committed", n)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown did not return")
+	}
+	eventually(t, "job finished", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		return len(r.e.jobs) == 0
+	})
+	k := c.pc.Keys
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if _, ok := st.small[k.Sidecar]; ok {
+		t.Fatal("a final sidecar was stored")
+	}
+	if _, ok := st.small[k.StagingSidecar]; !ok {
+		t.Fatal("the staging sidecar was removed")
+	}
+	if len(st.objects[k.Video]) == 0 {
+		t.Fatal("the committed video is missing")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.committed) != 0 || len(r.drops) != 0 {
+		t.Fatalf("committed = %v drops = %+v, want neither", r.committed, r.drops)
+	}
+}
+
+// A drop recorded after the clip's video was committed is not reported: the
+// recovery sweep promotes the clip, so coverage must not show a gap for it.
+func TestDropOfCommittedClipIsNotReported(t *testing.T) {
+	st := newFakeStore()
+	r := newEgressRig(t, 1, 1<<30, st)
+	live := &Clip{Camera: "front", Stream: NewStream(), Created: r.clk.Now()}
+	r.e.reportDrop(live, DropBacklog)
+	if ds := r.dropList(); len(ds) != 1 {
+		t.Fatalf("drops = %+v, want the uncommitted clip reported", ds)
+	}
+	done := &Clip{Camera: "back", Stream: NewStream(), Created: r.clk.Now()}
+	done.Committed.Store(true)
+	r.e.reportDrop(done, DropBacklog)
+	if ds := r.dropList(); len(ds) != 1 {
+		t.Fatalf("drops = %+v, want the committed clip not reported", ds)
 	}
 }
