@@ -10,7 +10,7 @@ import {
   openResult,
   type Env,
 } from '../../../test-support/player-fakes';
-import type { PlayerClient } from '../../lib/player/engine';
+import type { WorkerClient } from '../../lib/workerClient';
 import DemoPage from './+page.svelte';
 
 const CLIP = '01M2NBMVS0K8EKRQKGGAJCDT0B';
@@ -44,7 +44,7 @@ afterEach(() => {
   env.restore();
 });
 
-const asClient = (c: FakeClient) => c as unknown as PlayerClient;
+const asClient = (c: FakeClient) => c as unknown as WorkerClient;
 
 describe('demo page', () => {
   it('shows the verifying spinner, then the verified badge for a good clip', async () => {

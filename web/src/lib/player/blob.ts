@@ -36,10 +36,6 @@ export class BlobLru<V extends { url: string }> {
     for (const v of this.#entries.values()) this.revoke(v.url);
     this.#entries.clear();
   }
-
-  get size(): number {
-    return this.#entries.size;
-  }
 }
 
 /** The parts are referenced, not copied. */

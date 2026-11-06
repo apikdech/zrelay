@@ -9,18 +9,26 @@ package app_test
 //
 // It runs the real relay pipeline (app.Run) against the in-process RTSP test
 // server looping testdata/video/h264-640x360-gop2-10s.h264, holds a fake ONVIF
-// motion trigger for about 30 s, and records to the local driver under
-// t.TempDir(). The committed objects are then copied out, together with two
-// derived variants: tamper (one ciphertext bit flipped in a middle chunk) and
-// incomplete (truncated mid-final-chunk, with the recovered-clip sidecar of
-// Contract §7.4). The master key is the Contract §4.5 vector key (00..1f).
+// motion trigger for about 33 s, and records to the s3 driver against a
+// throwaway MinIO container (storagetest.StartMinIO; Docker required), so the
+// committed video went through the S3 multipart commit path. The committed
+// video and sidecar objects are then read back with S3 GETs and written out in
+// the local driver's layout (<variant>/zrelay/clips/...), which zview-server
+// serves. Two variants are derived from those bytes: tamper (one ciphertext bit
+// flipped in a middle chunk) and incomplete (truncated mid-final-chunk, with the
+// recovered-clip sidecar of Contract §7.4). The master key is the Contract §4.5
+// vector key (00..1f).
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,8 +38,15 @@ import (
 	"github.com/apikdech/zrelay-v2/internal/relay/config"
 	"github.com/apikdech/zrelay-v2/internal/testutil"
 	"github.com/apikdech/zrelay-v2/pkg/sidecar"
+	"github.com/apikdech/zrelay-v2/pkg/storage"
+	"github.com/apikdech/zrelay-v2/pkg/storage/s3"
+	"github.com/apikdech/zrelay-v2/pkg/storage/storagetest"
 	"github.com/apikdech/zrelay-v2/pkg/zrec"
 )
+
+// fixtureRoot is storage.root of the generator's config and the first path
+// element of the fixture trees.
+const fixtureRoot = "zrelay"
 
 const fixtureCamera = "front-door"
 
@@ -67,8 +82,9 @@ func vectorKey() zrec.MasterKey {
 }
 
 // newFixtureRig is newRigFor with the vector master key, the fixture camera
-// identity and 64 KiB chunks (so a 30 s clip has dozens of chunks).
-func newFixtureRig(t *testing.T) *rig {
+// identity and 64 KiB chunks (so a 30 s clip has dozens of chunks), recording
+// to a fresh MinIO bucket. The returned driver reads that bucket back.
+func newFixtureRig(t *testing.T) (*rig, *s3.Driver) {
 	t.Helper()
 	rtsp := testutil.StartRTSPServer(t, testutil.RTSPServerOpts{AUs: testutil.LoadAnnexB(t, h264Fixture), Loop: true})
 	onvif := testutil.StartFakeONVIF(t, testutil.FakeONVIFOpts{})
@@ -76,11 +92,15 @@ func newFixtureRig(t *testing.T) *rig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
-	base := filepath.Join(dir, "archive")
-	if err := os.MkdirAll(base, 0o755); err != nil {
+	endpoint, accessKey, secretKey, bucket := storagetest.StartMinIO(t)
+	store, err := s3.New(context.Background(), s3.Config{
+		Endpoint: endpoint, Region: "us-east-1", Bucket: bucket, Root: fixtureRoot,
+		AccessKey: accessKey, SecretKey: secretKey, UsePathStyle: true,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	dir := t.TempDir()
 	yml := fmt.Sprintf(`version: 2
 allow_literal_secrets: true
 relay:
@@ -93,10 +113,16 @@ encryption:
   master_key: %q
   chunk_size_kib: 64
 storage:
-  driver: "local"
-  root: "zrelay"
-  local:
-    base_dir: %q
+  driver: "s3"
+  root: %q
+  s3:
+    endpoint: %q
+    region: "us-east-1"
+    bucket: %q
+    use_path_style: true
+    access_key: %q
+    secret_key: %q
+    part_size_mib: 5
 defaults:
   pre_roll_seconds: 2
   post_roll_seconds: 1
@@ -111,7 +137,7 @@ cameras:
     credentials: { username: "admin", password: "secret" }
     rtsp: { port: %s, path: "/stream" }
     events: { source: "onvif", port: %d }
-`, freePort(t), vectorKey().String(), base, fixtureCamera, u.Port(), onvif.Port)
+`, freePort(t), vectorKey().String(), fixtureRoot, endpoint, bucket, accessKey, secretKey, fixtureCamera, u.Port(), onvif.Port)
 	p := filepath.Join(dir, "zrelay.yaml")
 	if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
 		t.Fatal(err)
@@ -120,7 +146,7 @@ cameras:
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
-	return &rig{rtsp: rtsp, onvif: onvif, base: base, cfg: cfg}
+	return &rig{rtsp: rtsp, onvif: onvif, cfg: cfg}, store
 }
 
 func TestGenerateClipFixtures(t *testing.T) {
@@ -129,31 +155,30 @@ func TestGenerateClipFixtures(t *testing.T) {
 		t.Skip("set ZRELAY_FIXTURES_OUT to the testdata/clips directory")
 	}
 	mk := vectorKey()
-	r := newFixtureRig(t)
+	r, store := newFixtureRig(t)
+	ctx := context.Background()
 
 	run := start(t, r.cfg, app.Options{Version: "fixture"})
-	statusFile := filepath.Join(r.base, "zrelay", "status", "relay.json")
 	eventually(t, "status/relay.json", 30*time.Second, func() bool {
-		_, err := os.Stat(statusFile)
+		_, err := fixtureObject(ctx, store, "status/relay.json")
 		return err == nil
 	})
+	// The video object is invisible until CompleteMultipartUpload, so there is no
+	// "being written" milestone: hold the trigger for 33 s (the phone-profile e2e seeks to duration-1, which must lie beyond its 30 s ahead window), then wait for the sidecar.
 	r.motion(true)
-	eventually(t, "a video object being written", 40*time.Second, func() bool {
-		return len(files(r.base, func(rel string) bool { return strings.Contains(rel, "/clips/") && strings.Contains(rel, ".zrec") })) > 0
-	})
-	time.Sleep(30 * time.Second)
+	time.Sleep(33 * time.Second)
 	r.motion(false)
-	eventually(t, "a clip sidecar", 40*time.Second, func() bool { return len(clipSidecars(r.base)) > 0 })
+	eventually(t, "a clip sidecar", 40*time.Second, func() bool { return len(fixtureSidecars(t, store)) > 0 })
 	if _, err := run.stop(t); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	scs := clipSidecars(r.base)
+	scs := fixtureSidecars(t, store)
 	if len(scs) != 1 {
 		t.Fatalf("want exactly one clip, got %v", scs)
 	}
-	scPath := scs[0]
-	sb, err := os.ReadFile(scPath)
+	scKey := scs[0]
+	sb, err := fixtureObject(ctx, store, scKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,19 +189,19 @@ func TestGenerateClipFixtures(t *testing.T) {
 	if err := sc.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	video, err := os.ReadFile(filepath.Join(filepath.Dir(scPath), sc.Video.Object))
+	video, err := fixtureObject(ctx, store, path.Join(path.Dir(scKey), sc.Video.Object))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if int64(len(video)) != sc.Video.SizeBytes {
+		t.Fatalf("video is %d bytes, sidecar says %d", len(video), sc.Video.SizeBytes)
 	}
 	if sc.SegmentIndex != 0 || sc.Video.SeekIndex == nil || sc.DurationMs == nil {
 		t.Fatalf("unexpected sidecar: %+v", sc)
 	}
 
-	rel, err := filepath.Rel(r.base, scPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	relDir := filepath.Dir(rel)
+	// The local driver's layout: <root>/<key's directory>.
+	relDir := path.Join(fixtureRoot, path.Dir(scKey))
 
 	chunk := int(sc.Video.ChunkSize)
 	hdrLen := int(video[6])<<8 | int(video[7])
@@ -192,8 +217,9 @@ func TestGenerateClipFixtures(t *testing.T) {
 		}
 	}
 
-	if err := os.RemoveAll(out); err != nil {
-		t.Fatal(err)
+	// Replace the generated trees only; the README beside them stays.
+	for _, d := range []string{"complete", "tamper", "incomplete"} {
+		must(t, os.RemoveAll(filepath.Join(out, d)))
 	}
 	write := func(variant string, sidecarJSON, videoBytes []byte) {
 		dir := filepath.Join(out, variant, relDir)
@@ -242,6 +268,38 @@ func TestGenerateClipFixtures(t *testing.T) {
 	}
 	must(t, os.WriteFile(filepath.Join(out, "manifest.json"), append(mb, '\n'), 0o644))
 	t.Logf("wrote fixtures under %s: %d chunks, tamper chunk %d (~%d ms), duration %d ms, video %d bytes", out, n, tamperChunk, failAt, *sc.DurationMs, len(video))
+}
+
+// fixtureSidecars lists the keys of the committed clip sidecars in the bucket.
+func fixtureSidecars(t *testing.T, store storage.Reader) []string {
+	t.Helper()
+	var out []string
+	for info, err := range store.List(context.Background(), "clips") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasSuffix(info.Key, ".json") {
+			out = append(out, info.Key)
+		}
+	}
+	return out
+}
+
+// fixtureObject GETs the whole object at key.
+func fixtureObject(ctx context.Context, r storage.Reader, key string) ([]byte, error) {
+	or, err := r.OpenRange(ctx, key, 0, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer or.Close()
+	b, err := io.ReadAll(or)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) != or.Total {
+		return nil, errors.New("short read")
+	}
+	return b, nil
 }
 
 func must(t *testing.T, err error) {

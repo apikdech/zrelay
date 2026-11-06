@@ -1,19 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { detectProfile } from '../../lib/player/buffer';
-  import { createPlayer, type Player, type PlayerClient, type PlayerState } from '../../lib/player/engine';
+  import { createPlayer, type Player, type PlayerState } from '../../lib/player/engine';
   import { describeIntegrity, initialState } from '../../lib/player/status';
-  import { workerClient } from '../../lib/workerClient';
+  import { getWorkerClient, type WorkerClient } from '../../lib/workerClient';
   import { isUlid } from '../../worker/schemas';
 
   interface Props {
     /** The crypto worker; it decrypts and authenticates every chunk. */
-    client?: PlayerClient;
+    client?: WorkerClient;
     /** The clip to play; changes load the new clip. */
     clipId?: string;
   }
 
-  let { client = workerClient, clipId = '' }: Props = $props();
+  let { client, clipId = '' }: Props = $props();
 
   let video: HTMLVideoElement | undefined = $state();
   let player: Player | undefined = $state();
@@ -30,7 +30,7 @@
     if (!video) return;
     const detected = detectProfile();
     profile = detected;
-    const p = createPlayer(video, client, { profile: detected });
+    const p = createPlayer(video, client ?? getWorkerClient(), { profile: detected });
     const off = p.onState((s) => (snap = s));
     player = p;
     return () => {

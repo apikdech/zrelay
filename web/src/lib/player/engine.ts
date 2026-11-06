@@ -42,9 +42,6 @@ export interface Player {
   destroy(): void;
 }
 
-/** What the engine needs of the worker client. */
-export type PlayerClient = Pick<WorkerClient, 'call'>;
-
 interface BlobEntry {
   url: string;
   outcome: { integrity: 'tampered' | 'incomplete'; failedAtMs: number | null } | null;
@@ -53,7 +50,7 @@ interface BlobEntry {
 const isQuota = (e: unknown): boolean => e instanceof DOMException && e.name === 'QuotaExceededError';
 const groupKeyId = (hex: string): string => (hex.match(/.{4}/g) ?? [hex]).join('-');
 
-export function createPlayer(video: HTMLVideoElement, client: PlayerClient, opts: { profile: Profile }): Player {
+export function createPlayer(video: HTMLVideoElement, client: WorkerClient, opts: { profile: Profile }): Player {
   return new PlayerImpl(video, client, opts.profile);
 }
 
@@ -66,6 +63,11 @@ class PlayerImpl implements Player {
   #open: ClipOpenResult | null = null;
   #sink: Sink | null = null;
   #waiters: (() => void)[] = [];
+  /**
+   * While a seek settles, the media time it is moving to (s). `video.currentTime` only
+   * follows once the target fragment is buffered, so window decisions read this instead.
+   */
+  #seekHead: number | null = null;
   #autoAdvance = false;
   #destroyed = false;
   readonly #win;
@@ -75,7 +77,7 @@ class PlayerImpl implements Player {
 
   constructor(
     private readonly video: HTMLVideoElement,
-    private readonly client: PlayerClient,
+    private readonly client: WorkerClient,
     private readonly profile: Profile,
   ) {
     this.#win = WINDOWS[profile];
@@ -86,6 +88,11 @@ class PlayerImpl implements Player {
   }
 
   // ---- state ---------------------------------------------------------------
+
+  /** The playhead for buffer-window decisions: the seek target while one is settling. */
+  #head(): number {
+    return this.#seekHead ?? this.video.currentTime;
+  }
 
   #set(patch: Partial<PlayerState>): void {
     this.#state = { ...this.#state, ...patch };
@@ -124,9 +131,18 @@ class PlayerImpl implements Player {
     this.#open = open;
     const v = open.verification;
     const mismatch = v.camera === 'mismatch' || v.start === 'mismatch' || v.clipId === 'mismatch';
-    const integrity: IntegrityState = mismatch ? 'mismatch' : open.status === 'incomplete' ? 'incomplete' : 'verified';
+    // A Blob cached from an earlier load already knows how that clip ended.
+    const cached = this.#blobs.get(clipId)?.outcome ?? null;
+    const integrity: IntegrityState = cached
+      ? cached.integrity
+      : mismatch
+        ? 'mismatch'
+        : open.status === 'incomplete'
+          ? 'incomplete'
+          : 'verified';
     this.#set({
       integrity,
+      failedAtMs: cached?.failedAtMs ?? null,
       verification: v,
       header: { cameraId: open.header.cameraId, startUnixMs: open.header.startUnixMs },
     });
@@ -207,7 +223,7 @@ class PlayerImpl implements Player {
   }
 
   #wantMore(sink: Sink): boolean {
-    return sink.streaming && needsMore(sink.buffered(), this.video.currentTime, this.#win);
+    return sink.streaming && needsMore(sink.buffered(), this.#head(), this.#win);
   }
 
   #demand(): Promise<void> {
@@ -283,7 +299,7 @@ class PlayerImpl implements Player {
   /** Removes what is older than `currentTime − behind_seconds` (a tighter bound after a quota error). */
   async #evictBehind(sink: Sink, tight: boolean): Promise<void> {
     const win = tight ? { ...this.#win, behindSeconds: Math.min(this.#win.behindSeconds, 2) } : this.#win;
-    for (const [s, e] of planEviction(sink.buffered(), this.video.currentTime, win).behind) await sink.remove(s, e);
+    for (const [s, e] of planEviction(sink.buffered(), this.#head(), win).behind) await sink.remove(s, e);
   }
 
   // ---- Blob path -----------------------------------------------------------
@@ -293,7 +309,6 @@ class PlayerImpl implements Player {
     const hit = this.#blobs.get(clipId);
     if (hit) {
       this.video.src = hit.url;
-      if (hit.outcome) this.#set(hit.outcome);
       return;
     }
     const parts: ArrayBuffer[] = [];
@@ -352,8 +367,12 @@ class PlayerImpl implements Player {
     let target = Math.max(0, tMs);
     if (this.#state.integrity === 'tampered' && this.#state.failedAtMs !== null) {
       // Never play (or fetch) past the last verified frame.
-      this.video.currentTime = Math.min(target, this.#state.failedAtMs) / 1000;
-      return;
+      const limit = this.#state.failedAtMs;
+      target = Math.min(target, limit);
+      if (target >= limit) {
+        this.video.currentTime = target / 1000;
+        return;
+      }
     }
     if (!open || !sink) {
       this.video.currentTime = target / 1000;
@@ -369,6 +388,7 @@ class PlayerImpl implements Player {
     const g = ++this.#gen;
     this.#signal();
     target = Math.max(target, plan.fragmentMs);
+    this.#seekHead = target / 1000;
     await sink.abort();
     if (g !== this.#gen) return;
     // Anything far ahead of the new position would otherwise leave a hole behind the sequential fill.
@@ -379,7 +399,10 @@ class PlayerImpl implements Player {
     });
     // Move the playhead only once its fragment is buffered. Setting it earlier makes
     // WebKit settle on the nearest buffered time instead of waiting for the data.
-    if (g === this.#gen) this.video.currentTime = target / 1000;
+    if (g === this.#gen) {
+      this.video.currentTime = target / 1000;
+      this.#seekHead = null;
+    }
   }
 
   // ---- auto-advance --------------------------------------------------------
@@ -408,6 +431,7 @@ class PlayerImpl implements Player {
   /** Stops everything belonging to the current clip. */
   #teardown(): void {
     this.#gen++;
+    this.#seekHead = null;
     this.#signal();
     if (this.#clipId !== null) this.#close(this.#clipId);
     this.#sink?.destroy();

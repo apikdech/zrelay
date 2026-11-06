@@ -7,20 +7,20 @@
   "codec": "avc1.640016",
   "width": 640,
   "height": 360,
-  "duration_ms": 33266,
+  "duration_ms": 34266,
   "complete": {
-    "clip_id": "01M6RVXZ8DM8TTNQDGBH6JZR1F",
+    "clip_id": "01M6RXRJAQRJY105FSDF0QRBH0",
     "dir": "complete"
   },
   "tamper": {
-    "clip_id": "01M6RVXZ8DM8TTNQDGBH6JZR1F",
+    "clip_id": "01M6RXRJAQRJY105FSDF0QRBH0",
     "dir": "tamper"
   },
   "incomplete": {
-    "clip_id": "01M6RVXZ8DM8TTNQDGBH6JZR1F",
+    "clip_id": "01M6RXRJAQRJY105FSDF0QRBH0",
     "dir": "incomplete"
   },
-  "num_chunks": 35,
-  "tamper_chunk": 17,
+  "num_chunks": 36,
+  "tamper_chunk": 18,
   "tamper_fail_at_ms": 16000
 }

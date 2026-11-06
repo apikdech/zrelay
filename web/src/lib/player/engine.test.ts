@@ -263,6 +263,33 @@ describe('failures while playing', () => {
   });
 });
 
+describe('seeking after a tampered failure', () => {
+  const tamperedAt4 = () =>
+    new FakeClient({
+      open: openResult({ numChunks: 100 }),
+      read: (i) => (i === 4 ? new ErrAuth(4) : { plaintext: chunkBytes(i), final: false }),
+    });
+
+  it('fetches a target before the failure that was evicted, and clamps one past it', async () => {
+    const c = tamperedAt4();
+    const { p, states } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => last(states).integrity === 'tampered', 'tampered');
+    // Everything is evicted (as if the viewer had played on elsewhere).
+    sb().ranges = [];
+    c.reads.length = 0;
+    await p.seek(2000);
+    expect(env.video.currentTime).toBe(2);
+    expect(c.reads[0]).toBe(2);
+    expect(sb().appends.some((a, i) => i >= 4 && a[0] === 2)).toBe(true);
+    await p.seek(9000);
+    expect(env.video.currentTime).toBeLessThanOrEqual(4);
+    expect(last(states).integrity).toBe('tampered');
+    expect(last(states).failedAtMs).toBe(4000);
+    p.destroy();
+  });
+});
+
 describe('seek (ui-spec §4.3.2)', () => {
   it('inside the buffer only sets currentTime', async () => {
     const c = new FakeClient({ open: openResult({ numChunks: 10 }) });
@@ -290,6 +317,37 @@ describe('seek (ui-spec §4.3.2)', () => {
     await until(() => sb().appends.length > 31, 'continues sequentially');
     expect(sb().appends[30]![0]).toBe(60);
     expect(c.reads.slice(0, 3)).toEqual([60, 61, 62]);
+    p.destroy();
+  });
+
+  it('a backward seek outside the buffer keeps its fragment and stops at ahead_seconds of the target', async () => {
+    const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
+    const { p } = make(c, 'mobile'); // ahead 30, behind 15
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    for (const t of [25, 50]) {
+      env.video.currentTime = t;
+      env.video.fire('timeupdate');
+      await until(() => Math.max(...sb().ranges.map((r) => r[1])) >= t + 30, `buffered to ${t + 30}`);
+    }
+    await tick(50);
+    // The playhead is at 50 s; the first 35 s have been evicted.
+    expect(sb().ranges[0]![0]).toBeGreaterThanOrEqual(35);
+
+    const removed = sb().removes.length;
+    await p.seek(10_000);
+    expect(env.video.currentTime).toBe(10);
+    await until(() => sb().ranges.some(([s, e]) => s <= 10 && e >= 40), '30 s ahead of 10 s buffered');
+    await tick(50);
+    const n = sb().appends.length;
+    await tick(100);
+    expect(sb().appends).toHaveLength(n); // appends stopped
+    // The fragment at the target was never evicted as "behind", and nothing runs past the window.
+    expect(sb().removes.slice(removed).some(([s, e]) => s <= 10 && e > 10)).toBe(false);
+    const holding = sb().ranges.find(([s, e]) => s <= 10 && e > 10)!;
+    expect(holding[1]).toBeLessThanOrEqual(41);
+    // Far fewer appends than fetching to the end of the clip.
+    expect(sb().appends.length).toBeLessThan(120);
     p.destroy();
   });
 
@@ -415,6 +473,35 @@ describe('blob fallback (ui-spec §4.3.3)', () => {
     const blob = env.registry.get(env.video.src) as Blob;
     expect(blob.size).toBe(3 * CHUNK);
     expect(last(states).failedAtMs).toBe(3000);
+  });
+
+  it('reloading a cached clip that was tampered resolves tampered, not verified', async () => {
+    const OTHER = '01M2NBMVS0K8EKRQKGGAJCDT0C';
+    const c = new FakeClient({
+      open: openResult({ numChunks: 6 }),
+      read: (i) => (i === 3 ? new ErrAuth(3) : { plaintext: chunkBytes(i), final: false }),
+    });
+    const { p, states } = make(c, 'desktop');
+    await p.load(CLIP);
+    await until(() => last(states).integrity === 'tampered', 'tampered');
+    await p.load(OTHER);
+    await until(() => last(states).clipId === OTHER && last(states).integrity === 'tampered', 'second load');
+    c.reads.length = 0;
+    expect(await p.load(CLIP)).toBe('tampered'); // served from the Blob LRU
+    expect(last(states).failedAtMs).toBe(3000);
+    expect(c.reads).toHaveLength(0);
+  });
+
+  it('reloading a cached incomplete clip resolves incomplete', async () => {
+    const c = new FakeClient({
+      open: openResult({ numChunks: 6 }),
+      read: (i) => (i === 3 ? new ErrTruncated('cut') : { plaintext: chunkBytes(i), final: false }),
+    });
+    const { p, states } = make(c, 'desktop');
+    await p.load(CLIP);
+    await until(() => last(states).integrity === 'incomplete', 'incomplete');
+    await p.load('01M2NBMVS0K8EKRQKGGAJCDT0C');
+    expect(await p.load(CLIP)).toBe('incomplete');
   });
 
   it('seek just sets currentTime', async () => {

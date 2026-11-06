@@ -147,14 +147,22 @@ test('a flipped ciphertext bit shows tampered at the right time and playback sto
   const demo = await openDemo(page, 'tamper', manifest.tamper.clip_id);
   await expect(demo).toHaveAttribute('data-integrity', 'tampered', { timeout: 30_000 });
   const failedAt = Number(await demo.getAttribute('data-failed-at-ms'));
-  expect(Math.abs(failedAt - manifest.tamper_fail_at_ms)).toBeLessThanOrEqual(2000);
+  expect(failedAt).toBe(manifest.tamper_fail_at_ms);
   await expect(page.getByTestId('integrity')).toContainText('This recording failed verification at ~');
-
-  // The verified part plays, nothing past the failure does.
-  await expect.poll(() => currentTime(page), { timeout: 20_000 }).toBeGreaterThan(1);
-  await page.waitForTimeout(1500);
-  expect(await currentTime(page)).toBeLessThanOrEqual(failedAt / 1000 + 0.5);
   await expect(page.getByTestId('export')).toHaveCount(0);
+
+  // Start just before the failure: the verified part plays, nothing past it does.
+  const failSec = failedAt / 1000;
+  await page.getByTestId('seek-input').fill(String(failSec - 2));
+  await page.getByTestId('seek-go').click();
+  await expect.poll(() => currentTime(page), { timeout: 5000 }).toBeGreaterThanOrEqual(failSec - 2);
+  await page.getByTestId('player').evaluate((v: HTMLVideoElement) => v.play());
+  await page.waitForTimeout(6000);
+  // One fragment (the 2 s GOP) of slack for the last frames of the verified fragment.
+  expect(await currentTime(page)).toBeLessThanOrEqual(failSec + 2);
+  const stalled = await page.getByTestId('player').evaluate((v: HTMLVideoElement) => v.ended || v.paused || v.readyState < 3);
+  expect(stalled).toBe(true);
+  await expect(demo).toHaveAttribute('data-integrity', 'tampered');
 });
 
 test('a truncated clip plays its verified part and shows incomplete', async ({ page }) => {
@@ -185,6 +193,16 @@ test('a phone profile seeks outside its 30 s buffer by fetching the indexed frag
     await expect(demo).toHaveAttribute('data-integrity', 'verified');
     // Playback reaches the end of the clip from the fetched fragment.
     await expect.poll(() => page.getByTestId('player').evaluate((v: HTMLVideoElement) => v.ended), { timeout: 10_000 }).toBe(true);
+
+    // A backward seek well outside the 15 s behind window must land and keep playing, not stall.
+    await page.getByTestId('seek-input').fill('2');
+    await page.getByTestId('seek-go').click();
+    await expect.poll(() => currentTime(page), { timeout: 3000, intervals: [50] }).toBeLessThan(10);
+    const back = await currentTime(page);
+    expect(back).toBeGreaterThanOrEqual(2);
+    await page.getByTestId('player').evaluate((v: HTMLVideoElement) => v.play());
+    await expect.poll(() => currentTime(page), { timeout: 8000 }).toBeGreaterThan(back + 1);
+    await expect(demo).toHaveAttribute('data-integrity', 'verified');
   } finally {
     await ctx.close();
   }
