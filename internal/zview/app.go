@@ -11,7 +11,7 @@ import (
 )
 
 // Content-Security-Policy for the single origin (ui-spec §2.4 with design
-// §7.1: connect-src 'self'). Sent as Report-Only until Task 42 enforces it.
+// §7.1: connect-src 'self'). Enforced (Task 42), not Report-Only.
 const contentSecurityPolicy = "default-src 'none'; " +
 	"script-src 'self'; " +
 	"style-src 'self' 'unsafe-inline'; " +
@@ -26,7 +26,7 @@ const contentSecurityPolicy = "default-src 'none'; " +
 func withSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy-Report-Only", contentSecurityPolicy)
+		h.Set("Content-Security-Policy", contentSecurityPolicy)
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")

@@ -147,7 +147,7 @@ interface Probe {
 
 /**
  * Installed before any page script: collects CSP violation events (the policy
- * is Report-Only, which fires them too), wraps the Worker so every message in
+ * is enforced since Task 42, so a blocked load shows up here), wraps the Worker so every message in
  * either direction is recorded, and, on Chromium, stands in for the save picker.
  */
 async function instrument(page: Page, stubPicker: boolean, rawKey: number[]) {
@@ -311,7 +311,7 @@ test('a fresh profile imports the key, plays, seeks, exports and sees live video
     await expect(tile).not.toHaveAttribute('data-state', 'limit');
   }
 
-  // The policy is Report-Only: not one violation was reported along the way.
+  // The policy is enforced (Task 42): not one violation was reported along the way, so nothing was blocked.
   const probe = await probeOf(page);
   expect(probe.csp).toEqual([]);
   expect(errors).toEqual([]);
@@ -342,6 +342,11 @@ test('after playback Cache Storage holds the hashed shell and no data', async ({
 
   await importKeyAndOpenDay(page);
   await playFirstClip(page);
+
+  // The policy on the shell is the enforcing header, not Report-Only.
+  const shell = await page.request.get(origin + '/');
+  expect(shell.headers()['content-security-policy']).toContain("connect-src 'self';");
+  expect(shell.headers()['content-security-policy-report-only']).toBeUndefined();
 
   // The worker registers once the page has loaded and takes control on activation.
   await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null), { timeout: 30_000 }).toBe(true);
