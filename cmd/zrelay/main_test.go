@@ -37,7 +37,7 @@ func writeFile(t *testing.T, dir, name, content string) string {
 func exampleConfigFile(t *testing.T, edit func(string) string) string {
 	t.Helper()
 	dir := t.TempDir()
-	writeFile(t, dir, "zrelay_master", "zk1-example-master-key\n")
+	writeFile(t, dir, "zrelay_master", seqMaster().String()+"\n")
 	writeFile(t, dir, "s3_secret_key", "s3-secret\n")
 	writeFile(t, dir, "api_token_sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n")
 	src, err := os.ReadFile(exampleConfig)
