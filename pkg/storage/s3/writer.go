@@ -20,10 +20,14 @@ var (
 	errCompleting  = errors.New("s3: writer refuses Write once CompleteMultipartUpload has been sent")
 	// errUnpublished: the upload is gone (NoSuchUpload) and the object is
 	// missing or has the wrong size, so no retry can publish it (Permanent).
-	errUnpublished = errors.New("s3: upload is gone and the object was not published")
+	// It wraps storage.ErrUploadGone so egress can restart the clip from its
+	// stream; Classify still reports Permanent.
+	errUnpublished = fmt.Errorf("s3: upload is gone and the object was not published: %w", storage.ErrUploadGone)
 	// errAbortCommitted: Abort found the upload gone because an earlier
 	// Commit's CompleteMultipartUpload published the object (Permanent).
-	errAbortCommitted = errors.New("s3: abort: the object was already published by Commit")
+	// It wraps storage.ErrAlreadyCommitted so egress can treat the clip as
+	// committed; Classify still reports Permanent.
+	errAbortCommitted = fmt.Errorf("s3: abort: the object was already published by Commit: %w", storage.ErrAlreadyCommitted)
 )
 
 // Create implements storage.Writer by starting a multipart upload. Part

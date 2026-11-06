@@ -22,6 +22,16 @@ var (
 	// ErrNothingToRecover reports that a recovery candidate held no durable
 	// bytes; the driver discarded it instead of publishing an empty object.
 	ErrNothingToRecover = errors.New("storage: nothing to recover")
+	// ErrUploadGone is wrapped by an ObjectWriter error when the streamed
+	// upload no longer exists and its object was not published, so no retry
+	// of the same writer can succeed. The caller that still holds every byte
+	// re-creates the object from scratch.
+	ErrUploadGone = errors.New("storage: upload is gone")
+	// ErrAlreadyCommitted is wrapped by an Abort error when the object was
+	// published by an earlier Commit whose outcome the caller never saw (a lost
+	// response). The object exists; Abort could not undo it, and the caller
+	// must treat the clip as committed.
+	ErrAlreadyCommitted = errors.New("storage: object already committed")
 )
 
 // ErrorClass is how egress treats a failed storage request (design §6.3).

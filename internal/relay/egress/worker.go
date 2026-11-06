@@ -119,6 +119,15 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 			_, werr := w.Write(buf[:n])
 			endOp()
 			if werr != nil {
+				// The multipart upload no longer exists (NoSuchUpload): no
+				// Resume or retry can fix that, and storage answered, so the
+				// breaker is not told of a failure. runJob replays the clip
+				// from the stream or abandons it.
+				if ctx.Err() == nil && e.cfg.Classify(werr) == storage.NotFound {
+					e.uploadError(werr)
+					e.success()
+					return errors.Join(errUploadGone, werr)
+				}
 				fails++
 				// A Write cancelled by eviction or shutdown says nothing
 				// about storage unless it stalled; noteStall judged that.
@@ -274,6 +283,23 @@ func (e *Egress) abort(j *job, ow storage.ObjectWriter, staged bool, err error) 
 	defer cancel()
 	if ow != nil {
 		if aerr := ow.Abort(ctx); aerr != nil {
+			if errors.Is(aerr, storage.ErrAlreadyCommitted) {
+				// An earlier Commit published the object and only its
+				// response was lost: the clip is committed. Its staging
+				// sidecar must survive for recovery, and unless the process
+				// is stopping the protocol is finished here.
+				slog.Warn("egress: abort found the clip already committed", "key", j.clip.Keys.Video)
+				j.clip.Committed.Store(true)
+				j.committed.Store(true)
+				if !hard {
+					// Bounded like the complete of a Commit that succeeded
+					// despite an eviction (runJob).
+					cctx, ccancel := context.WithTimeout(e.hctx, abortTimeout)
+					defer ccancel()
+					e.complete(cctx, j)
+				}
+				return
+			}
 			slog.Warn("egress: abort failed", "key", j.clip.Keys.Video, "error", aerr)
 		}
 	}

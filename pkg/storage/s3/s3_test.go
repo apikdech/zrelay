@@ -134,6 +134,9 @@ func TestCommitRetryAfterLostResponse(t *testing.T) {
 		if c := s3.Classify(err); c != storage.Permanent {
 			t.Errorf("Classify(upload gone, object missing) = %d, want Permanent", c)
 		}
+		if !errors.Is(err, storage.ErrUploadGone) {
+			t.Errorf("Commit error does not wrap storage.ErrUploadGone: %v", err)
+		}
 	})
 
 	t.Run("ObjectWrongSizeIsError", func(t *testing.T) {
@@ -158,6 +161,9 @@ func TestCommitRetryAfterLostResponse(t *testing.T) {
 		}
 		if c := s3.Classify(err); c != storage.Permanent {
 			t.Errorf("Classify(upload gone, wrong size) = %d, want Permanent", c)
+		}
+		if !errors.Is(err, storage.ErrUploadGone) {
+			t.Errorf("Commit error does not wrap storage.ErrUploadGone: %v", err)
 		}
 	})
 
@@ -249,8 +255,13 @@ func TestCommitRetryAfterLostResponse(t *testing.T) {
 		w := lostCommit(t, f, d)
 		if err := w.Abort(t.Context()); err == nil {
 			t.Error("Abort of an upload that was already completed error = nil, want error")
-		} else if c := s3.Classify(err); c != storage.Permanent {
-			t.Errorf("Classify(Abort of a published object) = %d, want Permanent", c)
+		} else {
+			if c := s3.Classify(err); c != storage.Permanent {
+				t.Errorf("Classify(Abort of a published object) = %d, want Permanent", c)
+			}
+			if !errors.Is(err, storage.ErrAlreadyCommitted) {
+				t.Errorf("Abort error does not wrap storage.ErrAlreadyCommitted: %v", err)
+			}
 		}
 		if n := f.callsOf("HEAD object"); n != 1 {
 			t.Errorf("HeadObject calls = %d, want 1", n)
