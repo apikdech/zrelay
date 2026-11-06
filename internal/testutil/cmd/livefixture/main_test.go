@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apikdech/zrelay-v2/pkg/zrec"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -167,5 +169,52 @@ func TestLiveFixtureUsage(t *testing.T) {
 	}
 	if c := run(context.Background(), []string{"--fixture", "/does/not/exist.h264"}, &out, &errOut, nil); c != 2 {
 		t.Errorf("missing fixture: exit %d, want 2", c)
+	}
+}
+
+// vectorKey is the Contract §4.5 vector master key, which the fixture clips of
+// testdata/clips/ are sealed with; the first-run e2e (Task 41) serves live video
+// under the same key as the clips.
+const vectorKey = "zk1-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f-2418"
+
+// TestLiveFixtureKeyRef: --key takes an ENV: ref (never a literal), and the
+// printed key, token hash and bearer follow it.
+func TestLiveFixtureKeyRef(t *testing.T) {
+	t.Setenv("LIVEFIXTURE_TEST_KEY", vectorKey)
+	i, stop := start(t, "--key", "ENV:LIVEFIXTURE_TEST_KEY")
+	m, err := zrec.ParseMasterKey(vectorKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := zrec.Derive(m)
+	sum := zrec.APITokenHash(keys)
+	if i.Key != vectorKey || i.Hash != hex.EncodeToString(sum[:]) || i.Bearer != zrec.BearerToken(keys) {
+		t.Errorf("info %+v does not follow the key", i)
+	}
+	if code, _ := whep(t, i, i.Bearer, offerSDP(t)); code != http.StatusCreated {
+		t.Errorf("offer under the given key: status %d, want 201", code)
+	}
+	if c := stop(); c != 0 {
+		t.Errorf("exit %d, want 0", c)
+	}
+}
+
+func TestLiveFixtureKeyRefRejected(t *testing.T) {
+	var out, errOut bytes.Buffer
+	for name, args := range map[string][]string{
+		"literal":     {"--key", vectorKey},
+		"unset ref":   {"--key", "ENV:LIVEFIXTURE_NOT_SET"},
+		"file ref":    {"--key", "FILE:/nope"},
+		"bad content": {"--key", "ENV:LIVEFIXTURE_BAD_KEY"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("LIVEFIXTURE_BAD_KEY", "not-a-key")
+			if c := run(context.Background(), append([]string{"--fixture", h264Fixture}, args...), &out, &errOut, nil); c != 2 {
+				t.Errorf("exit %d, want 2", c)
+			}
+		})
+	}
+	if strings.Contains(errOut.String(), vectorKey) {
+		t.Error("the key leaked into the error output")
 	}
 }

@@ -3,6 +3,11 @@
   import TimelinePage from './routes/+page.svelte';
   import LivePage from './routes/live/+page.svelte';
   import DemoPage from './routes/demo/+page.svelte';
+  import UpdatePrompt from './lib/pwa/UpdatePrompt.svelte';
+  import type { Updater } from './lib/pwa/update';
+
+  /** The service worker's update state; null where there is no service worker. */
+  let { updater = null }: { updater?: Updater | null } = $props();
 
   // Top-level views (design §7.2). The timeline is the home view.
   // `#/demo?clip=<id>` is the playback engine's demo page.
@@ -26,6 +31,8 @@
     clipId = clip();
   }}
 />
+
+<UpdatePrompt {updater} />
 
 <nav aria-label="Views" class="flex gap-4 border-b border-neutral-800 px-4 py-2 text-sm">
   <strong>zview</strong>

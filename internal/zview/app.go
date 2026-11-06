@@ -3,6 +3,7 @@ package zview
 import (
 	"io"
 	"io/fs"
+	"mime"
 	"net/http"
 	"os"
 	"path"
@@ -33,6 +34,12 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		h.Set("Strict-Transport-Security", "max-age=31536000")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func init() {
+	// The PWA manifest (Task 41): the host MIME database may not know it, and
+	// sniffing would call it text/plain.
+	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
 }
 
 // assetsDir holds the content-hashed build output (Vite's default).
