@@ -317,6 +317,105 @@ func TestResumeDiscardsInFlightPart(t *testing.T) {
 	}
 }
 
+// A transient failure of the final (short) part inside Commit must not wedge
+// the writer: the retried Commit re-sends the same part and completes, with
+// no Resume and no re-Write.
+func TestCommitRetryAfterFinalPartFailure(t *testing.T) {
+	f := newFakeS3(t)
+	d := stubDriver(t, f.URL, "")
+	ctx := t.Context()
+	const key = "clips/cam/tail.zrec"
+	w, err := d.Create(ctx, key)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	src := bytes.Repeat([]byte{9, 8, 7, 6, 5, 4, 3}, 5*mib/7+1000)[:5*mib+1000]
+	if _, err := w.Write(src); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.failPartUpload(2, 1)
+	err = w.Commit(ctx)
+	if err == nil {
+		t.Fatal("Commit with a failing final part: error = nil")
+	}
+	if got := s3.Classify(err); got != storage.Transient {
+		t.Fatalf("Classify(final part failure) = %v, want Transient (%v)", got, err)
+	}
+	if err := w.Commit(ctx); err != nil {
+		t.Fatalf("retried Commit: %v", err)
+	}
+	if got := f.get(key); !bytes.Equal(got, src) {
+		t.Fatalf("object differs (%d bytes, want %d)", len(got), len(src))
+	}
+}
+
+// After a failed final part, Resume discards the tail and reports the
+// durable offset; re-sending the tail and committing yields the full object.
+func TestResumeAfterFinalPartFailureThenResendTail(t *testing.T) {
+	f := newFakeS3(t)
+	d := stubDriver(t, f.URL, "")
+	ctx := t.Context()
+	const key = "clips/cam/tail2.zrec"
+	w, err := d.Create(ctx, key)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	src := bytes.Repeat([]byte{1, 3, 5, 7, 11}, 5*mib/5+200)[:5*mib+1000]
+	if _, err := w.Write(src); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.failPartUpload(2, 1)
+	if err := w.Commit(ctx); err == nil {
+		t.Fatal("Commit error = nil, want the part failure")
+	}
+	off, err := w.Resume(ctx)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if off != 5*mib {
+		t.Fatalf("Resume = %d, want %d", off, 5*mib)
+	}
+	if _, err := w.Write(src[off:]); err != nil {
+		t.Fatalf("Write tail: %v", err)
+	}
+	if err := w.Commit(ctx); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if got := f.get(key); !bytes.Equal(got, src) {
+		t.Fatalf("object differs (%d bytes, want %d)", len(got), len(src))
+	}
+}
+
+// errNeedsResume is writer state, not a storage verdict: it must never reach
+// the breaker as a Permanent failure.
+func TestNeedsResumeIsNotPermanent(t *testing.T) {
+	f := newFakeS3(t)
+	d := stubDriver(t, f.URL, "")
+	ctx := t.Context()
+	w, err := d.Create(ctx, "clips/cam/nr.zrec")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	f.failPartUpload(1, 1)
+	if _, err := w.Write(make([]byte, 5*mib)); err == nil {
+		t.Fatal("Write with a failing part: error = nil")
+	}
+	_, err = w.Write([]byte("x"))
+	if err == nil {
+		t.Fatal("Write before Resume: error = nil")
+	}
+	if got := s3.Classify(err); got == storage.Permanent {
+		t.Errorf("Classify(%v) = Permanent, want not Permanent", err)
+	}
+	err = w.Commit(ctx)
+	if err == nil {
+		t.Fatal("Commit before Resume: error = nil")
+	}
+	if got := s3.Classify(err); got == storage.Permanent {
+		t.Errorf("Classify(%v) = Permanent, want not Permanent", err)
+	}
+}
+
 func TestNewValidatesConfig(t *testing.T) {
 	good := s3.Config{
 		Endpoint: "http://127.0.0.1:1", Region: "us-east-1", Bucket: "zrelay",
