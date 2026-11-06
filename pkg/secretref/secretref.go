@@ -36,10 +36,15 @@ func IsRef(s string) bool {
 	return strings.HasPrefix(s, envPrefix) || strings.HasPrefix(s, filePrefix)
 }
 
+// formerSchemes are the only scheme names an error may quote. Any other
+// "WORD:rest" string is ordinary text that may be a literal secret, so no part
+// of it is ever echoed.
+var formerSchemes = map[string]bool{"KEYCHAIN": true, "VAULT": true, "OP": true}
+
 // Resolve returns the value that ref refers to. A string that is neither a
-// supported reference nor shaped like one (an upper-case scheme followed by
-// a colon) is a literal: it is returned as is when allowLiteral is true and
-// rejected with ErrLiteral otherwise.
+// supported reference nor a known former scheme (KEYCHAIN:, VAULT:, OP:) is a
+// literal, even when it looks like "WORD:rest": it is returned as is when
+// allowLiteral is true and rejected with ErrLiteral otherwise.
 func Resolve(ref string, allowLiteral bool) (string, error) {
 	switch {
 	case strings.HasPrefix(ref, envPrefix):
@@ -47,7 +52,7 @@ func Resolve(ref string, allowLiteral bool) (string, error) {
 	case strings.HasPrefix(ref, filePrefix):
 		return resolveFile(strings.TrimPrefix(ref, filePrefix))
 	}
-	if scheme, ok := schemeOf(ref); ok {
+	if scheme, ok := schemeOf(ref); ok && formerSchemes[scheme] {
 		return "", fmt.Errorf("%w %q", ErrUnsupported, scheme+":")
 	}
 	if !allowLiteral {

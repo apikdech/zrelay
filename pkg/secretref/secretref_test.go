@@ -190,6 +190,40 @@ func TestResolveRejectsOtherSchemes(t *testing.T) {
 	}
 }
 
+// An upper-case "WORD:rest" prefix that is not a known scheme is ordinary
+// secret text: it must never be echoed in an error, and it is a valid literal
+// when literals are allowed.
+func TestResolveUnknownSchemeLikeLiteralDoesNotLeak(t *testing.T) {
+	for _, in := range []string{"TAPO2024:Hunter2pw", "ADMIN1:s3cret", "HUNTER2SECRET:tail", "ADMIN2024:x"} {
+		got, err := Resolve(in, true)
+		if err != nil || got != in {
+			t.Fatalf("Resolve(%q, true) = %q, %v; want the literal", in, got, err)
+		}
+		_, err = Resolve(in, false)
+		if !errors.Is(err, ErrLiteral) {
+			t.Fatalf("Resolve(%q, false): err = %v, want ErrLiteral", in, err)
+		}
+		prefix := in[:strings.IndexByte(in, ':')]
+		for _, frag := range []string{prefix, in[len(prefix)+1:], in[:3]} {
+			if strings.Contains(err.Error(), frag) {
+				t.Fatalf("error %q contains fragment %q of the input", err, frag)
+			}
+		}
+	}
+}
+
+func TestResolveKnownFormerSchemeErrorLeaksNoBody(t *testing.T) {
+	for _, in := range []string{"KEYCHAIN:acctpw", "VAULT:secretpath"} {
+		_, err := Resolve(in, true)
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("Resolve(%q): err = %v, want ErrUnsupported", in, err)
+		}
+		if body := in[strings.IndexByte(in, ':')+1:]; strings.Contains(err.Error(), body) {
+			t.Fatalf("error %q leaks the reference body", err)
+		}
+	}
+}
+
 func TestIsRef(t *testing.T) {
 	for s, want := range map[string]bool{
 		"ENV:FOO":       true,
