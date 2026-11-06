@@ -3,11 +3,54 @@
 // from the bytes it is given: a chunk whose first byte is `c` covers
 // [c, c + 1) seconds, which matches the fixture clip below (one second per
 // 64 KiB chunk, one fragment per chunk).
+import { readFileSync } from 'node:fs';
 import type { ClipOpenResult, ClipReadResult, Request } from '../src/worker/protocol';
 
 export const CHUNK = 65536;
 
 export type R = [number, number];
+
+/**
+ * A clip's byte layout, for a SourceBuffer that parses like the real thing: bytes only become buffered
+ * time once a whole fragment has been appended in one unbroken run, and abort() drops a partial one.
+ * Chunk `c` is `CHUNK` bytes all equal to `c`, so an append's plaintext offset is recoverable from it.
+ */
+export interface Layout {
+  /** `video.seek_index`: [t_ms, plaintext offset] per fragment. */
+  seekIndex: [number, number][];
+  /** Bytes of the init segment, at the start of the plaintext. */
+  initBytes: number;
+  /** Plaintext length (a whole number of chunks in the fake). */
+  totalBytes: number;
+  durationMs: number;
+}
+
+const FIXTURE_SIDECAR = new URL(
+  '../../testdata/clips/complete/zrelay/clips/front-door/2026/11/06/171606359_01M6RXRJAQRJY105FSDF0QRBH0.json',
+  import.meta.url,
+);
+
+/**
+ * A clip laid out like the committed fixture: 2 s fragments at the fixture's own seek_index offsets
+ * (mid-chunk, spanning chunk boundaries, several per chunk), its fragment sizes repeating to `durationMs`.
+ * Fewer than 256 chunks, so the chunk number fits the fake's one-byte fill.
+ */
+export function fixtureLayout(durationMs = 120_000): Layout {
+  const sc = JSON.parse(readFileSync(FIXTURE_SIDECAR, 'utf8')) as {
+    video: { seek_index: [number, number][]; init_segment_bytes: number; plaintext_size_bytes: number };
+  };
+  const src = sc.video.seek_index;
+  const sizes = src.map(([, off], i) => (src[i + 1]?.[1] ?? sc.video.plaintext_size_bytes) - off);
+  const seekIndex: [number, number][] = [];
+  let off = sc.video.init_segment_bytes;
+  for (let i = 0; i * 2000 < durationMs; i++) {
+    seekIndex.push([i * 2000, off]);
+    off += sizes[i % sizes.length]!;
+  }
+  const totalBytes = Math.ceil(off / CHUNK) * CHUNK;
+  if (totalBytes / CHUNK > 255) throw new Error('layout too long for the fake');
+  return { seekIndex, initBytes: sc.video.init_segment_bytes, totalBytes, durationMs };
+}
 
 class FakeRanges {
   constructor(private readonly r: R[]) {}
@@ -55,7 +98,16 @@ export class FakeSourceBuffer extends EventTarget {
   aborts = 0;
   /** Number of upcoming appendBuffer calls that throw QuotaExceededError. */
   quotaFailures = 0;
-  /** Appends still allowed before the next one throws (Infinity: unlimited). */
+  /** Set by the media source it belongs to; appending to an ended source reopens it. */
+  source: FakeMediaSource | null = null;
+  /** With a layout, buffered time comes from completed fragments instead of the chunk number. */
+  layout: Layout | null = null;
+  /** Appends that broke the parser's rules (a gap without abort, a fragment-less start after abort). */
+  violations: string[] = [];
+  private known = false;
+  private pos = 0;
+  /** Index of the fragment being assembled; -1 while in the init segment. */
+  private asm = -1;
   get buffered(): FakeRanges {
     return new FakeRanges(this.ranges);
   }
@@ -79,15 +131,65 @@ export class FakeSourceBuffer extends EventTarget {
       ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
       : new Uint8Array(data);
     this.appends.push(u8.slice());
+    if (this.source?.readyState === 'ended') this.source.readyState = 'open';
     const c = u8[0] ?? 0;
+    if (this.layout) {
+      const end = (c + 1) * CHUNK;
+      const added = this.parse(end - u8.length, end);
+      this.finish(() => {
+        this.ranges = mergeRanges([...this.ranges, ...added]);
+      });
+      return;
+    }
     this.finish(() => {
       this.ranges = mergeRanges([...this.ranges, [c, c + 1]]);
     });
   }
 
+  /** The segment parser: consumes plaintext bytes [start, end) and returns the time ranges that completed. */
+  private parse(start: number, end: number): R[] {
+    const l = this.layout!;
+    const at = l.seekIndex.findIndex(([, o]) => o === start);
+    // Between segments (after a reset, or with the last fragment complete) any fragment may start next, as in
+    // a real parser; in the middle of one the bytes must continue where they stopped.
+    const f = l.seekIndex[this.asm];
+    const atBoundary = !this.known || (this.asm === -1 ? this.pos === 0 : f === undefined || this.pos === f[1]);
+    if (atBoundary) {
+      if (start === 0) this.asm = -1;
+      else if (at >= 0) this.asm = at;
+      else {
+        this.violations.push(`append at ${start} after a parser reset is not a fragment start`);
+        this.known = false;
+        return [];
+      }
+      this.known = true;
+    } else if (start !== this.pos) {
+      this.violations.push(`append at ${start} but the parser expected ${this.pos}`);
+      this.known = false;
+      return [];
+    }
+    this.pos = end;
+    const done: R[] = [];
+    for (;;) {
+      if (this.asm === -1) {
+        if (end < l.initBytes) break;
+        this.asm = 0;
+        continue;
+      }
+      const f = l.seekIndex[this.asm];
+      if (!f) break;
+      const fEnd = l.seekIndex[this.asm + 1]?.[1] ?? l.totalBytes;
+      if (end < fEnd) break;
+      done.push([f[0] / 1000, (l.seekIndex[this.asm + 1]?.[0] ?? l.durationMs) / 1000]);
+      this.asm++;
+    }
+    return done;
+  }
+
   remove(start: number, end: number): void {
     if (this.updating) throw new DOMException('still updating', 'InvalidStateError');
     this.removes.push([start, end]);
+    if (this.source?.readyState === 'ended') this.source.readyState = 'open';
     this.finish(() => {
       this.ranges = subtract(this.ranges, start, end);
     });
@@ -95,6 +197,7 @@ export class FakeSourceBuffer extends EventTarget {
 
   abort(): void {
     this.aborts++;
+    this.known = false; // the partial fragment, if any, is dropped
   }
 }
 
@@ -106,10 +209,14 @@ export class FakeMediaSource extends EventTarget {
   readyState: 'closed' | 'open' | 'ended' = 'closed';
   sb: FakeSourceBuffer | null = null;
   mime = '';
+  /** Applied to every SourceBuffer this source creates. */
+  layout: Layout | null = null;
   endedWith: string | undefined | null = null;
   addSourceBuffer(mime: string): FakeSourceBuffer {
     this.mime = mime;
     this.sb = new FakeSourceBuffer();
+    this.sb.source = this;
+    this.sb.layout = this.layout;
     return this.sb;
   }
   endOfStream(err?: string): void {
@@ -180,7 +287,7 @@ export interface Env {
 type G = Record<string, unknown>;
 
 /** Installs MediaSource/ManagedMediaSource globals and URL.createObjectURL stubs. */
-export function installMedia(opts: { mms?: boolean; mse?: boolean } = {}): Env {
+export function installMedia(opts: { mms?: boolean; mse?: boolean; layout?: Layout } = {}): Env {
   const g = globalThis as unknown as G;
   const saved = {
     MediaSource: g.MediaSource,
@@ -198,12 +305,14 @@ export function installMedia(opts: { mms?: boolean; mse?: boolean } = {}): Env {
   const MS = class extends FakeMediaSource {
     constructor() {
       super();
+      this.layout = opts.layout ?? null;
       created.push(this);
     }
   };
   const MMS = class extends FakeManagedMediaSource {
     constructor() {
       super();
+      this.layout = opts.layout ?? null;
       created.push(this);
     }
   };
@@ -265,6 +374,16 @@ export function openResult(over: Partial<ClipOpenResult> = {}): ClipOpenResult {
   };
 }
 
+/** An `openResult` for a clip with this byte layout. */
+export function layoutOpen(l: Layout): ClipOpenResult {
+  return openResult({
+    numChunks: l.totalBytes / CHUNK,
+    seekIndex: l.seekIndex,
+    initSegmentBytes: l.initBytes,
+    plaintextSizeBytes: l.totalBytes,
+  });
+}
+
 export interface FakeClientOpts {
   open?: ClipOpenResult | Error;
   /** Per-chunk override: throw to fail a read. */
@@ -279,6 +398,12 @@ export class FakeClient {
   /** Resolvers for reads held by `hold`. */
   held = new Map<number, () => void>();
   hold = new Set<number>();
+  private waiting = new Map<number, (() => void)[]>();
+  /** Stops holding new reads and frees every read held so far. */
+  releaseAll(): void {
+    this.hold.clear();
+    for (const f of [...this.held.values()]) f();
+  }
   constructor(public opts: FakeClientOpts = {}) {}
 
   async call<T = unknown>(msg: Request): Promise<T> {
@@ -291,7 +416,18 @@ export class FakeClient {
       }
       case 'clip.read': {
         this.reads.push(msg.chunk);
-        if (this.hold.has(msg.chunk)) await new Promise<void>((r) => this.held.set(msg.chunk, r));
+        if (this.hold.has(msg.chunk)) {
+          // Every read of a held chunk waits, however many are in flight; `held.get(c)()` frees them all.
+          await new Promise<void>((r) => {
+            const w = this.waiting.get(msg.chunk) ?? [];
+            w.push(r);
+            this.waiting.set(msg.chunk, w);
+            this.held.set(msg.chunk, () => {
+              for (const x of this.waiting.get(msg.chunk) ?? []) x();
+              this.waiting.delete(msg.chunk);
+            });
+          });
+        }
         const n = (this.opts.open && !(this.opts.open instanceof Error) ? this.opts.open.numChunks : 10) as number;
         const custom = this.opts.read?.(msg.chunk);
         if (custom instanceof Error) throw custom;

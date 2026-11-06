@@ -6,7 +6,7 @@ import type { ClipOpenResult, ClipReadResult, Request, Verification } from '../.
 import { ErrAuth, ErrAuthHeader, ErrFormat, ErrTrailingData, ErrTruncated, ErrUnknownKey } from '../zrec/errors';
 import type { WorkerClient } from '../workerClient';
 import { findNextClip } from './advance';
-import { BLOB_LRU, BLOB_MAX, WINDOWS, failureTimeMs, isBuffered, needsMore, planEviction, planResume, planSeek, type Profile } from './buffer';
+import { BLOB_LRU, BLOB_MAX, WINDOWS, alignToFragments, failureTimeMs, feedsRange, isBuffered, needsMore, planEviction, planResume, planSeek, type Profile } from './buffer';
 import { BlobLru, blobFromParts } from './blob';
 import { mseCtor, mseSupports, openSink, type MseKind, type Sink } from './mse';
 import { initialState } from './status';
@@ -78,6 +78,11 @@ class PlayerImpl implements Player {
    * browser clamping the playhead to the end of the buffer until the fragment is complete) is not a new scrub.
    */
   #fetching: { fragmentMs: number; gen: number } | null = null;
+  /**
+   * Where the running sequential fill is: its generation and the plaintext offset of the next byte it appends.
+   * Null when no fill is running (not started, ended, or failed).
+   */
+  #fillAt: { gen: number; offset: number } | null = null;
   #autoAdvance = false;
   #destroyed = false;
   readonly #win;
@@ -269,6 +274,8 @@ class PlayerImpl implements Player {
     // A seek always fetches its first chunk: the playhead has not moved yet, so the buffer window
     // (and ManagedMediaSource's streaming flag) still describe the old position.
     let force = onFirst !== undefined;
+    const size = open.header.chunkSize;
+    this.#fillAt = { gen: g, offset: from * size + intra };
     try {
       while (g === this.#gen && c < open.numChunks) {
         if (!force && !this.#wantMore(sink)) {
@@ -281,7 +288,7 @@ class PlayerImpl implements Player {
         if (c + 1 < open.numChunks && !pending.has(c + 1)) pending.set(c + 1, this.#read(c + 1));
         const res = await cur;
         if (g !== this.#gen) return;
-        await this.#append(sink, new Uint8Array(res.plaintext, c === from ? intra : 0));
+        await this.#append(g, sink, new Uint8Array(res.plaintext, c === from ? intra : 0));
         if (g !== this.#gen) return;
         this.#appended = true;
         onFirst?.();
@@ -291,7 +298,8 @@ class PlayerImpl implements Player {
           return;
         }
         c++;
-        await this.#evictBehind(sink, false);
+        this.#fillAt = { gen: g, offset: c * size };
+        await this.#evictBehind(g, sink, false);
       }
     } catch (e) {
       if (g !== this.#gen) return;
@@ -299,25 +307,31 @@ class PlayerImpl implements Player {
       // What was verified plays out, then the stream ends.
       await sink.endOfStream().catch(() => undefined);
     } finally {
+      if (this.#fillAt?.gen === g) this.#fillAt = null;
       onFirst?.();
     }
   }
 
-  async #append(sink: Sink, bytes: Uint8Array): Promise<void> {
+  async #append(g: number, sink: Sink, bytes: Uint8Array): Promise<void> {
     try {
       await sink.append(bytes);
     } catch (e) {
       if (!isQuota(e)) throw e;
-      // ui-spec §4.3.2: evict immediately, then retry once.
-      await this.#evictBehind(sink, true);
+      // ui-spec §4.3.2: evict immediately, then retry once (unless a newer seek reset the parser meanwhile).
+      await this.#evictBehind(g, sink, true);
+      if (g !== this.#gen) return;
       await sink.append(bytes);
     }
   }
 
   /** Removes what is older than `currentTime − behind_seconds` (a tighter bound after a quota error). */
-  async #evictBehind(sink: Sink, tight: boolean): Promise<void> {
+  async #evictBehind(g: number, sink: Sink, tight: boolean): Promise<void> {
     const win = tight ? { ...this.#win, behindSeconds: Math.min(this.#win.behindSeconds, 2) } : this.#win;
-    for (const [s, e] of planEviction(sink.buffered(), this.#head(), win).behind) await sink.remove(s, e);
+    for (const [s, e] of planEviction(sink.buffered(), this.#head(), win).behind) {
+      // A newer seek has taken over: what this fill planned to trim may be what that seek is about to play.
+      if (g !== this.#gen) return;
+      await sink.remove(s, e);
+    }
   }
 
   // ---- Blob path -----------------------------------------------------------
@@ -380,91 +394,86 @@ class PlayerImpl implements Player {
   // ---- seek ----------------------------------------------------------------
 
   /**
-   * The viewer dragged the native seek bar (or the browser moved the playhead on its own). A target
-   * that is not buffered must go through the seek planner, or the sequential fill would carry on from
-   * its old chunk. The engine's own assignment of currentTime plans as buffered, so it does not re-enter.
+   * The viewer dragged the native seek bar (or the browser moved the playhead on its own). Goes through the
+   * same path as seek(), minus assigning currentTime: the browser already did.
    */
   #nativeSeek(): void {
-    const open = this.#open;
-    const sink = this.#sink;
-    if (!open || !sink || !this.#appended) return;
-    const tMs = this.video.currentTime * 1000;
-    const st = this.#state;
-    if (st.integrity === 'tampered' && st.failedAtMs !== null) {
-      // At the failure point the clamp's own assignment lands here: nothing to fetch, nothing to clamp.
-      if (tMs > st.failedAtMs + 1) void this.seek(tMs);
-      if (tMs >= st.failedAtMs - 1) return;
-    }
-    const plan = planSeek({ tMs, seekIndex: open.seekIndex, chunkSize: open.header.chunkSize, buffered: sink.buffered() });
-    if (plan.kind === 'buffered') {
-      // A drag that ends inside the buffer while an earlier one is still fetching: the later one wins.
-      const settling = this.#seekHead !== null;
-      this.#fetching = null;
-      if (settling) {
-        this.#seekTok++;
-        this.#resumeBuffered(open, sink, tMs);
-      }
-    }
-    if (plan.kind !== 'fetch') return;
-    const f = this.#fetching;
-    if (f && f.gen === this.#gen && f.fragmentMs === plan.fragmentMs) return;
-    void this.seek(tMs);
-  }
-
-  /**
-   * A seek landed inside the buffer while an earlier fetch seek was still settling. Stop that seek's fill
-   * (its token is already stale, so it never moves the playhead), drop what it left beyond the window, and
-   * carry on sequentially from the end of the buffered range holding the target.
-   */
-  #resumeBuffered(open: ClipOpenResult, sink: Sink, tMs: number): void {
-    const g = ++this.#gen;
-    this.#seekHead = null;
-    this.#fetching = null;
-    this.#signal();
-    const resume = planResume({ tMs, seekIndex: open.seekIndex, chunkSize: open.header.chunkSize, buffered: sink.buffered() });
-    void (async () => {
-      try {
-        // The stopped fill may have been part-way through a fragment: reset the parser before appending again.
-        await sink.abort();
-        if (g !== this.#gen) return;
-        for (const [s, e] of planEviction(sink.buffered(), tMs / 1000, this.#win).ahead) await sink.remove(s, e);
-        if (g !== this.#gen || !resume) return;
-        await this.#fill(g, open, sink, resume.chunk, resume.intraOffset);
-      } catch (e) {
-        if (g === this.#gen) this.#fail(e, resume?.chunk ?? 0);
-      }
-    })();
+    void this.#move(this.video.currentTime * 1000, true);
   }
 
   async seek(tMs: number): Promise<void> {
+    await this.#move(tMs, false);
+  }
+
+  /**
+   * The one place the playhead moves: seek() and the browser's own `seeking` both end up here, and
+   * `#seekTok` makes the latest call win. Every position it works with comes from planSeek over the
+   * seek_index (Contract §6.4), the resume point after an in-buffer move included.
+   *
+   * `native`: the browser already assigned currentTime. A target that is not buffered must still go through
+   * the planner, or the sequential fill would carry on from its old chunk. The engine's own assignment of
+   * currentTime plans as buffered, so it does not re-enter.
+   */
+  async #move(tMs: number, native: boolean): Promise<void> {
     const open = this.#open;
     const sink = this.#sink;
-    const tok = ++this.#seekTok;
     let target = Math.max(0, tMs);
-    if (this.#state.integrity === 'tampered' && this.#state.failedAtMs !== null) {
-      // Never play (or fetch) past the last verified frame.
-      const limit = this.#state.failedAtMs;
-      target = Math.min(target, limit);
-      if (target >= limit) {
-        this.#seekHead = null;
-        this.video.currentTime = target / 1000;
+    const st = this.#state;
+    if (st.integrity === 'tampered' && st.failedAtMs !== null) {
+      // Never play (or fetch) past the last verified frame. At the failure point itself the browser's own
+      // assignment lands here: nothing to fetch, nothing to clamp.
+      const limit = st.failedAtMs;
+      if (target >= (native ? limit - 1 : limit)) {
+        this.#seekTok++;
+        if (!native || target > limit + 1) {
+          this.#seekHead = null;
+          this.video.currentTime = Math.min(target, limit) / 1000;
+        }
         return;
       }
     }
     if (!open || !sink) {
-      this.#seekHead = null;
-      this.video.currentTime = target / 1000;
+      if (!native) {
+        this.#seekTok++;
+        this.#seekHead = null;
+        this.video.currentTime = target / 1000;
+      }
       return;
     }
+    // Before the first fragment is appended the initial fetch is the one in progress.
+    if (native && !this.#appended) return;
     const plan = planSeek({ tMs: target, seekIndex: open.seekIndex, chunkSize: open.header.chunkSize, buffered: sink.buffered() });
     if (plan.kind !== 'fetch') {
+      ++this.#seekTok;
       const settling = plan.kind === 'buffered' && this.#seekHead !== null;
       this.#seekHead = null;
-      this.video.currentTime = target / 1000;
+      if (plan.kind === 'buffered') this.#fetching = null;
+      if (!native) this.video.currentTime = target / 1000;
       this.#signal();
-      if (settling) this.#resumeBuffered(open, sink, target); // supersedes a fetch seek that is still settling
+      if (plan.kind === 'buffered') {
+        // A move inside the buffer supersedes a fetch seek that is still settling (its token is stale now), and
+        // must re-aim the fill when the running one is carrying some other range: that fill would never extend
+        // the range the playhead is in.
+        const resume = planResume({
+          tMs: target,
+          seekIndex: open.seekIndex,
+          chunkSize: open.header.chunkSize,
+          buffered: sink.buffered(),
+          ended: sink.ended,
+        });
+        const at = this.#fillAt;
+        const feeding = at !== null && at.gen === this.#gen && feedsRange(sink.buffered(), target, at.offset, open.seekIndex);
+        if (!feeding && (settling || resume !== null)) this.#resumeBuffered(open, sink, target);
+      }
       return;
     }
+    // Once a fetch seek has handed the playhead over, the browser clamps it to the end of the buffer until
+    // the seek's fragment is complete: that is not a new scrub. While the seek is still settling the engine
+    // has not assigned currentTime yet, so any event is the viewer's, and the latest target wins.
+    const f = this.#fetching;
+    if (native && f && f.gen === this.#gen && f.fragmentMs === plan.fragmentMs && this.#seekHead === null) return;
+
+    const tok = ++this.#seekTok;
     // ui-spec §4.3.2 step 2: drop the old fetches (their results are ignored), reset the parser, fetch the fragment.
     const g = ++this.#gen;
     this.#fetching = { fragmentMs: plan.fragmentMs, gen: g };
@@ -476,7 +485,7 @@ class PlayerImpl implements Player {
     // Anything far ahead of the new position would otherwise leave a hole behind the sequential fill.
     // (A later seek inside the buffer may have taken over the playhead meanwhile: #head() follows it.
     // The fill below still runs, because this seek already stopped the previous one.)
-    for (const [s, e] of planEviction(sink.buffered(), this.#head(), this.#win).ahead) await sink.remove(s, e);
+    await this.#evictAhead(g, open, sink, this.#head());
     if (g !== this.#gen) return;
     await new Promise<void>((resolve) => {
       void this.#fill(g, open, sink, plan.chunk, plan.intraOffset, resolve);
@@ -487,6 +496,50 @@ class PlayerImpl implements Player {
       this.video.currentTime = target / 1000;
       this.#seekHead = null;
     }
+  }
+
+  /** Removes what is beyond `head + ahead_seconds`, starting on a fragment so that no fragment is left cut. */
+  async #evictAhead(g: number, open: ClipOpenResult, sink: Sink, head: number): Promise<void> {
+    const ahead = alignToFragments(planEviction(sink.buffered(), head, this.#win).ahead, open.seekIndex);
+    for (const [s, e] of ahead) {
+      if (g !== this.#gen) return;
+      await sink.remove(s, e);
+    }
+  }
+
+  /**
+   * A move landed inside the buffer while an earlier fetch seek was still settling. Stop that seek's fill
+   * (its token is already stale, so it never moves the playhead), drop what it left beyond the window, and
+   * carry on sequentially from the fragment holding the end of the buffered range that holds the target.
+   */
+  #resumeBuffered(open: ClipOpenResult, sink: Sink, tMs: number): void {
+    const g = ++this.#gen;
+    this.#fetching = null;
+    this.#fillAt = null;
+    this.#signal();
+    let from = 0;
+    void (async () => {
+      try {
+        // The stopped fill may have been part-way through a fragment: reset the parser before appending again.
+        await sink.abort();
+        if (g !== this.#gen) return;
+        await this.#evictAhead(g, open, sink, tMs / 1000);
+        if (g !== this.#gen) return;
+        // Plan from the buffer as the trim left it: it can end in the middle of a fragment.
+        const resume = planResume({
+          tMs,
+          seekIndex: open.seekIndex,
+          chunkSize: open.header.chunkSize,
+          buffered: sink.buffered(),
+          ended: sink.ended,
+        });
+        if (!resume) return;
+        from = resume.chunk;
+        await this.#fill(g, open, sink, resume.chunk, resume.intraOffset);
+      } catch (e) {
+        if (g === this.#gen) this.#fail(e, from);
+      }
+    })();
   }
 
   // ---- auto-advance --------------------------------------------------------
@@ -518,6 +571,7 @@ class PlayerImpl implements Player {
     this.#seekHead = null;
     this.#appended = false;
     this.#fetching = null;
+    this.#fillAt = null;
     this.#signal();
     if (this.#clipId !== null) this.#close(this.#clipId);
     this.#sink?.destroy();

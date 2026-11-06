@@ -24,6 +24,8 @@ export interface Sink {
   readonly kind: MseKind;
   /** False between `endstreaming` and `startstreaming` (ManagedMediaSource only). */
   readonly streaming: boolean;
+  /** `endOfStream()` has run and no append or remove has reopened the source since. */
+  readonly ended: boolean;
   append(data: Uint8Array): Promise<void>;
   remove(start: number, end: number): Promise<void>;
   /** Resets the segment parser (ui-spec §4.3.2). The init segment stays valid. */
@@ -60,6 +62,8 @@ class MseSink implements Sink {
   streaming = true;
   #chain: Promise<unknown> = Promise.resolve();
   #dead = false;
+  /** Removals queued but not finished. */
+  #removing: Range[] = [];
   readonly #onStart = () => this.#stream(true);
   readonly #onEnd = () => this.#stream(false);
 
@@ -75,6 +79,10 @@ class MseSink implements Sink {
       ms.addEventListener('startstreaming', this.#onStart);
       ms.addEventListener('endstreaming', this.#onEnd);
     }
+  }
+
+  get ended(): boolean {
+    return !this.#dead && this.ms.readyState === 'ended';
   }
 
   #stream(on: boolean): void {
@@ -119,7 +127,13 @@ class MseSink implements Sink {
   }
 
   remove(start: number, end: number): Promise<void> {
-    return this.#queue(() => (this.#dead ? undefined : this.#op(() => this.sb.remove(start, end))));
+    // Decisions made while the removal waits in the queue must already see its effect.
+    const pending: Range = [start, end];
+    this.#removing.push(pending);
+    const done = () => {
+      this.#removing = this.#removing.filter((r) => r !== pending);
+    };
+    return this.#queue(() => (this.#dead ? undefined : this.#op(() => this.sb.remove(start, end)))).finally(done);
   }
 
   abort(): Promise<void> {
@@ -130,11 +144,22 @@ class MseSink implements Sink {
     });
   }
 
+  /** What is buffered once every removal already queued has run. */
   buffered(): Range[] {
     if (this.#dead) return [];
     try {
       const b = this.sb.buffered;
-      return Array.from({ length: b.length }, (_, i) => [b.start(i), b.end(i)] as const);
+      let out: Range[] = Array.from({ length: b.length }, (_, i) => [b.start(i), b.end(i)] as const);
+      for (const [a, z] of this.#removing) {
+        out = out.flatMap(([s, e]): Range[] => {
+          if (e <= a || s >= z) return [[s, e]];
+          const keep: Range[] = [];
+          if (s < a) keep.push([s, a]);
+          if (e > z) keep.push([z, e]);
+          return keep;
+        });
+      }
+      return out;
     } catch {
       return [];
     }

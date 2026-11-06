@@ -53,6 +53,9 @@ export function detectProfile(): Profile {
 /** The first frame of a fragment rarely sits at exactly 0.000 s. */
 const START_SLACK = 0.25;
 
+/** How far short of the next fragment start a buffered range can end and still count as having reached it. */
+const END_SLACK = 0.1;
+
 /** The range holding `t` (allowing a hair before its start), or undefined. */
 function holding(ranges: readonly Range[], t: number): Range | undefined {
   return ranges.find(([s, e]) => t >= s - START_SLACK && t < e);
@@ -70,6 +73,21 @@ export function bufferedAhead(ranges: readonly Range[], t: number): number {
 /** ui-spec §4.3.1 step 3: keep fetching while `buffered.end − currentTime < ahead_seconds`. */
 export function needsMore(ranges: readonly Range[], t: number, win: BufferWindow): boolean {
   return bufferedAhead(ranges, t) < win.aheadSeconds;
+}
+
+/**
+ * Moves the start of each range up to the next fragment start (dropping what would be empty), so trimming
+ * never cuts through a fragment: the buffer then ends on a complete one, and a resume knows where to pick up.
+ * Without an index the ranges are returned as they are.
+ */
+export function alignToFragments(ranges: readonly Range[], seekIndex: readonly SeekEntry[]): Range[] {
+  if (seekIndex.length === 0) return [...ranges];
+  const out: Range[] = [];
+  for (const [s, e] of ranges) {
+    const next = seekIndex.find(([t]) => t / 1000 >= s - 1e-9);
+    if (next && next[0] / 1000 < e) out.push([next[0] / 1000, e]);
+  }
+  return out;
 }
 
 export interface Eviction {
@@ -124,20 +142,48 @@ export interface ResumeInput {
   seekIndex: readonly SeekEntry[];
   chunkSize: number;
   buffered: readonly Range[];
+  /** The media source has ended: the final chunk is appended and nothing was removed since. */
+  ended?: boolean;
 }
 
 /**
- * Where a sequential fill picks up for a target inside the buffer: the first fragment that starts at the
- * end of the buffered range holding the target. Null when there is nothing to continue with (the target
- * is not buffered, there is no index, or that range already reaches the last fragment).
+ * Where a sequential fill picks up for a target inside the buffer: the fragment holding the end of the
+ * buffered range that holds the target, found with the seek planner (Contract §6.4) like any other position.
+ * The range end can sit inside that fragment (a fill stops on a chunk boundary, not a fragment boundary), so
+ * the fragment is the last one starting at or before the end, with a hair of slack for a range that ends just
+ * short of the next start. Re-appending the part already buffered is harmless in `segments` mode.
+ *
+ * Null only when there is nothing to continue with: the target is not buffered, there is no index, or the
+ * range already reaches the end of the clip (the stream has ended and no range follows it).
  */
 export function planResume(i: ResumeInput): { chunk: number; intraOffset: number } | null {
   const r = holding(i.buffered, i.tMs / 1000);
   if (!r || i.seekIndex.length === 0) return null;
-  const endMs = r[1] * 1000 - START_SLACK * 1000;
-  const next = i.seekIndex.find(([t]) => t >= endMs);
-  if (!next) return null;
-  return { chunk: Math.floor(next[1] / i.chunkSize), intraOffset: next[1] % i.chunkSize };
+  if (i.ended && i.buffered.every(([, e]) => e <= r[1])) return null;
+  const plan = planSeek({
+    tMs: r[1] * 1000 + END_SLACK * 1000,
+    seekIndex: i.seekIndex,
+    chunkSize: i.chunkSize,
+    buffered: [],
+  });
+  return plan.kind === 'fetch' ? { chunk: plan.chunk, intraOffset: plan.intraOffset } : null;
+}
+
+/**
+ * True when a sequential fill whose next byte is plaintext `offset` is already carrying the range that holds
+ * `tMs`: the fragment it is assembling starts inside that range or right at its end, so it re-appends up to the
+ * end and then extends it. A fill anywhere else (feeding a different range) never extends this one, however
+ * much it appends.
+ */
+export function feedsRange(buffered: readonly Range[], tMs: number, offset: number, seekIndex: readonly SeekEntry[]): boolean {
+  const r = holding(buffered, tMs / 1000);
+  if (!r || seekIndex.length === 0) return false;
+  let at = seekIndex[0]![0];
+  for (const [t, o] of seekIndex) {
+    if (o <= offset) at = t;
+    else break;
+  }
+  return at / 1000 >= r[0] - START_SLACK && at / 1000 <= r[1] + START_SLACK;
 }
 
 /**

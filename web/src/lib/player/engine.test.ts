@@ -6,7 +6,9 @@ import {
   FakeManagedMediaSource,
   FakeMediaSource,
   chunkBytes,
+  fixtureLayout,
   installMedia,
+  layoutOpen,
   openResult,
   tick,
   until,
@@ -812,4 +814,366 @@ describe('auto-advance', () => {
     await tick(50);
     expect(c.calls.filter((m) => m.type === 'clip.open')).toHaveLength(1);
   });
+});
+
+// ---- overlapping seeks when fragments do not line up with chunks ------------
+
+describe('double scrub with a fragment every 4 chunks', () => {
+  const frag4 = () => {
+    const n = 100;
+    return openResult({ numChunks: n, seekIndex: Array.from({ length: n / 4 }, (_, i) => [i * 4000, i * 4 * CHUNK]) });
+  };
+  const holdingEnd = (t: number) => sb().ranges.find(([s, e]) => s <= t && e > t)?.[1];
+
+  /** Mobile, buffered [0, 30]; the first drag (to 70 s, fragment at chunk 68) is stuck on chunk 68. */
+  async function firstDragHeld() {
+    const c = new FakeClient({ open: frag4() });
+    const { p } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    c.hold.add(68);
+    return { c, p };
+  }
+
+  async function finish(c: FakeClient, readsBefore: number) {
+    c.held.get(68)!();
+    await tick(50);
+    await new Promise<void>((r) => setTimeout(r, 20));
+    // Play on to 29 s: the range holding the playhead must stay contiguous past 30 s and stop about 30 s ahead.
+    env.video.currentTime = 29;
+    env.video.fire('timeupdate');
+    await until(() => (holdingEnd(29) ?? 0) >= 59, '30 s ahead of 29 s buffered, contiguous');
+    await tick(50);
+    await new Promise<void>((r) => setTimeout(r, 20));
+    expect(holdingEnd(29)!).toBeLessThanOrEqual(63);
+    expect(Math.max(...c.reads.slice(readsBefore))).toBeLessThan(68); // nothing towards the end of the clip
+    expect(sb().appends.every((a) => (a[0] ?? 0) < 68)).toBe(true);
+    expect(sb().ranges.every(([s]) => s < 68)).toBe(true);
+  }
+
+  it('native scrubs: far, then back inside the buffer', async () => {
+    const { c, p } = await firstDragHeld();
+    env.video.currentTime = 70;
+    env.video.fire('seeking');
+    await until(() => c.held.has(68), 'read of chunk 68 in flight');
+    env.video.currentTime = 5;
+    env.video.fire('seeking');
+    await tick(50);
+    const readsBefore = c.reads.length;
+    await finish(c, readsBefore);
+    expect(env.video.currentTime).toBe(29);
+    p.destroy();
+  });
+
+  it('direct seeks: far, then back inside the buffer', async () => {
+    const { c, p } = await firstDragHeld();
+    const a = p.seek(70_000);
+    await until(() => c.held.has(68), 'read of chunk 68 in flight');
+    await p.seek(5000);
+    const readsBefore = c.reads.length;
+    await finish(c, readsBefore);
+    await a;
+    expect(env.video.currentTime).toBe(29);
+    p.destroy();
+  });
+});
+
+// ---- sequences of seeks over the committed fixture's fragment layout ---------
+
+describe('seek sequences over the fixture layout (2 s fragments at mid-chunk offsets)', () => {
+  const L = fixtureLayout(120_000);
+  const NCHUNKS = L.totalBytes / CHUNK;
+  const AHEAD = 30;
+  const holding = (t: number) => sb().ranges.find(([s, e]) => s - 0.25 <= t && t < e);
+  /** The chunk holding the first byte of the fragment that contains `tMs` (Contract §6.4). */
+  const fragChunk = (tMs: number) => {
+    let off = L.seekIndex[0]![1];
+    for (const [t, o] of L.seekIndex) if (t <= tMs) off = o;
+    return Math.floor(off / CHUNK);
+  };
+  /** The last chunk of the fragment containing `tMs`, plus the one chunk the fill prefetches. */
+  const lastChunk = (tMs: number) => {
+    let i = 0;
+    L.seekIndex.forEach(([t], k) => {
+      if (t <= tMs) i = k;
+    });
+    const end = L.seekIndex[i + 1]?.[1] ?? L.totalBytes;
+    return Math.min(NCHUNKS - 1, Math.floor((end - 1) / CHUNK) + 1);
+  };
+
+  type Op =
+    | { k: 'seek'; t: number; n?: number }
+    | { k: 'scrub'; t: number; n?: number }
+    | { k: 'play'; t: number }
+    | { k: 'wait'; n?: number }
+    | { k: 'release' }
+    | { k: 'settle' };
+
+  /** Waits until neither reads, appends nor removes have changed for a few polls. */
+  async function settle(c: FakeClient): Promise<void> {
+    let prev = '';
+    let same = 0;
+    for (let i = 0; i < 1000 && same < 6; i++) {
+      await new Promise<void>((r) => setTimeout(r, 2));
+      const now = `${c.reads.length}/${sb().appends.length}/${sb().removes.length}/${sb().aborts}`;
+      same = now === prev ? same + 1 : 0;
+      prev = now;
+    }
+  }
+
+  async function rig(hold: number[] = []) {
+    env.restore();
+    env = installMedia({ mms: false, layout: L });
+    const c = new FakeClient({ open: layoutOpen(L) });
+    const { p } = make(c, 'mobile');
+    await p.load(CLIP);
+    await settle(c);
+    expect(holding(0)![1]).toBeGreaterThanOrEqual(AHEAD);
+    for (const h of hold) c.hold.add(h);
+    return { c, p };
+  }
+
+  /** Runs the ops without waiting for them to settle; returns the target of the last seek or scrub. */
+  async function run(c: FakeClient, p: Player, ops: Op[], pending: Promise<void>[]) {
+    let target = 0;
+    let marker = c.reads.length;
+    for (const op of ops) {
+      if (op.k === 'seek') {
+        marker = c.reads.length;
+        target = op.t;
+        pending.push(p.seek(op.t));
+      } else if (op.k === 'scrub') {
+        marker = c.reads.length;
+        target = op.t;
+        env.video.currentTime = op.t / 1000;
+        env.video.fire('seeking');
+      } else if (op.k === 'play') {
+        env.video.currentTime = op.t / 1000;
+        env.video.fire('timeupdate');
+      } else if (op.k === 'release') {
+        c.releaseAll();
+      } else if (op.k === 'settle') {
+        await settle(c);
+      }
+      await tick(op.k === 'wait' ? (op.n ?? 30) : 'n' in op && op.n !== undefined ? op.n : 4);
+    }
+    return { target, marker };
+  }
+
+  /** The invariants every sequence of seeks must leave behind once everything has settled. */
+  function check(c: FakeClient, target: number, marker: number, label: string, strict = true): void {
+    const t = target / 1000;
+    expect(sb().violations, `${label}: parser violations`).toEqual([]);
+    expect(env.video.currentTime, `${label}: the playhead ends at the latest target`).toBeCloseTo(t, 6);
+    const h = holding(t);
+    expect(h, `${label}: the target is buffered`).toBeDefined();
+    expect(h![1], `${label}: contiguous to ${AHEAD} s ahead (or the clip end)`).toBeGreaterThanOrEqual(Math.min(t + AHEAD, 120) - 1e-6);
+    // Trimming the buffer to the window cuts a range mid-fragment: the fill must resume from the fragment that was
+    // cut. Resuming from a stale end would leave a hole and a stray range further on, and playback would stall.
+    if (strict) {
+      expect(
+        sb().ranges.filter(([s]) => s > h![1]),
+        `${label}: nothing is buffered past the end of the range holding the playhead`,
+      ).toEqual([]);
+    }
+    const head = env.video.currentTime * 1000;
+    for (const r of c.reads.slice(marker)) {
+      // A fill that was already inside the target's range may re-append what is buffered (back to the behind window);
+      // a stale fill from an earlier seek must not read anywhere else.
+      const low = strict ? target : Math.max(0, target - 17_000);
+      expect(r, `${label}: read ${r} is before the target's fragment`).toBeGreaterThanOrEqual(fragChunk(low));
+      expect(r, `${label}: read ${r} is beyond the window`).toBeLessThanOrEqual(lastChunk(head + (AHEAD + 4) * 1000));
+    }
+  }
+
+  async function execute(label: string, ops: Op[], hold: number[]) {
+    const { c, p } = await rig(hold);
+    const pending: Promise<void>[] = [];
+    const { target, marker } = await run(c, p, ops, pending);
+    c.releaseAll();
+    await settle(c);
+    await Promise.race([
+      Promise.all(pending),
+      new Promise<void>((_, rej) => setTimeout(() => rej(new Error(`${label}: a seek never resolved`)), 2000)),
+    ]);
+    check(c, target, marker, label);
+    p.destroy();
+  }
+
+  // The first chunk of the fragments at 70 s and 90 s.
+  const C70 = fragChunk(70_000);
+  const C90 = fragChunk(90_000);
+  const C20 = fragChunk(20_000);
+
+  const table: [string, Op[], number[]][] = [
+    ['native far then native back in the buffer', [{ k: 'scrub', t: 70_000 }, { k: 'wait' }, { k: 'scrub', t: 5000 }], [C70]],
+    ['direct far then direct back in the buffer', [{ k: 'seek', t: 70_000 }, { k: 'wait' }, { k: 'seek', t: 5000 }], [C70]],
+    ['native far then direct back in the buffer', [{ k: 'scrub', t: 70_000 }, { k: 'wait' }, { k: 'seek', t: 5000 }], [C70]],
+    ['direct far then native back in the buffer', [{ k: 'seek', t: 70_000 }, { k: 'wait' }, { k: 'scrub', t: 5000 }], [C70]],
+    ['far, farther, then back in the buffer', [{ k: 'seek', t: 70_000 }, { k: 'wait' }, { k: 'scrub', t: 90_000 }, { k: 'wait' }, { k: 'seek', t: 12_000 }], [C70, C90]],
+    ['far, back in the buffer, far again', [{ k: 'scrub', t: 70_000 }, { k: 'wait' }, { k: 'scrub', t: 5000 }, { k: 'wait' }, { k: 'seek', t: 90_000 }], [C70, C90]],
+    ['two fetch seeks, the first released after the second', [{ k: 'seek', t: 70_000 }, { k: 'wait' }, { k: 'seek', t: 90_000 }, { k: 'release' }], [C70, C90]],
+    ['in-buffer seeks only', [{ k: 'seek', t: 3000 }, { k: 'scrub', t: 25_000 }, { k: 'seek', t: 14_100 }], []],
+    ['mid-fragment targets', [{ k: 'scrub', t: 71_990 }, { k: 'wait' }, { k: 'scrub', t: 29_900 }], [C70]],
+    ['target exactly on a fragment start', [{ k: 'seek', t: 70_000 }, { k: 'wait' }, { k: 'seek', t: 28_000 }], [C70]],
+    ['target in the fragment the buffer ends in', [{ k: 'seek', t: 70_000 }, { k: 'wait' }, { k: 'scrub', t: 29_500 }], [C70]],
+    ['backward fetch seek then in-buffer scrub', [{ k: 'seek', t: 100_000 }, { k: 'release' }, { k: 'wait', n: 200 }, { k: 'seek', t: 20_000 }, { k: 'wait' }, { k: 'scrub', t: 24_000 }], [C20]],
+    // The first seek has settled and its fill idles about 30 s past it; the old buffer is cut to [t-15, 30].
+    ['settled fetch seek, then a move into the rest of the old buffer (direct)', [{ k: 'seek', t: 36_841 }, { k: 'settle' }, { k: 'seek', t: 23_000 }], []],
+    ['settled fetch seek, then a move into the rest of the old buffer (native)', [{ k: 'scrub', t: 36_841 }, { k: 'settle' }, { k: 'scrub', t: 23_000 }], []],
+    ['settled fetch seek, native scrub into the old buffer, then direct seek within it', [{ k: 'seek', t: 36_841 }, { k: 'settle' }, { k: 'scrub', t: 22_000 }, { k: 'seek', t: 25_100 }], []],
+    // The second fetch seek queues the removal of the first one's tail; a move into that tail must not plan from it.
+    ...Array.from({ length: 14 }, (_, n): [string, Op[], number[]] => [
+      `a move into a tail whose removal is already queued (${n} ticks between)`,
+      [{ k: 'seek', t: 105_392 }, { k: 'wait' }, { k: 'scrub', t: 33_213, n }, { k: 'scrub', t: 108_016 }],
+      [],
+    ]),
+    // The buffer reaches 38 s; trimming it to 1.769 + 30 s cuts a fragment in the middle, and the resume point is
+    // planned from the buffer as it is after that trim.
+    ['a resume after the trim cut a fragment in the middle', [{ k: 'play', t: 8000 }, { k: 'settle' }, { k: 'scrub', t: 89_348 }, { k: 'wait' }, { k: 'scrub', t: 1769 }], [fragChunk(89_348)]],
+    // Same fragment, different time, while the first is still fetching: the later target is the one that counts.
+    ['a native scrub within the fragment of a settling seek', [{ k: 'seek', t: 51_528 }, { k: 'wait' }, { k: 'scrub', t: 51_110 }], [fragChunk(51_528)]],
+    ['a direct seek within the fragment of a settling native scrub', [{ k: 'scrub', t: 51_528 }, { k: 'wait' }, { k: 'seek', t: 51_110 }], [fragChunk(51_528)]],
+    ['seek to the last fragment, then back', [{ k: 'seek', t: 119_000 }, { k: 'wait' }, { k: 'seek', t: 4000 }], [fragChunk(119_000)]],
+  ];
+
+  for (const [name, ops, hold] of table) {
+    it(name, async () => {
+      await execute(name, ops, hold);
+    });
+  }
+
+  it('the playhead plays on from the resume point: contiguous past 30 s, 30 s ahead, never to the clip end', async () => {
+    const { c, p } = await rig([C70]);
+    const pending: Promise<void>[] = [];
+    await run(c, p, [{ k: 'scrub', t: 70_000 }, { k: 'wait' }, { k: 'scrub', t: 5000 }], pending);
+    const before = c.reads.length;
+    c.releaseAll();
+    await settle(c);
+    env.video.currentTime = 29;
+    env.video.fire('timeupdate');
+    await settle(c);
+    const h = holding(29)!;
+    expect(h[1]).toBeGreaterThanOrEqual(59);
+    expect(h[1]).toBeLessThanOrEqual(63);
+    expect(Math.max(...c.reads.slice(before))).toBeLessThan(C70);
+    expect(sb().violations).toEqual([]);
+    p.destroy();
+  });
+
+  it('a resume after trimming the buffer to the window mid-fragment carries on from the fragment that was cut', async () => {
+    const { c, p } = await rig([fragChunk(89_348)]);
+    const pending: Promise<void>[] = [];
+    // The buffer reaches ~38 s; the far scrub is stuck, and a scrub back to 1.8 s trims the buffer to 31.769 s.
+    await run(c, p, [{ k: 'play', t: 8000 }, { k: 'settle' }, { k: 'scrub', t: 89_348 }, { k: 'wait' }, { k: 'scrub', t: 1769 }], pending);
+    c.releaseAll();
+    await settle(c);
+    env.video.currentTime = 12;
+    env.video.fire('timeupdate');
+    await settle(c);
+    const h = holding(12)!;
+    expect(h[1]).toBeGreaterThanOrEqual(42);
+    expect(sb().ranges.filter(([s]) => s > h[1])).toEqual([]);
+    expect(sb().violations).toEqual([]);
+    p.destroy();
+  });
+
+  it('a buffer ending inside the last fragment still resumes, so the stream ends', async () => {
+    const { c, p } = await rig([NCHUNKS - 1]);
+    // Play on to 90 s: the fill runs to the end of the clip and stops at the held final chunk.
+    for (const t of [20_000, 45_000, 70_000, 90_000]) {
+      env.video.currentTime = t / 1000;
+      env.video.fire('timeupdate');
+      await settle(c);
+    }
+    expect(c.held.has(NCHUNKS - 1)).toBe(true);
+    // A fetch seek to 20 s is stuck on its first chunk, then a scrub back inside the buffer supersedes it.
+    c.hold.add(C20);
+    env.video.currentTime = 20;
+    env.video.fire('seeking');
+    await tick(50);
+    env.video.currentTime = 95;
+    env.video.fire('seeking');
+    await tick(50);
+    c.releaseAll();
+    await settle(c);
+    expect(c.reads.slice(-6)).toContain(NCHUNKS - 1);
+    expect(env.mediaSources()[0]!.readyState).toBe('ended');
+    expect(holding(95)![1]).toBeCloseTo(120, 6);
+    expect(env.video.currentTime).toBe(95);
+    expect(sb().violations).toEqual([]);
+    p.destroy();
+  });
+
+  // Seeded random sequences: forward and backward, buffered and unbuffered, seek() and native scrubs, with
+  // reads held so that a new seek arrives while an earlier one is still settling.
+  function prng(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Seeds that once exposed a race (each is a sequence that failed before the fix it is named for), then the first N.
+  // SEEK_SEEDS=2500 widens the search.
+  const REGRESSION = [837, 1193, 1212, 1804, 2401, 2451];
+  const SEEDS = Number(process.env.SEEK_SEEDS ?? 60);
+  const seeds = [...new Set([...REGRESSION, ...Array.from({ length: SEEDS }, (_, i) => i + 1)])];
+  for (const seed of seeds) {
+    it(`random sequence ${seed}`, async () => {
+      const rnd = prng(seed);
+      const pick = <T>(a: T[]): T => a[Math.floor(rnd() * a.length)]!;
+      const hold: number[] = [];
+      for (let i = 0; i < 6; i++) hold.push(33 + Math.floor(rnd() * (NCHUNKS - 33)));
+      const { c, p } = await rig(hold);
+      const pending: Promise<void>[] = [];
+      const log: string[] = [];
+      let target = 0;
+      let marker = c.reads.length;
+      const n = 2 + Math.floor(rnd() * 5);
+      for (let i = 0; i < n; i++) {
+        const last = i === n - 1;
+        const kind = last ? pick(['seek', 'scrub']) : pick(['seek', 'seek', 'scrub', 'scrub', 'play', 'wait', 'release']);
+        // Half the targets land inside what is buffered, half anywhere.
+        const rs = sb().ranges;
+        const inside = (): number => {
+          const r = pick(rs);
+          return Math.round(1000 * (r[0] + rnd() * (r[1] - r[0])));
+        };
+        const t = rs.length > 0 && rnd() < 0.5 ? inside() : Math.floor(rnd() * 119_000);
+        log.push(kind === 'seek' || kind === 'scrub' ? `${kind} ${t}` : kind);
+        if (kind === 'seek' || kind === 'scrub') {
+          marker = c.reads.length;
+          target = t;
+          if (kind === 'seek') pending.push(p.seek(t));
+          else {
+            env.video.currentTime = t / 1000;
+            env.video.fire('seeking');
+          }
+        } else if (kind === 'play') {
+          const cur = env.video.currentTime;
+          const h = holding(cur);
+          if (h && h[1] - cur > 1) {
+            env.video.currentTime = cur + rnd() * (h[1] - cur - 1);
+            env.video.fire('timeupdate');
+          }
+        } else if (kind === 'release') {
+          c.releaseAll();
+        }
+        await tick(Math.floor(rnd() * 40));
+      }
+      c.releaseAll();
+      await settle(c);
+      await Promise.race([
+        Promise.all(pending),
+        new Promise<void>((_, rej) => setTimeout(() => rej(new Error('a seek never resolved')), 2000)),
+      ]);
+      check(c, target, marker, `seed ${seed} [${log.join(', ')}] holds ${hold.join(',')}`, false);
+      p.destroy();
+    });
+  }
 });
