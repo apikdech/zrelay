@@ -16,6 +16,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	"github.com/bluenviron/gortsplib/v5/pkg/liberrors"
 	"github.com/pion/rtp"
 
 	"github.com/apikdech/zrelay-v2/internal/relay/camera"
@@ -30,7 +31,7 @@ const (
 	camName = "tapo-c220"
 )
 
-type badStatus = gortsplib.ErrClientBadStatusCode
+type badStatus = liberrors.ErrClientBadStatusCode
 
 // rig is a fake camera feeding a Hub, and a restream Server in front of it.
 type rig struct {
@@ -130,7 +131,7 @@ func TestRestreamServesVideo(t *testing.T) {
 	if !ok || len(h264.SPS) == 0 || len(h264.PPS) == 0 {
 		t.Fatalf("format = %#v, want H264 with SPS and PPS", desc.Medias[0].Formats[0])
 	}
-	if _, err := c.SetupAll(desc.BaseURL, desc.Medias); err != nil {
+	if err := c.SetupAll(desc.BaseURL, desc.Medias); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
 	var n atomic.Int32
@@ -260,7 +261,7 @@ func TestRestreamClientsDroppedOnCameraLost(t *testing.T) {
 	})
 
 	c, desc := connect(t, r.goodURL(), nil)
-	if _, err := c.SetupAll(desc.BaseURL, desc.Medias); err != nil {
+	if err := c.SetupAll(desc.BaseURL, desc.Medias); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Play(nil); err != nil {
@@ -314,7 +315,7 @@ func TestRestreamAudioTrackWhenPresent(t *testing.T) {
 	if !ok || g711.MULaw || g711.SampleRate != 8000 {
 		t.Fatalf("audio format = %#v, want PCMA 8000", desc.Medias[1].Formats[0])
 	}
-	if _, err := c.SetupAll(desc.BaseURL, desc.Medias); err != nil {
+	if err := c.SetupAll(desc.BaseURL, desc.Medias); err != nil {
 		t.Fatal(err)
 	}
 	audio := make(chan *rtp.Packet, 1)

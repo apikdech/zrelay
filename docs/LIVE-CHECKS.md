@@ -255,3 +255,41 @@ staging sidecar.
   policy (design §6.5).
 
 **Status:** not run
+
+## Task 12 — RTSP restream
+
+**Automated in this task:** `internal/relay/restream` (`New`, `Start`, `Close`, `Clients`, `Addr`) is
+tested end to end on ephemeral ports. A looping synthetic H.264 camera (`testutil.StartRTSPServer`)
+feeds a `camera.Hub` through `camera.RunRTSP`; a gortsplib TCP client with credentials reads 30 RTP
+packets (`TestRestreamServesVideo`), no or wrong credentials get 401 (`TestRestreamAuthRequired`),
+RTSP-over-HTTP and over-WebSocket tunnels get 403 (`TestRestreamRejectsTunnels`), forcing UDP fails
+SETUP with 461 (`TestRestreamUDPRefused`), `Hub.Lost()` ends the client session and the stream
+returns on the next `Codec` call (`TestRestreamClientsDroppedOnCameraLost`), and a PCMA track is
+published once the camera sends audio (`TestRestreamAudioTrackWhenPresent`). All pass under
+`go test -race`. Plan Step 5 (the `camprobe --live --restream` extension) is deferred to T12b, so
+the steps below cannot run until it lands.
+
+**Manual steps:**
+1. After T12b lands, on the Mac mini run camprobe with supervisor, live and restream only:
+   `go run ./cmd/camprobe --live --restream` with the camera URL and restream credentials supplied
+   as `ENV:` refs (exact flags per T12b).
+2. On a laptop on the tailnet open `rtsp://<restream user>:<password>@<mac-mini-tailscale-ip>:8554/tapo-c220`
+   in VLC (Media, Open Network Stream).
+3. Run `go run ./internal/relay/live/testdata` on the Mac mini and open its `whep.html` on a phone
+   over the tailnet.
+4. Run `ffprobe -rtsp_transport udp rtsp://<user>:<pass>@<ip>:8554/tapo-c220` from the laptop.
+5. Stop the camera's network for 10 s, restore it, and watch VLC.
+
+**Expected result:** VLC plays the live Tapo C220 picture (video, plus G.711 audio if the camera
+sends it) within a few seconds; the phone plays via WHEP; the UDP probe is refused (461); a wrong
+password is refused (401); when the camera session drops, VLC disconnects and a manual reconnect
+succeeds once the camera is back.
+
+**If the result differs, update:** `publisher.publish`/`writeVideo` in
+`internal/relay/restream/restream.go` (RTP timestamps are `uint32(AU.PTS)`; parameter sets come only
+from the SDP, not in-band) and `TestRestreamServesVideo`; if players need in-band SPS/PPS before an
+IDR, prepend `Codec` parameter sets in `writeVideo`. If the audio track is missing for the first
+seconds, see `writeAudio` (the track appears when the first audio packet arrives, which republishes
+the stream and drops early clients) and `TestRestreamAudioTrackWhenPresent`. Design §5.2.
+
+**Status:** not run
