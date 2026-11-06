@@ -78,8 +78,11 @@ type job struct {
 	// committed is set once the video object is committed; from then on the
 	// clip is visible after recovery and is no longer dropped by Shutdown.
 	committed atomic.Bool
-	finishing sync.Once
-	done      chan struct{}
+	// pendingSince is the clock time (UnixNano) at which the storage request
+	// now in flight started, or 0 when none is.
+	pendingSince atomic.Int64
+	finishing    sync.Once
+	done         chan struct{}
 }
 
 // New returns an Egress. Call Run to start its workers.

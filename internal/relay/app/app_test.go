@@ -435,6 +435,11 @@ func TestRunShutdownWithStorageDownExitsWithinGrace(t *testing.T) {
 	if !strings.Contains(logs.text(), "reason=shutdown") {
 		t.Errorf("the dropped clip was not logged with reason shutdown:\n%s", logs.text())
 	}
+	// The grace the drain and the flush leave over still covers the ONVIF
+	// unsubscribe: the camera is told to drop its subscription.
+	if strings.Contains(logs.text(), "gave up waiting for an ONVIF unsubscribe") {
+		t.Errorf("shutdown left no grace for the ONVIF unsubscribe:\n%s", logs.text())
+	}
 	for _, line := range strings.Split(logs.text(), "\n") {
 		if strings.Contains(line, "secret") || strings.Contains(line, "zk1-") {
 			t.Errorf("log line leaks a credential: %s", line)
@@ -665,6 +670,9 @@ func TestRecoveryRetryNeverTouchesThisProcessesClips(t *testing.T) {
 // TestRunShutdownWithONVIFDownIsPrompt: review focus 5, the camera's event
 // endpoint refuses connections while RTSP works. Shutdown must not wait out
 // the grace period for an ONVIF unsubscribe that has nothing to unsubscribe.
+// The real pull point keeps running (it retries inside Run) until its context
+// ends, so this does not exercise the supervisor's own backoff; that is
+// TestRunShutdownWithEventSourceInBackoffIsPrompt.
 func TestRunShutdownWithONVIFDownIsPrompt(t *testing.T) {
 	logs := captureLogs(t)
 	r := newRig(t, "")
@@ -694,14 +702,64 @@ func TestRunShutdownWithONVIFDownIsPrompt(t *testing.T) {
 	}
 }
 
+// earlySource is an event source whose Run returns at once with an error, the
+// way a source with a bug or a future source type may: the supervisor's event
+// loop then sleeps in its backoff and calls Run again only when it ends.
+type earlySource struct{ runs atomic.Int32 }
+
+func (s *earlySource) Run(context.Context, func(events.Signal), func(bool)) error {
+	s.runs.Add(1)
+	return errors.New("source stopped early")
+}
+
+// TestRunShutdownWithEventSourceInBackoffIsPrompt is the scenario of review
+// round 1: the supervisor's event loop is asleep in its backoff (the source
+// returned early and is not running) when SIGTERM arrives. The loop exits on
+// its context without calling Run again, so shutdown must not wait for a Run
+// to return and use up the grace period. The real PullPoint only returns when
+// its context ends, so this needs a source that returns early; with the
+// idle-finish branch of doneSource disabled this test fails with a wait of
+// the whole grace and the "gave up waiting" log line.
+func TestRunShutdownWithEventSourceInBackoffIsPrompt(t *testing.T) {
+	logs := captureLogs(t)
+	src := &earlySource{}
+	t.Cleanup(app.SetEventSource(func(config.Camera, []events.Rule, clock.Clock) events.Source { return src }))
+	r := newRig(t, "")
+	run := start(t, r.cfg, app.Options{Version: "test"})
+
+	// Two stops: the backoff after the second is at most 2 s and after the
+	// third at most 4 s, so the loop is asleep for nearly all the time after
+	// the second stop.
+	eventually(t, "the supervisor to back off from the stopped source", 30*time.Second, func() bool {
+		return strings.Count(logs.text(), "event source stopped") >= 2
+	})
+	time.Sleep(20 * time.Millisecond) // the log precedes the sleep by microseconds
+	took, err := run.stop(t)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if took > grace/2 {
+		t.Errorf("Run took %v to stop with the event source in backoff, want well under the %v grace", took, grace)
+	}
+	if strings.Contains(logs.text(), "gave up waiting for an ONVIF unsubscribe") {
+		t.Errorf("shutdown waited out the grace for an unsubscribe that was not running:\n%s", logs.text())
+	}
+}
+
 // TestRunForceFinalizesThroughTheBacklogPolicy drives the egress backlog
 // policy through the wiring, in CI: with storage down and a 1 MiB backlog,
 // the accountant asks to force-finalize the recording camera (egress
 // ForceFinalize -> the app -> the recorder's WithBacklogPolicy -> the clip
 // machine). The finalized clip is then evicted, the backlog empties, the
 // recorder releases the suppressed camera (resume), a new clip starts, and
-// the backlog policy finalizes that one too. A clip only ends here through
-// the policy: max_clip_seconds is 60 and the trigger stays active.
+// the backlog policy finalizes that one too.
+//
+// Max clip and trigger timeout are an hour, so nothing but the policy can end
+// a clip inside the test window. The evidence is therefore the drop of a
+// finalized clip: the ForceFinalize callback's own log line is printed on
+// every accountant call whether or not the signal reaches the recorder, so it
+// proves nothing about the wiring. Two drops need the whole cycle: finalize,
+// suppress, resume, record again, finalize again.
 func TestRunForceFinalizesThroughTheBacklogPolicy(t *testing.T) {
 	logs := captureLogs(t)
 	t.Cleanup(func() {
@@ -711,17 +769,19 @@ func TestRunForceFinalizesThroughTheBacklogPolicy(t *testing.T) {
 	})
 	r := newRig(t, "")
 	r.cfg.Relay.EgressBacklogMB = 1
+	r.cfg.Cameras[0].MaxClip = time.Hour
+	r.cfg.Cameras[0].TriggerTimeout = time.Hour
 	st := newDown(t, r.base)
 	start(t, r.cfg, st.opts(t))
 
 	r.motion(true)
 	// The fixture is about 70 kB/s: a clip fills 1 MiB in ~15 s.
-	eventually(t, "the backlog policy to force-finalize a clip, resume the camera and finalize another",
-		120*time.Second, func() bool {
-			return strings.Count(logs.text(), "backlog full: finalizing the active clip") >= 2
+	eventually(t, "the backlog policy to finalize a clip, resume the camera and finalize another",
+		90*time.Second, func() bool {
+			return strings.Count(logs.text(), "egress: clip dropped") >= 2
 		})
-	if !strings.Contains(logs.text(), "reason=backlog") {
-		t.Errorf("the finalized clip was not dropped by the backlog policy:\n%s", logs.text())
+	if got := strings.Count(logs.text(), "reason=backlog"); got < 2 {
+		t.Errorf("the finalized clips were not dropped by the backlog policy (%d drops):\n%s", got, logs.text())
 	}
 }
 

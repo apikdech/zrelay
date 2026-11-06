@@ -183,6 +183,22 @@ func (d *doneSource) Run(ctx context.Context, emit func(events.Signal), ready fu
 	return err
 }
 
+// newEventSource builds the event source of camera c. A variable so a test
+// can substitute a source that returns early, which the ONVIF pull point
+// never does.
+var newEventSource = func(c config.Camera, rules []events.Rule, clk clock.Clock) events.Source {
+	return &events.PullPoint{
+		Camera:      c.ID,
+		Host:        c.Host,
+		Port:        c.EventsPort,
+		ServicePath: c.Events.ServicePath,
+		Username:    c.Username,
+		Password:    c.Password,
+		Rules:       rules,
+		Clock:       clk,
+	}
+}
+
 // app is the running relay.
 type app struct {
 	cfg  *config.Config
@@ -437,16 +453,7 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 	if err != nil {
 		return fmt.Errorf("camera %q: %w", c.ID, err)
 	}
-	src := newDoneSource(ctx, &events.PullPoint{
-		Camera:      c.ID,
-		Host:        c.Host,
-		Port:        c.EventsPort,
-		ServicePath: c.Events.ServicePath,
-		Username:    c.Username,
-		Password:    c.Password,
-		Rules:       rules,
-		Clock:       a.clk,
-	}, cm.evDone)
+	src := newDoneSource(ctx, newEventSource(c, rules, a.clk), cm.evDone)
 	cm.handle = camera.Supervise(ctx, camera.SuperviseConfig{
 		ID:             c.ID,
 		RTSPURL:        a.cfg.RTSPURL(c),

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/apikdech/zrelay-v2/pkg/storage"
 )
@@ -34,6 +35,7 @@ func (e *Egress) runJob(j *job) {
 	go func() {
 		select {
 		case <-c.Stream.Evicted():
+			e.noteStall(j)
 			cancel()
 		case <-jctx.Done():
 		}
@@ -81,14 +83,14 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 	}
 	// Step 0: the staging sidecar precedes the first byte of the video.
 	if !*staged {
-		if err := e.persist(ctx, func(ctx context.Context) error {
+		if err := e.persist(ctx, j, func(ctx context.Context) error {
 			return e.cfg.Storage.PutSmall(ctx, c.Keys.StagingSidecar, c.Staging, "application/json")
 		}); err != nil {
 			return err
 		}
 		*staged = true
 	}
-	if err := e.persist(ctx, func(ctx context.Context) error {
+	if err := e.persist(ctx, j, func(ctx context.Context) error {
 		w, err := e.cfg.Storage.Create(ctx, c.Keys.Video)
 		if err == nil {
 			*ow = w
@@ -112,9 +114,16 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 		}
 		if n > 0 {
 			before := w.DurableOffset()
-			if _, werr := w.Write(buf[:n]); werr != nil {
+			endOp := e.track(j)
+			_, werr := w.Write(buf[:n])
+			endOp()
+			if werr != nil {
 				fails++
-				e.failure(werr)
+				// A Write cancelled by eviction or shutdown says nothing
+				// about storage unless it stalled; noteStall judged that.
+				if ctx.Err() == nil {
+					e.failure(werr)
+				}
 				// Wait for the breaker, back off, then let the driver
 				// reposition itself and continue from the offset it reports.
 				roff, err := e.resume(ctx, w, &fails)
@@ -148,7 +157,7 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 		}
 	}
 
-	if err := e.persist(ctx, w.Commit); err != nil {
+	if err := e.persist(ctx, j, w.Commit); err != nil {
 		return err
 	}
 	// The video is durable: mark it first so the accountant skips the clip,
@@ -207,7 +216,7 @@ func (e *Egress) complete(ctx context.Context, j *job) {
 		slog.Warn("egress: final sidecar not built; staging sidecar left for recovery", "key", c.Keys.Sidecar, "error", err)
 		return
 	}
-	if err := e.persist(ctx, func(ctx context.Context) error {
+	if err := e.persist(ctx, j, func(ctx context.Context) error {
 		return e.cfg.Storage.PutSmall(ctx, c.Keys.Sidecar, data, "application/json")
 	}); err != nil {
 		slog.Warn("egress: final sidecar not stored; staging sidecar left for recovery", "key", c.Keys.Sidecar, "error", err)
@@ -324,9 +333,12 @@ var errUploadGone = errors.New("egress: upload no longer exists")
 // by the backlog policy or at shutdown (relay-spec §4.8). The breaker paces
 // the retries; without one a fixed delay does. A NotFound answer cannot be
 // fixed by retrying and ends the clip.
-func (e *Egress) persist(ctx context.Context, op func(ctx context.Context) error) error {
+func (e *Egress) persist(ctx context.Context, j *job, op func(ctx context.Context) error) error {
 	for {
-		err := e.do(ctx, op)
+		err := e.do(ctx, func(ctx context.Context) error {
+			defer e.track(j)()
+			return op(ctx)
+		})
 		if err == nil {
 			return nil
 		}
@@ -343,3 +355,31 @@ func (e *Egress) persist(ctx context.Context, op func(ctx context.Context) error
 		}
 	}
 }
+
+// track marks a storage request of j as pending and returns the function that
+// clears the mark.
+func (e *Egress) track(j *job) (end func()) {
+	j.pendingSince.Store(e.cfg.Clock.Now().UnixNano())
+	return func() { j.pendingSince.Store(0) }
+}
+
+// noteStall is called when the backlog policy is about to cancel j's clip. A
+// request still pending after stallReport is a failure signal for the breaker:
+// under sustained overload the oldest finalized clip, the one a worker is
+// draining, is evicted every few seconds, so during an outage its requests
+// are cancelled before the transport times out and would never be reported.
+// Without this the breaker never opens and the workers keep hammering a dead
+// endpoint. A quick cancellation proves nothing and is not reported.
+func (e *Egress) noteStall(j *job) {
+	since := j.pendingSince.Load()
+	if since == 0 || e.cfg.Breaker == nil {
+		return
+	}
+	if e.cfg.Clock.Now().Sub(time.Unix(0, since)) >= stallReport {
+		e.cfg.Breaker.Failure(false)
+	}
+}
+
+// stallReport is how long a storage request may be pending when the backlog
+// policy cancels it for the cancellation to count as a breaker failure.
+const stallReport = 5 * time.Second
