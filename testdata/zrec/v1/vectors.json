@@ -1,0 +1,101 @@
+{
+  "format_version": 1,
+  "suite": 1,
+  "master_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "chunk_size": 65536,
+  "camera_id": "front-door",
+  "clip_id": "01M2NBMVS0K8EKRQKGGAJCDT0B",
+  "start_unix_ms": 1789570740000,
+  "derived": {
+    "key_id_hex": "24f301fa8d9378d6",
+    "k_wrap_hex": "551a829f0314d9ad0ed95a8f0832917006af66eb07ab2c39f082779adc130a37",
+    "k_api_hex": "849cc3a8c4c6e5e13f9e99524fff4ace0ac5cfb9c02c7c1c9c519df39e846108",
+    "k_api_sha256_hex": "eb66813c6262652be928e589db68ab62743685ed04e5c4b748221effa5eadce4"
+  },
+  "positive": [
+    {
+      "name": "one-byte",
+      "file": "pos-one-byte.zrec",
+      "plaintext_len": 1,
+      "plaintext_sha256_hex": "5a6e7a4754af8e7f47fc9493040d853e7b01e39d537cb1dd353c93b7ae58eb3d"
+    },
+    {
+      "name": "exact-chunk",
+      "file": "pos-exact-chunk.zrec",
+      "plaintext_len": 65536,
+      "plaintext_sha256_hex": "980c5d401ce99fdae74ba4516b82f059ee5737bef9bd0fbd81c5d704a1b21578"
+    },
+    {
+      "name": "two-chunks",
+      "file": "pos-two-chunks.zrec",
+      "plaintext_len": 131072,
+      "plaintext_sha256_hex": "9da6df0062925f56f735a3390801cf70aa58fdd7016a49f6f9a482712c57e178"
+    },
+    {
+      "name": "two-and-half-chunks",
+      "file": "pos-two-and-half-chunks.zrec",
+      "plaintext_len": 163840,
+      "plaintext_sha256_hex": "e578f26f0eb3b0f9bec82bc8552b6a8b31ecb49069a79a68b7baf1203e705cc6"
+    }
+  ],
+  "negative": [
+    {
+      "name": "camera-id-bitflip",
+      "file": "neg-camera-id-bitflip.zrec",
+      "expect": "ErrAuthHeader"
+    },
+    {
+      "name": "key-id-bitflip",
+      "file": "neg-key-id-bitflip.zrec",
+      "expect": "ErrUnknownKey"
+    },
+    {
+      "name": "wrapped-dek-bitflip",
+      "file": "neg-wrapped-dek-bitflip.zrec",
+      "expect": "ErrAuthHeader"
+    },
+    {
+      "name": "bitflip-chunk",
+      "file": "neg-bitflip-chunk.zrec",
+      "expect": "ErrAuth",
+      "chunk_index": 1
+    },
+    {
+      "name": "swapped-chunks",
+      "file": "neg-swapped-chunks.zrec",
+      "expect": "ErrAuth",
+      "chunk_index": 0
+    },
+    {
+      "name": "dropped-final-chunk",
+      "file": "neg-dropped-final-chunk.zrec",
+      "expect": "ErrTruncated"
+    },
+    {
+      "name": "extra-chunk",
+      "file": "neg-extra-chunk.zrec",
+      "expect": "ErrTrailingData"
+    },
+    {
+      "name": "transplanted-key-block",
+      "file": "neg-transplanted-key-block.zrec",
+      "expect": "ErrAuthHeader"
+    },
+    {
+      "name": "wrong-master-key",
+      "file": "neg-wrong-master-key.zrec",
+      "expect": "ErrUnknownKey"
+    },
+    {
+      "name": "trailing-bytes",
+      "file": "neg-trailing-bytes.zrec",
+      "expect": "ErrAuth",
+      "chunk_index": 2
+    },
+    {
+      "name": "header-only",
+      "file": "neg-header-only.zrec",
+      "expect": "ErrTruncated"
+    }
+  ]
+}

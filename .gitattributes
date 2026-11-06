@@ -1,1 +1,2 @@
 docs/LIVE-CHECKS.md merge=union
+testdata/zrec/v1/* -text
