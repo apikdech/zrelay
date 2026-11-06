@@ -1,4 +1,4 @@
-.PHONY: test vet integration vectors web
+.PHONY: test vet integration vectors web web-e2e
 
 # Unit tests with the race detector.
 test:
@@ -16,6 +16,10 @@ integration:
 vectors:
 	go run ./pkg/zrec/internal/genvectors -out testdata/zrec/v1
 
-# SPA install, lint and unit tests.
+# SPA install, lint, type check and unit tests.
 web:
-	cd web && pnpm install --frozen-lockfile && pnpm lint && pnpm test
+	cd web && pnpm install --frozen-lockfile && pnpm lint && pnpm check && pnpm test
+
+# SPA browser tests (Chromium and WebKit); needs `pnpm exec playwright install chromium webkit`.
+web-e2e:
+	cd web && pnpm exec playwright test
