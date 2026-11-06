@@ -220,3 +220,19 @@ func TestLocalModTimeUTC(t *testing.T) {
 		t.Errorf("ModTime location = %v, want UTC", info.ModTime.Location())
 	}
 }
+
+func TestLocalIncompleteIgnoresDegenerateNames(t *testing.T) {
+	d := newDriver(t)
+	for _, k := range []string{"clips/.part", "clips/..part", "clips/...part", "clips/....part", "clips/x.part"} {
+		if err := d.PutSmall(t.Context(), k, []byte("x"), ""); err != nil {
+			t.Fatalf("PutSmall(%q): %v", k, err)
+		}
+	}
+	incs, err := d.ListIncomplete(t.Context(), "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incs) != 0 {
+		t.Errorf("ListIncomplete = %+v, want none", incs)
+	}
+}
