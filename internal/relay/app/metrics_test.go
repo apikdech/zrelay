@@ -128,6 +128,11 @@ func TestRunCountsClipAndUpload(t *testing.T) {
 func TestRunMetricsShowStorageOutage(t *testing.T) {
 	r := newRig(t, "")
 	st := newDown(t, r.base)
+	// Storage is reachable at startup: the status publisher also reports to
+	// the breaker, so a store that is down from the first write would open it
+	// before any upload is tried and no upload error would be counted. The
+	// outage starts once the camera is up, before the clip's upload.
+	st.down.Store(false)
 	start(t, r.cfg, st.opts(t))
 	eventually(t, "camera up", 30*time.Second, func() bool {
 		b := scrape(t, r.cfg.Relay.HTTPListen)
@@ -135,6 +140,7 @@ func TestRunMetricsShowStorageOutage(t *testing.T) {
 		ev, _ := sample(b, `zrelay_camera_events_up{camera="cam-1"}`)
 		return rtsp == 1 && ev == 1
 	})
+	st.down.Store(true)
 	r.motion(true)
 	eventually(t, "the breaker to open", 60*time.Second, func() bool {
 		b := scrape(t, r.cfg.Relay.HTTPListen)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"slices"
 	"sync"
@@ -26,9 +28,17 @@ type Config struct {
 	// closes writes the current state (design §6.6). Nil means always closed
 	// and omits the storage field from status/relay.json.
 	Breaker *egress.Breaker
-	RelayID string
-	Version string
-	KeyID   [8]byte
+	// Reader, when set, lets the publisher merge an hour's coverage with the
+	// object already stored for it (a partial hour written by an earlier
+	// process or by Flush) instead of replacing it. Nil means the object is
+	// replaced.
+	Reader ObjectReader
+	// Classify maps a storage error to its class so write outcomes can be
+	// reported to Breaker. Nil treats every error as transient.
+	Classify func(error) storage.ErrorClass
+	RelayID  string
+	Version  string
+	KeyID    [8]byte
 	// Cameras returns the current per-camera status, one entry per configured
 	// camera.
 	Cameras func() []sidecar.CameraStatus
@@ -43,10 +53,18 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// object is a serialised status object waiting to be written.
+// ObjectReader is the read side the publisher needs; storage.Reader
+// satisfies it. A missing object must be reported as storage.ErrNotFound.
+type ObjectReader interface {
+	OpenRange(ctx context.Context, key string, off, n int64) (*storage.ObjectRange, error)
+}
+
+// object is a serialised status object waiting to be written. cov is set for
+// coverage: at write time it is merged with the object already stored.
 type object struct {
 	key  string
 	data []byte
+	cov  *sidecar.Coverage
 }
 
 // Publisher writes status/relay.json every Interval and one coverage object
@@ -161,7 +179,7 @@ func (p *Publisher) writeStatus(ctx context.Context) {
 		p.log.Error("status: marshal relay status", "err", err)
 		return
 	}
-	p.put(ctx, object{sidecar.StatusKey, data})
+	p.put(ctx, sidecar.StatusKey, data)
 }
 
 func stateName(s egress.BreakerState) string {
@@ -203,7 +221,7 @@ func (p *Publisher) enqueue(hour time.Time) {
 			p.log.Error("status: marshal coverage", "camera", id, "hour", hour, "err", err)
 			continue
 		}
-		p.pending = append(p.pending, object{sidecar.CoverageKey(id, hour), data})
+		p.pending = append(p.pending, object{key: sidecar.CoverageKey(id, hour), data: data, cov: &c})
 	}
 }
 
@@ -211,17 +229,112 @@ func (p *Publisher) enqueue(hour time.Time) {
 // failure, keeping the rest for the next tick.
 func (p *Publisher) writePending(ctx context.Context) {
 	for len(p.pending) > 0 {
-		if !p.put(ctx, p.pending[0]) {
+		if !p.putCoverage(ctx, p.pending[0]) {
 			return
 		}
 		p.pending = p.pending[1:]
 	}
 }
 
-func (p *Publisher) put(ctx context.Context, o object) bool {
-	if err := p.cfg.Storage.PutSmall(ctx, o.key, o.data, "application/json"); err != nil {
-		p.log.Warn("status: write failed, retrying at the next tick", "key", o.key, "err", err)
+// putCoverage writes one coverage object. When a Reader is configured it
+// first reads the object already stored for that camera and hour and writes
+// the union of the two, so a partial hour from an earlier process or from
+// Flush is extended rather than replaced. If the stored object cannot be read
+// nothing is written: the write is retried at the next tick and the stored
+// object survives. A stored object that is not a valid coverage object for
+// the same camera and hour is replaced.
+func (p *Publisher) putCoverage(ctx context.Context, o object) bool {
+	data := o.data
+	if p.cfg.Reader != nil && o.cov != nil {
+		if !p.storageClosed() {
+			return false
+		}
+		stored, err := p.readCoverage(ctx, o.key, o.cov)
+		if err != nil {
+			p.report(ctx, err)
+			p.log.Warn("status: reading stored coverage failed, retrying at the next tick", "key", o.key, "err", err)
+			return false
+		}
+		p.report(ctx, nil)
+		if stored != nil {
+			merged := mergeCoverage(*stored, *o.cov)
+			if err := merged.Validate(); err != nil {
+				p.log.Error("status: merged coverage invalid, stored object replaced", "key", o.key, "err", err)
+			} else if b, err := json.Marshal(merged); err != nil {
+				p.log.Error("status: marshal merged coverage", "key", o.key, "err", err)
+			} else {
+				data = b
+			}
+		}
+	}
+	return p.put(ctx, o.key, data)
+}
+
+// readCoverage returns the valid coverage object stored at key for the same
+// camera and hour as want, or nil when there is none, it is unreadable as
+// JSON, or it belongs to another camera or hour. A non-nil error means the
+// storage request itself failed.
+func (p *Publisher) readCoverage(ctx context.Context, key string, want *sidecar.Coverage) (*sidecar.Coverage, error) {
+	rc, err := p.cfg.Reader.OpenRange(ctx, key, 0, -1)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(io.LimitReader(rc, storage.MaxSmallSize+1))
+	if err != nil {
+		return nil, err
+	}
+	var c sidecar.Coverage
+	if len(b) > storage.MaxSmallSize || json.Unmarshal(b, &c) != nil || c.Validate() != nil ||
+		c.CameraID != want.CameraID || !c.HourStart.Equal(want.HourStart.Time) {
+		p.log.Warn("status: stored coverage is not a valid object for this camera and hour, replacing it", "key", key)
+		return nil, nil
+	}
+	return &c, nil
+}
+
+// put writes one small object and reports the outcome to the breaker, so an
+// idle relay (no drain worker making requests) still opens it, and with it
+// /healthz and the breaker metric, when storage is down.
+func (p *Publisher) put(ctx context.Context, key string, data []byte) bool {
+	if !p.storageClosed() {
+		return false
+	}
+	err := p.cfg.Storage.PutSmall(ctx, key, data, "application/json")
+	p.report(ctx, err)
+	if err != nil {
+		p.log.Warn("status: write failed, retrying at the next tick", "key", key, "err", err)
 		return false
 	}
 	return true
+}
+
+// report tells the breaker how a storage request ended, as egress.Do does:
+// success and "not found" mean storage answered, a permanent error opens the
+// breaker at once, any other error counts as a transient failure. Nothing is
+// reported once ctx is done, since shutdown is not a storage failure.
+func (p *Publisher) report(ctx context.Context, err error) {
+	b := p.cfg.Breaker
+	if b == nil || ctx.Err() != nil {
+		return
+	}
+	if err == nil {
+		b.Success()
+		return
+	}
+	class := storage.Transient
+	if p.cfg.Classify != nil {
+		class = p.cfg.Classify(err)
+	}
+	switch class {
+	case storage.NotFound:
+		b.Success()
+	case storage.Permanent:
+		b.Failure(true)
+	default:
+		b.Failure(false)
+	}
 }

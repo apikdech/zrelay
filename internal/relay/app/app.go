@@ -427,6 +427,8 @@ func (a *app) start() error {
 	a.pub = status.New(status.Config{
 		Storage:  a.prov,
 		Breaker:  a.breaker,
+		Reader:   a.prov,
+		Classify: s3.Classify,
 		RelayID:  cfg.Relay.ID,
 		Version:  a.opts.Version,
 		KeyID:    keys.ID,

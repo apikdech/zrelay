@@ -1,9 +1,11 @@
 package status_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"sort"
 	"sync"
 	"testing"
@@ -22,6 +24,7 @@ type memStore struct {
 	objects map[string][]byte
 	puts    chan string // one entry per successful PutSmall
 	fail    int         // the next fail PutSmall calls return an error
+	readErr error       // error returned by OpenRange when set
 }
 
 func newMemStore() *memStore {
@@ -38,6 +41,21 @@ func (m *memStore) PutSmall(_ context.Context, key string, data []byte, _ string
 	m.objects[key] = append([]byte(nil), data...)
 	m.puts <- key
 	return nil
+}
+
+// OpenRange makes memStore a status.ObjectReader.
+func (m *memStore) OpenRange(_ context.Context, key string, off, n int64) (*storage.ObjectRange, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.readErr != nil {
+		return nil, m.readErr
+	}
+	b, ok := m.objects[key]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	b = b[off:]
+	return &storage.ObjectRange{ReadCloser: io.NopCloser(bytes.NewReader(b)), Total: int64(len(b))}, nil
 }
 
 func (m *memStore) Create(context.Context, string) (storage.ObjectWriter, error) {
@@ -96,16 +114,24 @@ type rig struct {
 
 var keyID = [8]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18}
 
+// newRig builds a rig whose breaker tolerates many consecutive write failures,
+// so a failed write is simply retried at the next tick.
 func newRig(t *testing.T, start time.Time) *rig {
+	t.Helper()
+	return newRigThreshold(t, start, 100)
+}
+
+func newRigThreshold(t *testing.T, start time.Time, threshold int) *rig {
 	t.Helper()
 	r := &rig{t: t, clk: clock.NewFake(start), store: newMemStore(), bclk: clock.NewFake(start)}
 	r.cov = status.NewCoverageTracker(r.clk)
 	// The breaker has its own fake clock so its recovery timers never
 	// interfere with the publisher's tick timer.
-	r.brk = egress.NewBreaker(egress.BreakerConfig{FailureThreshold: 1, BaseDelay: time.Second, MaxDelay: time.Second},
+	r.brk = egress.NewBreaker(egress.BreakerConfig{FailureThreshold: threshold, BaseDelay: time.Second, MaxDelay: time.Second},
 		r.bclk, func(context.Context) error { return nil }, nil)
 	r.pub = status.New(status.Config{
 		Storage: r.store,
+		Reader:  r.store,
 		Breaker: r.brk,
 		RelayID: "home-mini",
 		Version: "2.0.0",
@@ -337,5 +363,172 @@ func TestFlushSkipsWhileBreakerOpen(t *testing.T) {
 
 	if keys := r.store.keys(); len(keys) != 0 {
 		t.Fatalf("Flush wrote %v while the breaker was open", keys)
+	}
+}
+
+// decodeCoverage reads and validates the stored coverage object of one hour.
+func decodeCoverage(t *testing.T, store *memStore, hour time.Time) sidecar.Coverage {
+	t.Helper()
+	raw, ok := store.get(sidecar.CoverageKey("front-door", hour))
+	if !ok {
+		t.Fatalf("coverage for %v missing; have %v", hour, store.keys())
+	}
+	var c sidecar.Coverage
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatalf("coverage JSON: %v\n%s", err, raw)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("coverage invalid: %v\n%s", err, raw)
+	}
+	return c
+}
+
+// secondRelay is a restarted process on the same store: new clock, tracker
+// and publisher.
+func secondRelay(store *memStore, start time.Time) (*clock.Fake, *status.CoverageTracker, *status.Publisher) {
+	clk := clock.NewFake(start)
+	cov := status.NewCoverageTracker(clk)
+	pub := status.New(status.Config{
+		Storage:  store,
+		Reader:   store,
+		RelayID:  "home-mini",
+		Version:  "2.0.0",
+		KeyID:    keyID,
+		Coverage: map[string]*status.CoverageTracker{"front-door": cov},
+		Clock:    clk,
+		Interval: 60 * time.Second,
+	})
+	return clk, cov, pub
+}
+
+func TestRestartMidHourKeepsPartialCoverageAndDrops(t *testing.T) {
+	// Relay A: ready from 14:05, a shutdown drop at 14:12, flushed at 14:20.
+	a := newRig(t, utc(14, 0, 0))
+	a.cov.SetReady(true, utc(14, 5, 0))
+	a.cov.Drop(utc(14, 12, 0), "shutdown", 3000)
+	a.clk.Advance(20 * time.Minute)
+	a.pub.Flush(context.Background())
+	wantIvs(t, decodeCoverage(t, a.store, utc(14, 0, 0)), [2]time.Time{utc(14, 5, 0), utc(14, 20, 0)})
+
+	// Relay B starts at 14:22 on the same store and closes the hour at 15:02.
+	clk, cov, pub := secondRelay(a.store, utc(14, 22, 0))
+	cov.SetReady(true, utc(14, 23, 0))
+	cov.Drop(utc(14, 40, 0), "backlog", 9000)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); pub.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	a.store.waitPut(t, sidecar.StatusKey)
+	clk.BlockUntil(1)
+	clk.Advance(40 * time.Minute) // 15:02
+	clk.BlockUntil(1)
+
+	c := decodeCoverage(t, a.store, utc(14, 0, 0))
+	wantIvs(t, c,
+		[2]time.Time{utc(14, 5, 0), utc(14, 20, 0)},
+		[2]time.Time{utc(14, 23, 0), utc(15, 0, 0)})
+	if len(c.Dropped) != 2 || c.Dropped[0].Reason != "shutdown" || c.Dropped[1].Reason != "backlog" ||
+		!c.Dropped[0].At.Equal(utc(14, 12, 0)) || !c.Dropped[1].At.Equal(utc(14, 40, 0)) {
+		t.Fatalf("dropped = %+v, want the shutdown drop then the backlog drop", c.Dropped)
+	}
+}
+
+func TestMergeKeepsTouchingIntervalsAndIsStableAcrossFlushes(t *testing.T) {
+	r := newRig(t, utc(14, 0, 0))
+	r.cov.SetReady(true, utc(14, 5, 0))
+	r.cov.Drop(utc(14, 12, 0), "shutdown", 3000)
+	r.clk.Advance(20 * time.Minute)
+	r.pub.Flush(context.Background())
+
+	r.clk.Advance(10 * time.Minute) // 14:30, same process flushes again
+	r.pub.Flush(context.Background())
+	c := decodeCoverage(t, r.store, utc(14, 0, 0))
+	wantIvs(t, c, [2]time.Time{utc(14, 5, 0), utc(14, 30, 0)})
+	if len(c.Dropped) != 1 {
+		t.Fatalf("dropped = %+v, want the single shutdown drop", c.Dropped)
+	}
+}
+
+func TestUnreadableStoredCoverageIsNotOverwritten(t *testing.T) {
+	r := newRig(t, utc(14, 0, 0))
+	r.cov.SetReady(true, utc(14, 5, 0))
+	r.clk.Advance(20 * time.Minute)
+	r.pub.Flush(context.Background())
+
+	// The stored object cannot be read: writing now would lose it.
+	r.store.mu.Lock()
+	r.store.readErr = errors.New("read boom")
+	r.store.mu.Unlock()
+	r.clk.Advance(10 * time.Minute)
+	r.pub.Flush(context.Background())
+	wantIvs(t, decodeCoverage(t, r.store, utc(14, 0, 0)), [2]time.Time{utc(14, 5, 0), utc(14, 20, 0)})
+
+	// Once readable, the retried write merges.
+	r.store.mu.Lock()
+	r.store.readErr = nil
+	r.store.mu.Unlock()
+	r.pub.Flush(context.Background())
+	wantIvs(t, decodeCoverage(t, r.store, utc(14, 0, 0)), [2]time.Time{utc(14, 5, 0), utc(14, 30, 0)})
+}
+
+func TestCorruptStoredCoverageIsReplaced(t *testing.T) {
+	r := newRig(t, utc(14, 0, 0))
+	key := sidecar.CoverageKey("front-door", utc(14, 0, 0))
+	r.store.mu.Lock()
+	r.store.objects[key] = []byte("{not json")
+	r.store.mu.Unlock()
+	r.cov.SetReady(true, utc(14, 5, 0))
+	r.clk.Advance(20 * time.Minute)
+	r.pub.Flush(context.Background())
+	wantIvs(t, decodeCoverage(t, r.store, utc(14, 0, 0)), [2]time.Time{utc(14, 5, 0), utc(14, 20, 0)})
+}
+
+func TestIdleRelayWithStorageDownOpensTheBreaker(t *testing.T) {
+	r := newRigThreshold(t, utc(3, 0, 0), 1) // an idle night: no clip, so no drain worker reports
+	r.store.setFail(1000)
+	stop := r.run()
+	defer stop()
+	r.clk.BlockUntil(1) // first tick done; its status write failed (threshold is 1)
+
+	if s, _ := r.brk.State(); s != egress.Open {
+		t.Fatalf("breaker = %v after a failed status write, want Open", s)
+	}
+}
+
+func TestPublisherPermanentErrorOpensBreaker(t *testing.T) {
+	start := utc(3, 0, 0)
+	clk := clock.NewFake(start)
+	brk := egress.NewBreaker(egress.BreakerConfig{FailureThreshold: 5, BaseDelay: time.Second, MaxDelay: time.Second},
+		clock.NewFake(start), func(context.Context) error { return nil }, nil)
+	store := newMemStore()
+	store.setFail(1)
+	pub := status.New(status.Config{
+		Storage:  store,
+		Breaker:  brk,
+		Classify: func(error) storage.ErrorClass { return storage.Permanent },
+		RelayID:  "home-mini",
+		Version:  "2.0.0",
+		Coverage: map[string]*status.CoverageTracker{},
+		Clock:    clk,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); pub.Run(ctx) }()
+	clk.BlockUntil(1)
+	cancel()
+	<-done
+	if s, _ := brk.State(); s != egress.Open {
+		t.Fatalf("breaker = %v after one permanent write error with threshold 5, want Open", s)
+	}
+}
+
+func TestSuccessfulWritesKeepTheBreakerClosed(t *testing.T) {
+	r := newRig(t, utc(3, 0, 0))
+	stop := r.run()
+	defer stop()
+	r.store.waitPut(t, sidecar.StatusKey)
+	r.clk.BlockUntil(1)
+	if s, _ := r.brk.State(); s != egress.Closed {
+		t.Fatalf("breaker = %v, want Closed", s)
 	}
 }
