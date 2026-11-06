@@ -33,14 +33,6 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
-type info struct {
-	Upstream string `json:"upstream"`
-	Camera   string `json:"camera"`
-	Key      string `json:"key"`
-	Hash     string `json:"api_token_sha256"`
-	Bearer   string `json:"bearer"`
-}
-
 func start(t *testing.T, extra ...string) (info, func() int) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
