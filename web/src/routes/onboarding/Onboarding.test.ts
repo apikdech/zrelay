@@ -230,6 +230,18 @@ describe('rejected key', () => {
     expect(screen.queryByText(/could not check recent recordings/i)).toBeNull();
     expect(screen.getByRole('list', { name: /keyring/i })).toBeInTheDocument();
   });
+
+  // The server never refuses a valid credential, so a 429 on the check means
+  // the key failed authentication too, only after the failure limit was hit.
+  it('says the server did not accept the key when the clip list answers 429', async () => {
+    const err = Object.assign(new Error('too many requests'), { name: 'ApiError', status: 429 });
+    const { client } = fakeClient({ clipsError: err });
+    render(Onboarding, { client, now: () => NOW });
+    await typeKey(await masterText());
+    await fireEvent.click(screen.getByRole('button', { name: /import key/i }));
+    expect(await screen.findByText(/server did not accept this key/i)).toBeInTheDocument();
+    expect(screen.queryByText(/could not check recent recordings/i)).toBeNull();
+  });
 });
 
 describe('lock and forget', () => {

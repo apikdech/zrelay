@@ -16,11 +16,13 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -327,4 +329,22 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("s3: delete %q: %w", key, err)
 	}
 	return nil
+}
+
+// NewHTTPClient returns the HTTP client both binaries give the driver. The
+// SDK default has no response timeout, so a partitioned endpoint (a hung
+// process, a half-open path) would hang a request forever. A request body may
+// take as long as the link needs; only connection setup and the wait for the
+// response headers (responseHeaderTimeout) are bounded.
+func NewHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
+	return &http.Client{Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   4,
+	}}
 }

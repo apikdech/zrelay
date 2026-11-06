@@ -66,8 +66,11 @@
       check = '';
     } catch (e) {
       if (seq !== checkSeq) return;
-      // 401: the server did not accept the Bearer derived from this key.
-      check = (e as { status?: number } | null)?.status === 401 ? 'rejected' : 'failed';
+      // 401: the server did not accept the Bearer derived from this key. 429
+      // means the same: the server never refuses a valid credential, it only
+      // rate-limits failed ones, so this key failed too.
+      const status = (e as { status?: number } | null)?.status;
+      check = status === 401 || status === 429 ? 'rejected' : 'failed';
     }
   }
 

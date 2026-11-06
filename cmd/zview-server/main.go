@@ -41,6 +41,10 @@ const (
 	idleTimeout       = 2 * time.Minute
 )
 
+// s3ResponseTimeout is how long an S3 request may wait for the response
+// headers after sending its request.
+var s3ResponseTimeout = 30 * time.Second
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -136,6 +140,7 @@ func openStorage(ctx context.Context, cfg *zview.Config) (storage.ReadProvider, 
 		return s3.New(ctx, s3.Config{
 			Endpoint: s.Endpoint, Region: s.Region, Bucket: s.Bucket, Root: cfg.Storage.Root,
 			AccessKey: s.AccessKey, SecretKey: s.SecretKey, UsePathStyle: s.UsePathStyle,
+			HTTPClient: s3.NewHTTPClient(s3ResponseTimeout),
 		})
 	case "local":
 		return local.New(cfg.Storage.Local.BaseDir, cfg.Storage.Root)
