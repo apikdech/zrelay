@@ -13,11 +13,11 @@ func TestAppSecurityHeadersOnRoot(t *testing.T) {
 		t.Fatalf("GET / = %d", rec.Code)
 	}
 	h := rec.Header()
-	// Orchestrator note: Report-Only until Task 42 enforces the policy.
-	if h.Get("Content-Security-Policy") != "" {
-		t.Error("enforcing Content-Security-Policy set; it must stay Report-Only until Task 42")
+	// Task 42 enforces the policy; Report-Only is gone.
+	if h.Get("Content-Security-Policy-Report-Only") != "" {
+		t.Error("Report-Only header still set after Task 42 enforced the policy")
 	}
-	csp := h.Get("Content-Security-Policy-Report-Only")
+	csp := h.Get("Content-Security-Policy")
 	for _, want := range []string{
 		"default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'",
 		"img-src 'self' blob: data:", "media-src 'self' blob:", "worker-src 'self'",
@@ -50,7 +50,7 @@ func TestSecurityHeadersAlsoOnAPIAndErrors(t *testing.T) {
 		e.do("GET", "/api/v1/cameras", "-"),
 		e.do("GET", "/healthz", "-"),
 	} {
-		if rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("Content-Security-Policy-Report-Only") == "" {
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("Content-Security-Policy") == "" {
 			t.Errorf("security headers missing: %v", rec.Header())
 		}
 	}
