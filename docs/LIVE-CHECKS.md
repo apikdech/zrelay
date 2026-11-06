@@ -505,3 +505,57 @@ call, including `DeleteObject` on the dot-named staging key.
 **Expected result:** the first restart changes nothing (no `Discarded`, the staging sidecar and the multipart upload are still there); the second restart recovers the clip (`Recovered: 1`) with an `incomplete` sidecar.
 **If the result differs, update:** the age comparison in `recovery.scan` (`internal/relay/recovery/recovery.go`) and Contract §7.4. If host and MinIO clocks differ, see the clock-skew note in the Task 27 entry above.
 **Status:** not run
+
+## Task 12b — camprobe live and restream modes (Task 12 Step 5)
+
+This entry carries out Task 12's deferred Step 5 and replaces its manual steps 1 and 3, which named a
+`./cmd/camprobe` path and a `go run ./internal/relay/live/testdata` program that did not exist yet.
+
+**Automated in this task:** `camprobe` (`internal/testutil/cmd/camprobe`) gained `--live` and
+`--restream`. Each starts, next to the supervised camera (RTSP + ONVIF, no recorder, no storage), the
+WHEP server (`live:` block of the config, served over HTTP on `live.listen`) and the RTSP restream
+(`restream:` block), and logs `live listening addr=...` and `restream listening addr=...`. A flag whose
+config block is disabled exits 2 (`TestCamprobeLiveRestreamNeedConfig`). `TestCamprobeLiveAndRestream`
+runs it against the test RTSP camera and fake ONVIF on loopback ephemeral ports: a WHEP offer without a
+bearer gets 401, with the bearer gets 201 and an answer SDP with `m=video`, and a gortsplib TCP client with
+the restream credentials reads 30 RTP packets; the probe exits 0 and prints neither the restream password
+nor the bearer token. It passes under `go test -race`. New helper `internal/relay/live/testdata/main.go`
+(`go run ./internal/relay/live/testdata`) serves `whep.html` on one origin and reverse-proxies `/live/`
+to `--upstream`; smoke-run on loopback (page served, `/live/` answers 502 with no upstream). Not
+covered: a real camera, VLC, a phone, ICE across the tailnet.
+
+**Manual steps:**
+1. On the Mac mini, build the config and secrets as in the Task 9 live check (steps 1 to 3 there:
+   `$D/zrelay.yaml` from `deploy/zrelay.example.yaml`, `.env` with the camera credentials,
+   `TAILSCALE_IP=<mac mini tailscale ip>`, `RESTREAM_USER=viewer`, `RESTREAM_PASS=<a password>`). Then make
+   the WHEP token and its hash (K_api is a random 32 bytes; the token is its unpadded base64url):
+   `head -c 32 /dev/urandom > $D/kapi && shasum -a 256 $D/kapi | cut -d' ' -f1 > $D/api_token_sha256 && base64 < $D/kapi | tr '+/' '-_' | tr -d '=\n' > $D/token`.
+   Do not paste the token into logs or notes.
+2. Start the probe (no other zrelay running against the camera):
+   `go run ./internal/testutil/cmd/camprobe --env-file .env --config $D/zrelay.yaml --camera tapo-c220 --live --restream --interval 30s`
+   Wait for `state=ready` and the two `listening addr=` lines.
+3. On a laptop on the tailnet, VLC, Media, Open Network Stream:
+   `rtsp://viewer:<password>@<mac-mini-tailscale-ip>:8554/tapo-c220`.
+4. On the Mac mini, in a second terminal:
+   `go run ./internal/relay/live/testdata --listen <mac-mini-tailscale-ip>:8080 --upstream http://127.0.0.1:9465`
+   On a phone on the tailnet open `http://<mac-mini-tailscale-ip>:8080/`, paste the contents of
+   `$D/token`, camera id `tapo-c220`, press Start.
+5. From the laptop: `ffprobe -rtsp_transport udp rtsp://viewer:<password>@<ip>:8554/tapo-c220` and the same
+   with a wrong password.
+6. Cut the camera's network for 10 s, restore it, and watch VLC and the phone.
+7. Stop the probe with Ctrl-C and confirm it exits within a few seconds. Then `rm -rf $D`.
+
+**Expected result:** VLC shows the live C220 picture within a few seconds (plus G.711 audio if the camera
+sends it); the phone page plays video (muted autoplay) within about one GOP and `ice: connected` shows in
+its log; the UDP probe is refused (461) and the wrong password gets 401; when the camera drops, VLC
+disconnects and a manual reconnect works once the probe logs `state=ready` again; the probe's
+`goroutines` and `rss_kib` stay flat over the run; Ctrl-C exits 0.
+
+**If the result differs, update:** VLC fails or shows garbage: `publisher.publish`/`writeVideo`
+(`internal/relay/restream/restream.go`) and `TestRestreamServesVideo`; the phone fails: the notes of the
+Task 11 entry (`newAPI` in `internal/relay/live/server.go`, `live.advertise_ip`, firewall for UDP
+`live.ice_udp_port` on the Tailscale interface); `--live` or `--restream` rejected or no `listening` line:
+`startServers` and `run` in `internal/testutil/cmd/camprobe/main.go` and `TestCamprobeLiveAndRestream`;
+the page cannot reach `/live/`: `internal/relay/live/testdata/main.go`.
+
+**Status:** not run
