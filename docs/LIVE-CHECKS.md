@@ -264,11 +264,13 @@ client on loopback (ephemeral ports only): `TestWHEPOfferAnswerDeliversVideo` (H
 `TestWHEPNoAudioTrackWhenCameraHasNone`, `TestWHEPAuth` (401, no pion session created),
 `TestWHEPMaxViewers` (503), `TestWHEPDeleteEndsSession`, `TestWHEPUnknownCamera404`,
 `TestWHEPWrongContentType415`, `TestWHEPBodyLimit413`, `TestWHEPBadOffer400`,
-`TestViewerLagResyncsAtIDR`, `TestSessionClosedOnICEDisconnect` (peer closes DTLS, slot freed),
+`TestViewerLagResyncsAtIDR`, `TestSessionClosedWhenPeerCloses` (clean path: peer closes DTLS, slot freed),
 `TestSessionClosedWhenPeerGoesSilent` (client socket closed without a DTLS close; ICE timeouts shortened
 through the `iceDisconnected`/`iceFailed` variables), `TestICETimeoutsClosePeerWithin30Seconds`
-(defaults sum to 30 s), `TestServerCloseDuringNegotiation` (Close during an in-flight POST, under
-`-race`), `TestWHEPDisabledWithZeroMaxViewers` (503), `TestWHEPRejectsH265With501`,
+(defaults sum to 30 s), `TestServerCloseAtEachNegotiationStep` (Close forced deterministically through a test hook at the
+"created", "attached" and "negotiated" points of a POST: 503, pion session closed, slot freed;
+mutation-checked against the attach guard and both 503 branches) and
+`TestServerCloseDuringNegotiationStress` (Close racing in-flight POSTs, under `-race`), `TestWHEPDisabledWithZeroMaxViewers` (503), `TestWHEPRejectsH265With501`,
 `TestPeerThatNeverConnectsIsClosedAfterTimeout` (fake clock), `TestNewServerValidation`/`Defaults`,
 `TestServerCloseEndsSessions`. `BenchmarkViewerMemory` (four viewer processes at 400 KiB/s) measured
 about 2.2 MiB of heap and stacks per added viewer (2.27 to 2.36 MB across three runs), so

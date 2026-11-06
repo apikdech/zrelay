@@ -217,7 +217,10 @@ func TestWHEPBadOffer400(t *testing.T) {
 	}
 }
 
-func TestSessionClosedOnICEDisconnect(t *testing.T) {
+// TestSessionClosedWhenPeerCloses covers the clean path: the client closes
+// its peer connection (DTLS close_notify) and the slot is freed. The silent
+// peer case is TestSessionClosedWhenPeerGoesSilent.
+func TestSessionClosedWhenPeerCloses(t *testing.T) {
 	hub := camera.NewHub("cam1")
 	ts := newTestServer(t, map[string]*camera.Hub{"cam1": hub}, 4)
 	startPublisher(t, hub, 15*time.Millisecond, false)
@@ -271,50 +274,115 @@ func TestICETimeoutsClosePeerWithin30Seconds(t *testing.T) {
 	}
 }
 
-// TestServerCloseDuringNegotiation closes the server while a POST is still
-// negotiating. Run under -race: the session's peer connection must be
-// guarded, closed, and the client must not get a session that is gone.
-func TestServerCloseDuringNegotiation(t *testing.T) {
+// setNegotiateHook installs negotiateHook for the test and restores it after
+// the server (registered later) has shut down.
+func setNegotiateHook(t *testing.T, h func(point string, pc *webrtc.PeerConnection)) {
+	t.Helper()
+	old := negotiateHook
+	negotiateHook = h
+	t.Cleanup(func() { negotiateHook = old })
+}
+
+// TestServerCloseAtEachNegotiationStep closes the server deterministically at
+// every point of a POST where shutdown can arrive, and checks that the client
+// gets 503 (never a 201 for a session that is gone), the slot is freed and
+// the peer connection is closed.
+func TestServerCloseAtEachNegotiationStep(t *testing.T) {
+	for _, point := range []string{
+		"created",    // pc exists but is not attached: attach() must refuse it
+		"attached",   // Close stops a session mid-negotiation: error remapped to 503
+		"negotiated", // negotiation finished, then Close: 503 instead of 201
+	} {
+		t.Run(point, func(t *testing.T) {
+			var mu sync.Mutex
+			var pc *webrtc.PeerConnection
+			var ts *testServer
+			fired := 0
+			setNegotiateHook(t, func(p string, c *webrtc.PeerConnection) {
+				mu.Lock()
+				pc = c
+				mu.Unlock()
+				if p != point {
+					return
+				}
+				fired++
+				if err := ts.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			})
+			hub := camera.NewHub("cam1")
+			ts = newTestServer(t, map[string]*camera.Hub{"cam1": hub}, 4)
+			_, offer := newOfferClient(t, false)
+
+			resp := ts.post(t, "cam1", "application/sdp", "Bearer "+ts.token, strings.NewReader(offer))
+			if fired != 1 {
+				t.Fatalf("hook point %q fired %d times, want 1", point, fired)
+			}
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("POST status %d, want 503", resp.StatusCode)
+			}
+			if loc := resp.Header.Get("Location"); loc != "" {
+				t.Fatalf("503 carries Location %q", loc)
+			}
+			if ts.Viewers("cam1") != 0 {
+				t.Fatal("viewer slot remains")
+			}
+			mu.Lock()
+			got := pc
+			mu.Unlock()
+			if got == nil {
+				t.Fatal("no peer connection was created")
+			}
+			eventually(t, 5*time.Second, "peer connection closed", func() bool {
+				return got.ConnectionState() == webrtc.PeerConnectionStateClosed
+			})
+		})
+	}
+}
+
+// TestServerCloseDuringNegotiationStress races Close against in-flight POSTs
+// at varying offsets. Run under -race.
+func TestServerCloseDuringNegotiationStress(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		hub := camera.NewHub("cam1")
 		ts := newTestServer(t, map[string]*camera.Hub{"cam1": hub}, 4)
 		_, offer := newOfferClient(t, false)
 
-		var wg sync.WaitGroup
-		wg.Add(1)
-		var status int
+		type result struct {
+			status int
+			err    error
+		}
+		res := make(chan result, 1)
 		go func() {
-			defer wg.Done()
-			resp := ts.post(t, "cam1", "application/sdp", "Bearer "+ts.token, strings.NewReader(offer))
-			status = resp.StatusCode
+			req, err := http.NewRequest(http.MethodPost, ts.http.URL+"/live/cam1", strings.NewReader(offer))
+			if err != nil {
+				res <- result{err: err}
+				return
+			}
+			req.Header.Set("Content-Type", "application/sdp")
+			req.Header.Set("Authorization", "Bearer "+ts.token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				res <- result{err: err}
+				return
+			}
+			resp.Body.Close()
+			res <- result{status: resp.StatusCode}
 		}()
 		eventually(t, 5*time.Second, "session reserved", func() bool { return ts.Viewers("cam1") == 1 })
 		time.Sleep(time.Duration(i) * 500 * time.Microsecond)
-		ts.mu.Lock()
-		var sess *session
-		for _, s := range ts.sessions {
-			sess = s
-		}
-		ts.mu.Unlock()
 		if err := ts.Close(); err != nil {
 			t.Fatal(err)
 		}
-		wg.Wait()
-		if status != http.StatusCreated && status != http.StatusServiceUnavailable {
-			t.Fatalf("iteration %d: POST during Close = %d, want 201 or 503", i, status)
+		r := <-res
+		if r.err != nil {
+			t.Fatalf("iteration %d: POST: %v", i, r.err)
+		}
+		if r.status != http.StatusCreated && r.status != http.StatusServiceUnavailable {
+			t.Fatalf("iteration %d: POST during Close = %d, want 201 or 503", i, r.status)
 		}
 		if ts.Viewers("cam1") != 0 {
 			t.Fatalf("iteration %d: viewer remains", i)
-		}
-		if sess != nil {
-			sess.mu.Lock()
-			pc := sess.pc
-			sess.mu.Unlock()
-			if pc != nil {
-				eventually(t, 5*time.Second, "peer connection closed", func() bool {
-					return pc.ConnectionState() == webrtc.PeerConnectionStateClosed
-				})
-			}
 		}
 	}
 }

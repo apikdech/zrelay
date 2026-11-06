@@ -17,6 +17,19 @@ import (
 // gatherTimeout bounds ICE candidate gathering for the non-trickle answer.
 const gatherTimeout = 5 * time.Second
 
+// negotiateHook, when set by a test, runs synchronously at the points of a
+// WHEP negotiation where a server Close can arrive: "created" (peer
+// connection exists, not yet attached to the session), "attached" and
+// "negotiated" (answer ready, response not yet sent). It is nil in
+// production.
+var negotiateHook func(point string, pc *webrtc.PeerConnection)
+
+func hook(point string, pc *webrtc.PeerConnection) {
+	if h := negotiateHook; h != nil {
+		h(point, pc)
+	}
+}
+
 // Handler returns the WHEP endpoints (RFC 9725):
 //
 //	POST   /live/{camera}            application/sdp offer -> 201 + answer, Location
@@ -138,10 +151,12 @@ func (s *Server) negotiate(sess *session, offer string) (string, int, error) {
 	if err != nil {
 		return "", http.StatusInternalServerError, err
 	}
+	hook("created", pc)
 	if !sess.attach(pc) {
 		_ = pc.Close()
 		return "", http.StatusServiceUnavailable, errShuttingDown
 	}
+	hook("attached", pc)
 
 	// No fmtp: the track binds to whichever H.264 entry the browser accepted.
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000}, "video", "camera")
@@ -192,6 +207,7 @@ func (s *Server) negotiate(sess *session, offer string) (string, int, error) {
 	case <-gatherTimer.C():
 		return "", http.StatusInternalServerError, errors.New("ICE gathering timed out")
 	}
+	hook("negotiated", pc)
 	return pc.LocalDescription().SDP, 0, nil
 }
 
