@@ -1,6 +1,7 @@
+// @vitest-environment jsdom
 import qrcode from 'qrcode-generator';
-import { describe, expect, it, vi } from 'vitest';
-import { createDecoder, scanFrames, type Frame } from './scan';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createDecoder, openCamera, scanFrames, type Frame } from './scan';
 
 /** Renders text as a QR code into an RGBA frame with a quiet zone. */
 function render(text: string, scale = 4): Frame {
@@ -102,5 +103,80 @@ describe('scanFrames', () => {
       signal: ac.signal,
     });
     await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});
+
+describe('openCamera', () => {
+  const origMedia = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (origMedia) Object.defineProperty(navigator, 'mediaDevices', origMedia);
+    else delete (navigator as unknown as { mediaDevices?: unknown }).mediaDevices;
+  });
+
+  function stubStream() {
+    const tracks = [{ stop: vi.fn() }, { stop: vi.fn() }];
+    const stream = { getTracks: () => tracks } as unknown as MediaStream;
+    const getUserMedia = vi.fn(async () => stream);
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
+    return { tracks, getUserMedia };
+  }
+
+  it('asks for the rear camera, video only, and plays inline and muted', async () => {
+    const { getUserMedia } = stubStream();
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+    const cam = await openCamera();
+    expect(getUserMedia).toHaveBeenCalledWith({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(cam.video.muted).toBe(true);
+    expect(cam.video.playsInline).toBe(true);
+  });
+
+  it('stops every track and rethrows when play() is rejected', async () => {
+    const { tracks } = stubStream();
+    const boom = new Error('NotAllowedError');
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockRejectedValue(boom);
+    await expect(openCamera()).rejects.toBe(boom);
+    for (const t of tracks) expect(t.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('stop() releases every track', async () => {
+    const { tracks } = stubStream();
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+    const cam = await openCamera();
+    cam.stop();
+    for (const t of tracks) expect(t.stop).toHaveBeenCalledTimes(1);
+    expect(cam.video.srcObject).toBeNull();
+  });
+
+  it('grab() is null while the video has no dimensions, then returns the canvas pixels', async () => {
+    stubStream();
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+    const image = { data: new Uint8ClampedArray(2 * 3 * 4), width: 2, height: 3 };
+    const drawImage = vi.fn();
+    const getImageData = vi.fn(() => image);
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue({ drawImage, getImageData } as unknown as CanvasRenderingContext2D);
+    const cam = await openCamera();
+
+    expect(cam.grab()).toBeNull(); // jsdom: videoWidth/videoHeight are 0
+    expect(getContext).not.toHaveBeenCalled();
+
+    Object.defineProperty(cam.video, 'videoWidth', { configurable: true, value: 2 });
+    Object.defineProperty(cam.video, 'videoHeight', { configurable: true, value: 3 });
+    expect(cam.grab()).toBe(image);
+    expect(drawImage).toHaveBeenCalledWith(cam.video, 0, 0, 2, 3);
+    expect(getImageData).toHaveBeenCalledWith(0, 0, 2, 3);
+  });
+
+  it('grab() is null when the canvas has no 2d context', async () => {
+    stubStream();
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null);
+    const cam = await openCamera();
+    Object.defineProperty(cam.video, 'videoWidth', { configurable: true, value: 2 });
+    Object.defineProperty(cam.video, 'videoHeight', { configurable: true, value: 3 });
+    expect(cam.grab()).toBeNull();
   });
 });

@@ -38,7 +38,8 @@
   let locked = $state(false);
   let scanning = $state(false);
   let mismatch: Mismatch | null = $state(null);
-  let check: '' | 'checking' | 'failed' = $state('');
+  let check: '' | 'checking' | 'failed' | 'rejected' = $state('');
+  let actionError = $state('');
   let idleMinutes = $state(savedIdleMinutes());
   let idle: IdleLock | undefined;
   let checkSeq = 0;
@@ -63,37 +64,59 @@
       if (seq !== checkSeq) return;
       mismatch = keyMismatch(res.clips, keyId);
       check = '';
-    } catch {
-      if (seq === checkSeq) check = 'failed';
+    } catch (e) {
+      if (seq !== checkSeq) return;
+      // 401: the server did not accept the Bearer derived from this key.
+      check = (e as { status?: number } | null)?.status === 401 ? 'rejected' : 'failed';
     }
+  }
+
+  /** Drops any in-flight recent-recordings check and clears its result. */
+  function cancelCheck() {
+    checkSeq++;
+    mismatch = null;
+    check = '';
   }
 
   async function doImport() {
     if (input !== 'valid') return;
     importError = '';
-    const res = await client.call<ImportResult>({ type: 'key.import', encoded: text, remember });
-    if ('error' in res) {
-      importError = res.error === 'checksum' ? 'typo in key' : 'Not a complete key.';
-      return;
+    actionError = '';
+    try {
+      const res = await client.call<ImportResult>({ type: 'key.import', encoded: text, remember });
+      if ('error' in res) {
+        importError = res.error === 'checksum' ? 'typo in key' : 'Not a complete key.';
+        return;
+      }
+      text = ''; // the key text must not linger in the page
+      locked = false;
+      await refresh();
+      void checkRecordings(res.keyId);
+    } catch {
+      actionError = 'Could not import the key. Try again.'; // fixed text: never the key or the raw error
     }
-    text = ''; // the key text must not linger in the page
-    locked = false;
-    await refresh();
-    void checkRecordings(res.keyId);
   }
 
   async function doLock() {
-    await refresh(await client.call<KeyListResult>({ type: 'key.lock' }));
-    locked = true;
-    mismatch = null;
-    check = '';
+    actionError = '';
+    cancelCheck();
+    try {
+      await refresh(await client.call<KeyListResult>({ type: 'key.lock' }));
+      locked = true;
+    } catch {
+      actionError = 'Could not lock. Try again.';
+    }
   }
 
   async function doForget(keyId: string) {
-    await refresh(await client.call<KeyListResult>({ type: 'key.forget', keyId }));
-    locked = true;
-    mismatch = null;
-    check = '';
+    actionError = '';
+    cancelCheck();
+    try {
+      await refresh(await client.call<KeyListResult>({ type: 'key.forget', keyId }));
+      locked = true;
+    } catch {
+      actionError = 'Could not forget the key. Try again.';
+    }
   }
 
   function setIdle(e: Event) {
@@ -176,6 +199,11 @@
     <p class="text-sm text-neutral-400">Checking recent recordings…</p>
   {:else if check === 'failed'}
     <p class="text-sm text-neutral-400">Could not check recent recordings.</p>
+  {:else if check === 'rejected'}
+    <p role="status" class="text-sm text-amber-300">The server did not accept this key. Check that it is the right one.</p>
+  {/if}
+  {#if actionError}
+    <p role="alert" class="text-sm text-red-400">{actionError}</p>
   {/if}
   {#if mismatch}
     <div role="alert" class="space-y-1 rounded border border-amber-500 p-3 text-sm text-amber-300">

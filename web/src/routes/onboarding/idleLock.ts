@@ -22,19 +22,36 @@ export const realTimer: TimerApi = {
   clear: (id) => clearTimeout(id),
 };
 
-export function createIdleLock(opts: { doc: VisibilitySource; lock: () => void; timer?: TimerApi }): IdleLock {
+export function createIdleLock(opts: {
+  doc: VisibilitySource;
+  lock: () => void;
+  timer?: TimerApi;
+  /** Wall clock in ms; injectable for tests. */
+  now?: () => number;
+}): IdleLock {
   const { doc, lock } = opts;
   const timer = opts.timer ?? realTimer;
+  const now = opts.now ?? Date.now;
   let minutes = 0;
   let pending: number | null = null;
+  let hiddenAt = 0;
 
   const cancel = () => {
     if (pending !== null) timer.clear(pending);
     pending = null;
   };
   const sync = () => {
+    // Mobile browsers freeze timers in the background, so a countdown armed on
+    // 'hidden' may never have fired. Check the wall clock before dropping it.
+    const armed = pending !== null;
+    const overdue = armed && !doc.hidden && now() - hiddenAt >= minutes * 60_000;
     cancel();
+    if (overdue) {
+      lock();
+      return;
+    }
     if (minutes > 0 && doc.hidden) {
+      if (!armed) hiddenAt = now(); // keep the original hide time when only the setting changed
       pending = timer.set(() => {
         pending = null;
         lock();

@@ -28,8 +28,10 @@ function fixture() {
     doc.dispatchEvent(new Event('visibilitychange'));
   };
   let locks = 0;
-  const idle = createIdleLock({ doc, timer, lock: () => void locks++ });
-  return { idle, advance, setHidden, locks: () => locks, timers };
+  const idle = createIdleLock({ doc, timer, now: () => now, lock: () => void locks++ });
+  /** Wall clock moves but no timer runs: a suspended mobile tab. */
+  const advanceWithoutTimers = (ms: number) => void (now += ms);
+  return { idle, advance, advanceWithoutTimers, setHidden, locks: () => locks, timers };
 }
 
 describe('idle auto-lock', () => {
@@ -83,5 +85,31 @@ describe('idle auto-lock', () => {
     f.advance(2 * 60_000);
     expect(f.locks()).toBe(0);
     expect(f.timers.size).toBe(0);
+  });
+
+  it('locks on return when the timer never fired while the tab was suspended', () => {
+    const f = fixture();
+    f.idle.setMinutes(5);
+    f.setHidden(true);
+    f.advanceWithoutTimers(5 * 60_000 + 1); // timers frozen by the OS
+    expect(f.locks()).toBe(0);
+    f.setHidden(false);
+    expect(f.locks()).toBe(1);
+    f.advance(10 * 60_000);
+    expect(f.locks()).toBe(1); // exactly once
+  });
+
+  it('does not lock on return before the deadline, and does not double-lock after the timer fired', () => {
+    const f = fixture();
+    f.idle.setMinutes(5);
+    f.setHidden(true);
+    f.advanceWithoutTimers(5 * 60_000 - 1);
+    f.setHidden(false);
+    expect(f.locks()).toBe(0);
+    f.setHidden(true);
+    f.advance(5 * 60_000); // timer fires normally
+    expect(f.locks()).toBe(1);
+    f.setHidden(false);
+    expect(f.locks()).toBe(1);
   });
 });

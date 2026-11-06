@@ -33,12 +33,13 @@ const clipsAt = (...keyIds: string[]) => ({
 });
 
 /** A scripted worker client that records every call. */
-function fakeClient(opts: { clips?: unknown; clipsError?: Error } = {}) {
+function fakeClient(opts: { clips?: unknown; clipsError?: Error; gate?: Promise<void>; failOn?: Request['type'] } = {}) {
   const calls: Request[] = [];
   let keys: { keyId: string; remembered: boolean }[] = [];
   const client = {
     async call<T>(msg: Request): Promise<T> {
       calls.push(msg);
+      if (opts.failOn === msg.type) throw new Error('worker exploded');
       switch (msg.type) {
         case 'key.import':
           keys = [...keys.filter((k) => k.keyId !== KEY_ID), { keyId: KEY_ID, remembered: msg.remember }];
@@ -52,6 +53,7 @@ function fakeClient(opts: { clips?: unknown; clipsError?: Error } = {}) {
           keys = keys.filter((k) => k.remembered);
           return { keys } as T;
         case 'api.get':
+          if (opts.gate) await opts.gate;
           if (opts.clipsError) throw opts.clipsError;
           return (opts.clips ?? clipsAt()) as T;
         default:
@@ -156,6 +158,20 @@ describe('importing', () => {
     await typeKey(await masterText());
     await fireEvent.click(screen.getByRole('button', { name: /import key/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/typo in key/i);
+    const hex = (await masterText()).split('-')[1];
+    expect(document.body.textContent).not.toContain(hex);
+    expect(location.href).not.toContain('zk1');
+  });
+
+  it('shows a generic error, never the key, when the worker call rejects', async () => {
+    const { client } = fakeClient({ failOn: 'key.import' });
+    render(Onboarding, { client, now: () => NOW });
+    await typeKey(await masterText());
+    await fireEvent.click(screen.getByRole('button', { name: /import key/i }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/could not import/i);
+    expect(document.body.textContent).not.toContain((await masterText()).split('-')[1]);
+    expect(location.href).not.toContain('zk1');
   });
 });
 
@@ -203,7 +219,89 @@ describe('recent recordings check', () => {
   });
 });
 
+describe('rejected key', () => {
+  it('says the server did not accept the key when the clip list answers 401', async () => {
+    const err = Object.assign(new Error('unauthorized'), { name: 'ApiError', status: 401 });
+    const { client } = fakeClient({ clipsError: err });
+    render(Onboarding, { client, now: () => NOW });
+    await typeKey(await masterText());
+    await fireEvent.click(screen.getByRole('button', { name: /import key/i }));
+    expect(await screen.findByText(/server did not accept this key/i)).toBeInTheDocument();
+    expect(screen.queryByText(/could not check recent recordings/i)).toBeNull();
+    expect(screen.getByRole('list', { name: /keyring/i })).toBeInTheDocument();
+  });
+});
+
 describe('lock and forget', () => {
+  async function importWithPendingCheck() {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { client, calls } = fakeClient({ clips: clipsAt(OTHER_ID), gate });
+    render(Onboarding, { client, now: () => NOW });
+    await typeKey(await masterText());
+    await fireEvent.click(screen.getByRole('button', { name: /import key/i }));
+    await screen.findByRole('list', { name: /keyring/i });
+    await screen.findByText(/checking recent recordings/i);
+    return { release, calls };
+  }
+
+  it('Lock discards a recent-recordings check that is still in flight', async () => {
+    const { release } = await importWithPendingCheck();
+    await fireEvent.click(screen.getByRole('button', { name: /^lock$/i }));
+    await screen.findByText(/locked/i);
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(screen.queryByText(/doesn't match/i)).toBeNull();
+  });
+
+  it('Forget discards a recent-recordings check that is still in flight', async () => {
+    const { release } = await importWithPendingCheck();
+    await fireEvent.click(screen.getByRole('button', { name: /forget key/i }));
+    await screen.findByText(/locked/i);
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(screen.queryByText(/doesn't match/i)).toBeNull();
+  });
+
+  it('shows an error instead of an unhandled rejection when Lock fails', async () => {
+    const { client } = fakeClient({ failOn: 'key.lock' });
+    render(Onboarding, { client, now: () => NOW });
+    await fireEvent.click(screen.getByRole('button', { name: /^lock$/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/could not lock/i);
+  });
+
+  it('shows an error instead of an unhandled rejection when Forget fails', async () => {
+    const { client } = fakeClient();
+    render(Onboarding, { client, now: () => NOW });
+    await typeKey(await masterText());
+    await fireEvent.click(screen.getByRole('button', { name: /import key/i }));
+    await screen.findByRole('list', { name: /keyring/i });
+    const failing = {
+      call: async <T,>(msg: Request): Promise<T> => {
+        if (msg.type === 'key.forget') throw new Error('worker exploded');
+        return client.call<T>(msg);
+      },
+    };
+    cleanup();
+    // Re-render with a client whose forget fails; the key is still remembered by the first client.
+    render(Onboarding, { client: failing, now: () => NOW });
+    await fireEvent.click(await screen.findByRole('button', { name: /forget key/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/could not forget/i);
+  });
+
+  it('auto-lock failing does not raise an unhandled rejection', async () => {
+    vi.useFakeTimers();
+    const { client } = fakeClient({ failOn: 'key.lock' });
+    render(Onboarding, { client, now: () => NOW });
+    await fireEvent.change(screen.getByLabelText(/auto-lock/i), { target: { value: '1' } });
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(60_000);
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/could not lock/i);
+  });
+
   it('Lock asks the worker to discard derived keys', async () => {
     const { client, calls } = fakeClient();
     render(Onboarding, { client, now: () => NOW });

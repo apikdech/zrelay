@@ -589,3 +589,13 @@ the page cannot reach `/live/`: `internal/relay/live/testdata/main.go`.
 **Expected result:** the QR scans in the installed iOS app (where Safari's storage is not shared) and in Safari; the camera light turns off when the scanner closes or after a successful scan; fingerprint matches the relay; the mismatch warning appears only for a non-matching key; Forget empties the IndexedDB store; no URL contains the key.
 **If the result differs, update:** `openCamera` (constraints, `playsInline`, canvas grab) and `createDecoder` in `web/src/lib/qr/scan.ts` plus `scan.test.ts`; `Scanner.svelte`; the mismatch window in `web/src/routes/onboarding/mismatch.ts` (`RECENT_CLIPS`) and ui-spec §4.1; idle behaviour in `idleLock.ts`.
 **Status:** not run
+
+## Task 38 (review fixes) — Key onboarding: suspended-tab auto-lock, rejected key, camera release
+**Automated in this task:** jsdom tests for `openCamera` (constraints `{video:{facingMode:{ideal:'environment'}}, audio:false}`, tracks stopped when `play()` rejects, `grab()` null without video dimensions, canvas pixels otherwise, all with a stubbed `getUserMedia`); `idleLock.test.ts` for a timer that never fires while the clock passes the deadline (locks once on return to visible); Onboarding tests for HTTP 401 on the clip list ("The server did not accept this key"), rejected worker calls on import, lock, forget and auto-lock (generic alert, no key text), in-flight recording checks discarded by Lock and Forget, and no key hex in the page or `location.href`. A real suspended browser tab and a real camera were not exercised.
+**Manual steps:**
+1. On an iPhone Home Screen app, set "Auto-lock when tab is hidden" to 1 min, import a key without "Remember this device", lock the phone (or switch apps) for 5 minutes, then reopen the app.
+2. Import a valid key that the server does not accept (for example a key from another household) on a fresh device and watch the status line under the form.
+3. Open the scanner, then close it and deny camera permission once; confirm the camera indicator turns off in each case.
+**Expected result:** on reopening in step 1 the keyring shows "Locked: session keys were discarded." immediately, even though timers were suspended; step 2 shows "The server did not accept this key" instead of "Could not check recent recordings"; the camera indicator is off after closing and after a denied permission.
+**If the result differs, update:** the visibility handling and clock check in `web/src/routes/onboarding/idleLock.ts` (consider `pagehide`/`freeze` events) with `idleLock.test.ts`; the 401 mapping in `checkRecordings` in `Onboarding.svelte`; `openCamera` in `web/src/lib/qr/scan.ts` with `scan.test.ts`.
+**Status:** not run
