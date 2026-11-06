@@ -118,6 +118,28 @@ export function planSeek(i: SeekInput): SeekPlan {
   return { kind: 'fetch', chunk, intraOffset, fragmentMs: fragment };
 }
 
+export interface ResumeInput {
+  /** The seek target (ms), expected to be buffered. */
+  tMs: number;
+  seekIndex: readonly SeekEntry[];
+  chunkSize: number;
+  buffered: readonly Range[];
+}
+
+/**
+ * Where a sequential fill picks up for a target inside the buffer: the first fragment that starts at the
+ * end of the buffered range holding the target. Null when there is nothing to continue with (the target
+ * is not buffered, there is no index, or that range already reaches the last fragment).
+ */
+export function planResume(i: ResumeInput): { chunk: number; intraOffset: number } | null {
+  const r = holding(i.buffered, i.tMs / 1000);
+  if (!r || i.seekIndex.length === 0) return null;
+  const endMs = r[1] * 1000 - START_SLACK * 1000;
+  const next = i.seekIndex.find(([t]) => t >= endMs);
+  if (!next) return null;
+  return { chunk: Math.floor(next[1] / i.chunkSize), intraOffset: next[1] % i.chunkSize };
+}
+
 /**
  * ~Media time at which verification failed: the start of the last fragment at
  * or before the failing chunk, so what was shown before it was all verified.

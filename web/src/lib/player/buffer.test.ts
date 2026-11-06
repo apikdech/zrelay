@@ -9,6 +9,7 @@ import {
   isBuffered,
   needsMore,
   planEviction,
+  planResume,
   planSeek,
   type Range,
 } from './buffer';
@@ -136,5 +137,25 @@ describe('failureTimeMs', () => {
   it('is 0 for a failure in the first chunk or with no index', () => {
     expect(failureTimeMs(seekIndex, 0, CS)).toBe(0);
     expect(failureTimeMs([], 7, CS)).toBe(0);
+  });
+});
+
+describe('planResume (continue after the buffered range holding a seek target)', () => {
+  const idx: [number, number][] = Array.from({ length: 100 }, (_, i) => [i * 1000, i * CS]);
+  const at = (buffered: Range[], tMs: number) => planResume({ tMs, seekIndex: idx, chunkSize: CS, buffered });
+
+  it('resumes at the fragment starting where the holding range ends', () => {
+    expect(at([[0, 30]], 5000)).toEqual({ chunk: 30, intraOffset: 0 });
+    expect(at([[0, 10], [20, 40]], 25_000)).toEqual({ chunk: 40, intraOffset: 0 });
+  });
+
+  it('tolerates a range end a hair past the fragment start', () => {
+    expect(at([[0, 30.033]], 5000)).toEqual({ chunk: 30, intraOffset: 0 });
+  });
+
+  it('is null when the range reaches the last fragment, the target is unbuffered, or there is no index', () => {
+    expect(at([[0, 100]], 5000)).toBeNull();
+    expect(at([[0, 30]], 50_000)).toBeNull();
+    expect(planResume({ tMs: 5000, seekIndex: [], chunkSize: CS, buffered: [[0, 30]] })).toBeNull();
   });
 });

@@ -6,7 +6,7 @@ import type { ClipOpenResult, ClipReadResult, Request, Verification } from '../.
 import { ErrAuth, ErrAuthHeader, ErrFormat, ErrTrailingData, ErrTruncated, ErrUnknownKey } from '../zrec/errors';
 import type { WorkerClient } from '../workerClient';
 import { findNextClip } from './advance';
-import { BLOB_LRU, BLOB_MAX, WINDOWS, failureTimeMs, isBuffered, needsMore, planEviction, planSeek, type Profile } from './buffer';
+import { BLOB_LRU, BLOB_MAX, WINDOWS, failureTimeMs, isBuffered, needsMore, planEviction, planResume, planSeek, type Profile } from './buffer';
 import { BlobLru, blobFromParts } from './blob';
 import { mseCtor, mseSupports, openSink, type MseKind, type Sink } from './mse';
 import { initialState } from './status';
@@ -396,11 +396,44 @@ class PlayerImpl implements Player {
       if (tMs >= st.failedAtMs - 1) return;
     }
     const plan = planSeek({ tMs, seekIndex: open.seekIndex, chunkSize: open.header.chunkSize, buffered: sink.buffered() });
-    if (plan.kind === 'buffered') this.#fetching = null;
+    if (plan.kind === 'buffered') {
+      // A drag that ends inside the buffer while an earlier one is still fetching: the later one wins.
+      const settling = this.#seekHead !== null;
+      this.#fetching = null;
+      if (settling) {
+        this.#seekTok++;
+        this.#resumeBuffered(open, sink, tMs);
+      }
+    }
     if (plan.kind !== 'fetch') return;
     const f = this.#fetching;
     if (f && f.gen === this.#gen && f.fragmentMs === plan.fragmentMs) return;
     void this.seek(tMs);
+  }
+
+  /**
+   * A seek landed inside the buffer while an earlier fetch seek was still settling. Stop that seek's fill
+   * (its token is already stale, so it never moves the playhead), drop what it left beyond the window, and
+   * carry on sequentially from the end of the buffered range holding the target.
+   */
+  #resumeBuffered(open: ClipOpenResult, sink: Sink, tMs: number): void {
+    const g = ++this.#gen;
+    this.#seekHead = null;
+    this.#fetching = null;
+    this.#signal();
+    const resume = planResume({ tMs, seekIndex: open.seekIndex, chunkSize: open.header.chunkSize, buffered: sink.buffered() });
+    void (async () => {
+      try {
+        // The stopped fill may have been part-way through a fragment: reset the parser before appending again.
+        await sink.abort();
+        if (g !== this.#gen) return;
+        for (const [s, e] of planEviction(sink.buffered(), tMs / 1000, this.#win).ahead) await sink.remove(s, e);
+        if (g !== this.#gen || !resume) return;
+        await this.#fill(g, open, sink, resume.chunk, resume.intraOffset);
+      } catch (e) {
+        if (g === this.#gen) this.#fail(e, resume?.chunk ?? 0);
+      }
+    })();
   }
 
   async seek(tMs: number): Promise<void> {
@@ -425,9 +458,11 @@ class PlayerImpl implements Player {
     }
     const plan = planSeek({ tMs: target, seekIndex: open.seekIndex, chunkSize: open.header.chunkSize, buffered: sink.buffered() });
     if (plan.kind !== 'fetch') {
-      this.#seekHead = null; // supersedes a fetch seek that is still settling
+      const settling = plan.kind === 'buffered' && this.#seekHead !== null;
+      this.#seekHead = null;
       this.video.currentTime = target / 1000;
       this.#signal();
+      if (settling) this.#resumeBuffered(open, sink, target); // supersedes a fetch seek that is still settling
       return;
     }
     // ui-spec §4.3.2 step 2: drop the old fetches (their results are ignored), reset the parser, fetch the fragment.

@@ -547,6 +547,58 @@ describe('overlapping seeks', () => {
     p.destroy();
   });
 
+  it('a native scrub inside the buffer fully supersedes an earlier native scrub that is still settling', async () => {
+    const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
+    const { p } = make(c, 'mobile'); // buffered [0, 30]
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    c.hold.add(70);
+    env.video.currentTime = 70; // first drag: unbuffered, starts a fetch seek
+    env.video.fire('seeking');
+    await until(() => c.held.has(70), 'read of chunk 70 in flight');
+    env.video.currentTime = 5; // second drag: back inside the buffer
+    env.video.fire('seeking');
+    await tick(50);
+    const appended = sb().appends.length;
+    const reads = c.reads.length;
+    c.held.get(70)!();
+    await tick(50);
+    await new Promise<void>((r) => setTimeout(r, 20));
+    expect(env.video.currentTime).toBe(5);
+    expect(sb().ranges.some(([s, e]) => s <= 0 && e >= 30)).toBe(true); // [0, 30] was not evicted
+    expect(sb().appends.slice(appended).every((a) => (a[0] ?? 0) < 70)).toBe(true);
+    expect(sb().appends.slice(0, appended).every((a) => (a[0] ?? 0) < 70)).toBe(true);
+    expect(c.reads.slice(reads).every((r) => r < 70)).toBe(true);
+    p.destroy();
+  });
+
+  it('a direct seek inside the buffer stops the earlier fetch seek\'s fill and resumes after the buffered range', async () => {
+    const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
+    const { p } = make(c, 'mobile'); // buffered [0, 30]
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    c.hold.add(70);
+    const a = p.seek(70_000);
+    await until(() => c.held.has(70), 'read of chunk 70 in flight');
+    await p.seek(5000); // buffered
+    const reads = c.reads.length;
+    c.held.get(70)!();
+    await a;
+    await tick(50);
+    expect(env.video.currentTime).toBe(5);
+    env.video.currentTime = 29;
+    env.video.fire('timeupdate');
+    await until(() => sb().ranges.some(([s, e]) => s <= 29 && e >= 59), '30 s ahead of 29 s buffered, contiguous');
+    await tick(50);
+    await new Promise<void>((r) => setTimeout(r, 20));
+    const holding = sb().ranges.find(([s, e]) => s <= 29 && e > 29)!;
+    expect(holding[1]).toBeLessThanOrEqual(61); // stopped about 30 s ahead of the playhead
+    expect(sb().ranges.every(([s]) => s < 70)).toBe(true);
+    expect(c.reads.slice(reads).every((r) => r < 70)).toBe(true);
+    expect(sb().appends.every((a) => (a[0] ?? 0) < 70)).toBe(true);
+    p.destroy();
+  });
+
   it('a later fetch seek supersedes an earlier one', async () => {
     const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
     const { p } = make(c, 'mobile');
