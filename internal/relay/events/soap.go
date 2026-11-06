@@ -179,7 +179,8 @@ type notification struct {
 	Topic   string
 	UtcTime string
 	Op      string // PropertyOperation
-	Items   []Item
+	Source  []Item // Message/Source SimpleItems
+	Items   []Item // Message/Data SimpleItems
 }
 
 func parsePull(raw []byte) ([]notification, error) {
@@ -189,7 +190,11 @@ func parsePull(raw []byte) ([]notification, error) {
 			Message struct {
 				UtcTime string `xml:"UtcTime,attr"`
 				Op      string `xml:"PropertyOperation,attr"`
-				Items   []struct {
+				Source  []struct {
+					Name  string `xml:"Name,attr"`
+					Value string `xml:"Value,attr"`
+				} `xml:"Source>SimpleItem"`
+				Items []struct {
 					Name  string `xml:"Name,attr"`
 					Value string `xml:"Value,attr"`
 				} `xml:"Data>SimpleItem"`
@@ -205,7 +210,11 @@ func parsePull(raw []byte) ([]notification, error) {
 		for i, it := range n.Message.Items {
 			items[i] = Item{Name: it.Name, Value: it.Value}
 		}
-		out = append(out, notification{Topic: strings.TrimSpace(n.Topic), UtcTime: n.Message.UtcTime, Op: n.Message.Op, Items: items})
+		source := make([]Item, len(n.Message.Source))
+		for i, it := range n.Message.Source {
+			source[i] = Item{Name: it.Name, Value: it.Value}
+		}
+		out = append(out, notification{Topic: strings.TrimSpace(n.Topic), UtcTime: n.Message.UtcTime, Op: n.Message.Op, Source: source, Items: items})
 	}
 	return out, nil
 }
