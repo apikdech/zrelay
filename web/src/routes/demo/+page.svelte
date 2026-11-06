@@ -98,7 +98,7 @@
   </form>
 
   <div class="relative overflow-hidden rounded-lg border border-neutral-800 bg-black">
-    <video bind:this={video} data-testid="player" controls muted playsinline class="aspect-video w-full bg-black object-contain"></video>
+    <video bind:this={video} data-testid="player" data-clip-player controls muted playsinline class="aspect-video w-full bg-black object-contain"></video>
     {#if view.spinner}
       <div class="absolute inset-0 flex items-center justify-center bg-black/50 text-sm" role="progressbar" aria-label="Verifying">
         <span class="animate-pulse">{view.text}</span>

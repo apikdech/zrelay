@@ -215,6 +215,11 @@ describe('Player', () => {
     await waitFor(() => expect(FakePlayer.instances[0]?.loads).toEqual([ids.a]));
   });
 
+  it('marks its video as clip playback so the update prompt can tell it from live tiles', () => {
+    render(Player, props());
+    expect(screen.getByTestId('player')).toHaveAttribute('data-clip-player');
+  });
+
   it('seeks to the offset after loading', async () => {
     render(Player, props({ cue: { clipId: ids.a, offsetMs: 12_000, n: 1 } }));
     await waitFor(() => expect(FakePlayer.instances[0]?.seeks).toEqual([12_000]));
