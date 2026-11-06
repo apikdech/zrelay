@@ -505,3 +505,14 @@ call, including `DeleteObject` on the dot-named staging key.
 **Expected result:** the first restart changes nothing (no `Discarded`, the staging sidecar and the multipart upload are still there); the second restart recovers the clip (`Recovered: 1`) with an `incomplete` sidecar.
 **If the result differs, update:** the age comparison in `recovery.scan` (`internal/relay/recovery/recovery.go`) and Contract §7.4. If host and MinIO clocks differ, see the clock-skew note in the Task 27 entry above.
 **Status:** not run
+
+## Task 37 — Timeline component
+**Automated in this task:** `web/src/lib/timeline/` (Canvas 2D `Timeline.svelte`, pure `model.ts`, `zoom.ts`, `timezone.ts`, `render.ts`). Vitest: `localDayRange` for Asia/Jakarta, Asia/Kolkata and America/New_York across both DST changes (23 h and 25 h days); glyph and color mapping (P orange, V green, A purple, M blue, • gray); hit-test snap at 24 px landing on the first trigger offset; coverage complement shaded as not monitored; zoom presets 24 h, 6 h, 1 h, 10 min, 1 min; dirty-flag rAF scheduler. Playwright (`web/e2e/timeline.spec.ts`, Chromium and WebKit): click, snap, wheel zoom, double-click and drag pan. Chromium perf test: 4 x 500 synthetic clips with coverage gaps, scripted wheel-zoom and drag for 3 s; one run measured an average draw cost of 0.73 ms per frame (180 frames, max 2.8 ms). The test asserts average draw cost per frame below 16.7 ms.
+**Manual steps:**
+1. On the Mac mini, serve the SPA with a build that includes the timeline view and open the Perf page `web/e2e/page/timeline.html?data=perf` through the dev server (`cd web && pnpm exec vite --host 127.0.0.1 --port 0`, note the printed port) from a mid-range phone on the tailnet (use the Mac's tailnet address instead of 127.0.0.1 with `--host 0.0.0.0` only for this check).
+2. On the phone, pan with one finger and pinch-zoom continuously for 10 s. In Safari Web Inspector (iOS) or Chrome `chrome://inspect` (Android) record a Timelines/Performance trace.
+3. Open the real zview with a day that has clips on 4 cameras; set the display zone to `Asia/Jakarta` and then to the viewer zone; confirm the ruler labels follow the zone.
+4. Open a day containing a DST change in a forced `America/New_York` zone (2026-03-08 and 2026-11-01) and confirm the day is 23 h and 25 h wide.
+**Expected result:** 60 fps (frames under 16.7 ms) during pan and pinch on the phone; pinch and one-finger pan do not scroll the page; the now line shows only when viewing today; hovering a hatched region labels it "not monitored"; the ruler matches the forced zone.
+**If the result differs, update:** per-frame cost in `drawTimeline` (`web/src/lib/timeline/render.ts`: batching, hatch pattern) and `layoutLanes` culling (`model.ts`); gesture constants in `Timeline.svelte` (pinch, wheel sensitivity); ui-spec §4.6 performance target if the target changes.
+**Status:** not run

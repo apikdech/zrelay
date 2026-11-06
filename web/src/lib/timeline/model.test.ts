@@ -99,16 +99,16 @@ describe('layoutLanes', () => {
 
   it('lays trigger spans from clip start + first_at_ms .. last_at_ms with their style', () => {
     const l = layout([
-      clip('a', 'front', 12 * H, 10 * 60 * S, [
-        { type: 'person', firstAtMs: 60 * S, lastAtMs: 120 * S },
-        { type: 'vehicle', firstAtMs: 200 * S, lastAtMs: 260 * S },
+      clip('a', 'front', 12 * H, 3 * H, [
+        { type: 'person', firstAtMs: 20 * 60 * S, lastAtMs: 40 * 60 * S },
+        { type: 'vehicle', firstAtMs: 60 * 60 * S, lastAtMs: 90 * 60 * S },
       ]),
     ]);
     const c = l.lanes[0]!.clips[0]!;
     expect(c.triggers).toHaveLength(2);
     expect(c.triggers[0]).toMatchObject({ type: 'person', glyph: 'P', color: '#f97316' });
-    expect(c.triggers[0]!.x0).toBeCloseTo(((12 * H + 60 * S) / (24 * H)) * W, 6);
-    expect(c.triggers[0]!.x1).toBeCloseTo(((12 * H + 120 * S) / (24 * H)) * W, 6);
+    expect(c.triggers[0]!.x0).toBeCloseTo(((12 * H + 20 * 60 * S) / (24 * H)) * W, 6);
+    expect(c.triggers[0]!.x1).toBeCloseTo(((12 * H + 40 * 60 * S) / (24 * H)) * W, 6);
     expect(c.triggers[1]).toMatchObject({ type: 'vehicle', glyph: 'V', color: '#22c55e' });
   });
 
@@ -246,10 +246,10 @@ describe('hitTest', () => {
 });
 
 describe('rulerTicks', () => {
-  it('24 h view: 3-hourly local ticks in the forced zone', () => {
+  it('24 h view: 2-hourly local ticks in the forced zone', () => {
     const r = localDayRange('2026-11-06', 'Asia/Jakarta');
     const ticks = rulerTicks(fullView(r), 1000, 'Asia/Jakarta');
-    expect(ticks.map((t) => t.label)).toEqual(['00:00', '03:00', '06:00', '09:00', '12:00', '15:00', '18:00', '21:00']);
+    expect(ticks.map((t) => t.label)).toEqual(['00:00', '02:00', '04:00', '06:00', '08:00', '10:00', '12:00', '14:00', '16:00', '18:00', '20:00', '22:00']);
     expect(ticks[0]!.ms).toBe(r[0]);
   });
 
