@@ -6,6 +6,7 @@ tool honnef.co/go/tools/cmd/staticcheck
 
 require (
 	github.com/bluenviron/gortsplib/v5 v5.6.7
+	github.com/oklog/ulid/v2 v2.1.2
 	github.com/pion/rtcp v1.2.20
 	github.com/pion/rtp v1.10.6
 )
