@@ -30,6 +30,12 @@ type env struct {
 	// age makes the given keys (and everything else written so far) old
 	// enough for olderThan.
 	age func(t *testing.T, keys ...string)
+	// settle, when set, is how long a scenario waits after age so that
+	// objects written afterwards are measurably younger than aged ones, and
+	// youngWindow is the olderThan that scenario then uses. Backends whose
+	// timestamps are server-side with coarse resolution (s3) need both.
+	settle      time.Duration
+	youngWindow time.Duration
 }
 
 const camera = "front"
@@ -254,6 +260,8 @@ func runScenarios(t *testing.T, newEnv func(t *testing.T) env) {
 		{"PromoteMismatchLeavesVideoWithoutSidecar", testPromoteMismatch},
 		{"EmptyUploadDiscardsThePair", testEmptyUpload},
 		{"YoungerThanOlderThanIsUntouched", testYounger},
+		{"OldStagingWithYoungVideoIsUntouched", testOldStagingYoungVideo},
+		{"StagingWithoutSchemaIsRecovered", testStagingWithoutSchema},
 		{"OnlyTodayAndYesterdayOfListedCameras", testScope},
 		{"SecondRunIsANoOp", testIdempotent},
 	}
@@ -495,4 +503,65 @@ func testIdempotent(t *testing.T, e env) {
 	e.age(t, c.keys.Video, c.keys.StagingSidecar)
 	wantReport(t, e.mustRun(t, camera), recovery.Report{Recovered: 1})
 	wantReport(t, e.mustRun(t, camera), recovery.Report{})
+}
+
+// testOldStagingYoungVideo is the crash-restart-within-OlderThan case: the
+// staging sidecar is old, but the video upload is younger than OlderThan, so
+// the pair must be left alone for a later Run (Contract §7.4: "Do not discard
+// on this row alone").
+func testOldStagingYoungVideo(t *testing.T, e env) {
+	c := newClip(t, camera, hourAgo(), 14)
+	e.putStaging(t, c, camera)
+	e.age(t, c.keys.StagingSidecar)
+	time.Sleep(e.settle)
+	e.crashVideo(t, c, camera, false)
+	window := e.olderThan
+	if e.youngWindow > 0 {
+		window = e.youngWindow
+	}
+	rep, err := recovery.Run(t.Context(), recovery.Config{
+		Provider: e.p, Recoverer: e.r, Cameras: []string{camera},
+		Now: time.Now().UTC(), OlderThan: window,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	wantReport(t, rep, recovery.Report{})
+	if got, want := e.staged(t), []string{c.keys.StagingSidecar}; !slices.Equal(got, want) {
+		t.Errorf("staging = %q, want %q left in place", got, want)
+	}
+	incs, err := e.r.ListIncomplete(t.Context(), "", 0)
+	if err != nil || len(incs) != 1 {
+		t.Errorf("young interrupted video not left in place: %+v, %v", incs, err)
+	}
+	if e.exists(t, c.keys.Sidecar) {
+		t.Error("a young clip was recovered")
+	}
+}
+
+// testStagingWithoutSchema pins that "schema" is a constant the recoverer
+// supplies: the step-0 writer lists no schema field (Contract §7.3 step 0),
+// so its absence must not turn a recoverable clip into an orphan.
+func testStagingWithoutSchema(t *testing.T, e env) {
+	c := newClip(t, camera, hourAgo(), 15)
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(c.stagingDoc(t, camera), &doc); err != nil {
+		t.Fatal(err)
+	}
+	delete(doc, "schema")
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.p.PutSmall(t.Context(), c.keys.StagingSidecar, b, "application/json"); err != nil {
+		t.Fatalf("PutSmall: %v", err)
+	}
+	e.crashVideo(t, c, camera, false)
+	e.age(t, c.keys.Video, c.keys.StagingSidecar)
+
+	wantReport(t, e.mustRun(t, camera), recovery.Report{Recovered: 1})
+	sc, _ := e.readSidecar(t, c.keys.Sidecar)
+	if sc.Schema != sidecar.Schema || sc.Status != sidecar.StatusIncomplete {
+		t.Errorf("sidecar = %+v", sc)
+	}
 }

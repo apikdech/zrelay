@@ -300,3 +300,12 @@ call, including `DeleteObject` on the dot-named staging key.
   age (Contract §7.4).
 
 **Status:** not run
+
+## Task 27 (fix) — Startup crash recovery: age filter and step-0 format
+**Automated in this task:** `recovery.scan` now lists every incomplete (`ListIncomplete(ctx, prefix, 0)`) and applies `OlderThan` to videos and staging sidecars alike against `Config.Now`; a young interrupted video is left untouched and its staging sidecar is treated as paired. New sub-tests: `OldStagingWithYoungVideoIsUntouched`, `StagingWithoutSchemaIsRecovered` (both on `local` and MinIO), `TestDefaultOlderThan` (OlderThan 0 = 2 min), `TestRunRejectsBadConfig` (nil Provider/Recoverer, zero `Now`). `make vet test` and `make integration` pass.
+**Dependency for Task 25/26 (step-0 writer):** recovery supplies `schema` (`sidecar.Schema`) when the staging sidecar lacks it, but every other field `sidecar.Decode` and `Validate` require, including `recorder.*`, must still be in the staging sidecar. `testClip.stagingDoc` in `internal/relay/recovery/harness_test.go` is the reference shape. A staging sidecar that fails validation is counted as Orphaned.
+**Manual steps:**
+1. Against the Synology MinIO, start a clip, `kill -9` the relay after about 3 minutes of recording, and restart it within 2 minutes. Run `zrelay` startup recovery, then restart again after 2 more minutes.
+**Expected result:** the first restart changes nothing (no `Discarded`, the staging sidecar and the multipart upload are still there); the second restart recovers the clip (`Recovered: 1`) with an `incomplete` sidecar.
+**If the result differs, update:** the age comparison in `recovery.scan` (`internal/relay/recovery/recovery.go`) and Contract §7.4. If host and MinIO clocks differ, see the clock-skew note in the Task 27 entry above.
+**Status:** not run

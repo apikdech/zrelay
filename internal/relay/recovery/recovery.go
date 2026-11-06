@@ -84,6 +84,9 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	if cfg.Provider == nil || cfg.Recoverer == nil {
 		return Report{}, errors.New("recovery: Provider and Recoverer are required")
 	}
+	if cfg.Now.IsZero() {
+		return Report{}, errors.New("recovery: Now is required")
+	}
 	r := &runner{cfg: cfg, olderThan: cfg.OlderThan}
 	if r.olderThan == 0 {
 		r.olderThan = DefaultOlderThan
@@ -138,7 +141,11 @@ func (r *runner) scan(ctx context.Context, prefix string) error {
 			byVideo[s.video] = s
 		}
 	}
-	incs, err := r.cfg.Recoverer.ListIncomplete(ctx, prefix, r.olderThan)
+	// Every incomplete is listed regardless of age; the age filter is applied
+	// here against cfg.Now, the same reference as for staging sidecars. A
+	// young incomplete must still be seen, so that its staging sidecar is not
+	// mistaken for an unpaired one.
+	incs, err := r.cfg.Recoverer.ListIncomplete(ctx, prefix, 0)
 	if err != nil {
 		return fmt.Errorf("recovery: list incomplete under %q: %w", prefix, err)
 	}
@@ -151,8 +158,14 @@ func (r *runner) scan(ctx context.Context, prefix string) error {
 		if !strings.HasSuffix(inc.Key, videoExt) || !sidecar.NameRE.MatchString(path.Base(inc.Key)) {
 			continue // not a clip this relay wrote
 		}
-		if s, ok := byVideo[inc.Key]; ok {
-			paired[inc.Key] = true
+		s, hasStaging := byVideo[inc.Key]
+		if hasStaging {
+			paired[inc.Key] = true // handled, even if left alone below
+		}
+		if r.cfg.Now.Sub(inc.ModTime) < r.olderThan {
+			continue // too young: the clip may still be being written
+		}
+		if hasStaging {
 			if err := r.recoverPair(ctx, inc, s); err != nil {
 				r.fail(err)
 			}
@@ -322,6 +335,10 @@ func (r *runner) buildSidecar(ctx context.Context, s staged, hdr zrec.Header, si
 	if err != nil {
 		return nil, fmt.Errorf("recovery: read staging sidecar %q: %w", s.info.Key, err)
 	}
+	raw, err = withSchema(raw)
+	if err != nil {
+		return nil, &errMismatch{reason: err.Error()}
+	}
 	sc, err := sidecar.Decode(raw)
 	if err != nil {
 		return nil, &errMismatch{reason: err.Error()}
@@ -350,6 +367,25 @@ func (r *runner) buildSidecar(ctx context.Context, s staged, hdr zrec.Header, si
 		return nil, &errMismatch{reason: err.Error()}
 	}
 	return sc, nil
+}
+
+// withSchema fills in "schema" when the staging sidecar lacks it. Contract
+// §7.3 step 0 does not list it among the crash-lost state, and it is a
+// constant, so recovery supplies it rather than orphaning the clip.
+func withSchema(raw []byte) ([]byte, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	if s, ok := doc["schema"]; ok && string(s) != "null" {
+		return raw, nil
+	}
+	b, err := json.Marshal(sidecar.Schema)
+	if err != nil {
+		return nil, err
+	}
+	doc["schema"] = b
+	return json.Marshal(doc)
 }
 
 // errDescriptor marks a descriptor that could not be parsed.

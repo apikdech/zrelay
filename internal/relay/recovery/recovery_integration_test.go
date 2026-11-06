@@ -43,6 +43,10 @@ func TestRecoveryMinIO(t *testing.T) {
 			// 6 MiB after the header completes one 5 MiB part.
 			pad:       6 * mib,
 			olderThan: time.Millisecond,
+			// An aged staging sidecar is ~3.3 s old when the young-video
+			// scenario writes its upload; a 2 s window separates them.
+			settle:      2200 * time.Millisecond,
+			youngWindow: 2 * time.Second,
 			// The s3 writer holds no resources: dropping it leaves the
 			// multipart upload and its completed parts on the server.
 			crash: func(*testing.T, storage.ObjectWriter) {},
