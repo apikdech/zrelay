@@ -2,18 +2,21 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { IDBFactory } from 'fake-indexeddb';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { manifest, masterText } from '../../../test-support/worker-fixtures';
+import { testKeyId, testKeyText } from '../../../test-support/onboarding-keys';
 import type { Request } from '../../worker/protocol';
 import { openKeystore } from '../../worker/keystore';
 import { createWorker } from '../../worker/worker';
 import Onboarding from './Onboarding.svelte';
 
-const KEY_ID = manifest.derived.key_id_hex;
+const masterText = async () => testKeyText();
+let KEY_ID = '';
+let FP = '';
 const OTHER_ID = '0123456789abcdef';
-const FP = KEY_ID.match(/.{4}/g)!.join('-');
 const OTHER_FP = OTHER_ID.match(/.{4}/g)!.join('-');
 
-beforeEach(() => {
+beforeEach(async () => {
+  KEY_ID = await testKeyId();
+  FP = KEY_ID.match(/.{4}/g)!.join('-');
   localStorage.clear();
 });
 afterEach(() => {
@@ -125,7 +128,8 @@ describe('importing', () => {
     const form = screen.getByLabelText(/master key/i).closest('form');
     expect(form).not.toBeNull();
     expect(form!.getAttribute('action')).toBeNull();
-    await fireEvent.submit(form!);
+    // fireEvent resolves to false when a handler called preventDefault (no native navigation).
+    expect(await fireEvent.submit(form!)).toBe(false);
     await screen.findByRole('list', { name: /keyring/i });
     expect(location.href).toBe(before);
     expect(location.href).not.toContain('zk1');
@@ -143,8 +147,11 @@ describe('importing', () => {
   });
 
   it('shows the worker error without leaking the key', async () => {
-    const { client } = fakeClient();
-    client.call = async () => ({ error: 'checksum' }) as never;
+    const inner = fakeClient().client;
+    const client = {
+      call: async <T,>(msg: Request): Promise<T> =>
+        msg.type === 'key.import' ? ({ error: 'checksum' } as T) : inner.call<T>(msg),
+    };
     render(Onboarding, { client, now: () => NOW });
     await typeKey(await masterText());
     await fireEvent.click(screen.getByRole('button', { name: /import key/i }));
