@@ -38,7 +38,11 @@ func (m *countingMetrics) Unmatched(topic string) {
 	m.unmatched = append(m.unmatched, topic)
 	m.mu.Unlock()
 }
-func (m *countingMetrics) ClockSkew(s float64) { m.mu.Lock(); m.skew = append(m.skew, s); m.mu.Unlock() }
+func (m *countingMetrics) ClockSkew(s float64) {
+	m.mu.Lock()
+	m.skew = append(m.skew, s)
+	m.mu.Unlock()
+}
 
 func (m *countingMetrics) retries() int {
 	m.mu.Lock()

@@ -44,7 +44,7 @@ type RecordedRequest struct {
 	// Created is the UsernameToken Created text.
 	Created string
 	// Close reports whether the request asked to close the connection.
-	Close bool
+	Close  bool
 	Header http.Header
 	Body   string
 }
