@@ -108,28 +108,29 @@ func atLeastAUs(n int) func([]event) bool {
 	return func(evs []event) bool { return len(videos(evs)) >= n }
 }
 
-// run starts RunRTSP in the background. The returned function cancels it
-// and returns its error.
-func run(t *testing.T, url string, sink camera.SessionSink) (stop func() error, done <-chan error) {
+// run starts RunRTSP in the background. stop cancels it and returns its
+// error; done is closed when it returns, after which *errp holds the error.
+func run(t *testing.T, url string, sink camera.SessionSink) (stop func() error, done <-chan struct{}, errp *error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	errc := make(chan error, 1)
-	go func() { errc <- camera.RunRTSP(ctx, url, sink) }()
-	var once sync.Once
+	finished := make(chan struct{})
 	var err error
+	go func() {
+		defer close(finished)
+		err = camera.RunRTSP(ctx, url, sink)
+	}()
 	stop = func() error {
-		once.Do(func() {
-			cancel()
-			select {
-			case err = <-errc:
-			case <-time.After(15 * time.Second):
-				t.Errorf("RunRTSP did not return after cancel")
-			}
-		})
-		return err
+		cancel()
+		select {
+		case <-finished:
+			return err
+		case <-time.After(15 * time.Second):
+			t.Errorf("RunRTSP did not return after cancel")
+			return nil
+		}
 	}
 	t.Cleanup(func() { stop() })
-	return stop, errc
+	return stop, finished, &err
 }
 
 func checkDTSStrictlyIncreasing(t *testing.T, aus []*camera.AccessUnit) {
@@ -146,7 +147,7 @@ func TestRunRTSPDeliversAccessUnits(t *testing.T) {
 	aus := testutil.LoadAnnexB(t, h264Fixture)
 	srv := testutil.StartRTSPServer(t, testutil.RTSPServerOpts{Codec: "h264", AUs: aus, FPS: 15})
 	sink := newRecSink()
-	stop, _ := run(t, srv.URL(), sink)
+	stop, _, _ := run(t, srv.URL(), sink)
 
 	evs := sink.waitFor(t, 20*time.Second, "140 access units", atLeastAUs(140))
 	if err := stop(); !errors.Is(err, context.Canceled) {
@@ -380,13 +381,13 @@ func TestRunRTSPReturnsOnSessionLoss(t *testing.T) {
 	aus := testutil.LoadAnnexB(t, h264Fixture)
 	srv := testutil.StartRTSPServer(t, testutil.RTSPServerOpts{Codec: "h264", AUs: aus, FPS: 15, Loop: true})
 	sink := newRecSink()
-	_, done := run(t, srv.URL(), sink)
+	_, done, errp := run(t, srv.URL(), sink)
 	sink.waitFor(t, 10*time.Second, "first AU", atLeastAUs(1))
 	srv.Disconnect()
 	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("RunRTSP returned nil after session loss")
+	case <-done:
+		if err := *errp; err == nil || errors.Is(err, context.Canceled) {
+			t.Fatalf("RunRTSP after session loss = %v, want a session error", err)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("RunRTSP did not return after session loss")

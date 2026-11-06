@@ -6,6 +6,7 @@ tool honnef.co/go/tools/cmd/staticcheck
 
 require (
 	github.com/bluenviron/gortsplib/v5 v5.6.7
+	github.com/bluenviron/mediacommon/v2 v2.9.6
 	github.com/oklog/ulid/v2 v2.1.2
 	github.com/pion/rtcp v1.2.20
 	github.com/pion/rtp v1.10.6
@@ -13,7 +14,6 @@ require (
 
 require (
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c // indirect
-	github.com/bluenviron/mediacommon/v2 v2.9.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/pion/logging v0.2.4 // indirect
