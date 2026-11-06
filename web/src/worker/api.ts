@@ -31,19 +31,25 @@ export class NoKeyError extends Error {
 
 export type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
+/** An `AuthFetch` whose pinned-token memory can be dropped (on Lock and Forget). */
+export type ResettableAuthFetch = AuthFetch & { reset(): void };
+
 const MAX_JSON_BYTES = 16 << 20;
 const MAX_ERROR_BYTES = 4096;
 
 /**
  * Wraps fetch with `Authorization: Bearer`. With several keys it tries the
- * newest token first and falls back to older ones on 401 (rotation can leave
- * the server accepting only an older key's token). The token that last got a
- * non-401 answer is tried first from then on, so one unrelated key imported
- * last does not draw a 401 on every request (ui-spec §3.2 rate-limits 401s).
+ * newest token first and falls back to older ones on 401 or 429 (rotation can
+ * leave the server accepting only an older key's token, and while the 401 rate
+ * limit holds the server answers 429 whichever token is sent). The token that
+ * last got an answer other than 401 or 429 is tried first from then on, so one
+ * unrelated key imported last does not draw a 401 on every request (ui-spec
+ * §3.2 rate-limits 401s). `reset()` forgets that token: it is derived key
+ * material, so Lock and Forget must not leave it in memory.
  */
-export function makeAuthFetch(fetchFn: typeof fetch, tokens: () => Promise<string[]>): AuthFetch {
+export function makeAuthFetch(fetchFn: typeof fetch, tokens: () => Promise<string[]>): ResettableAuthFetch {
   let working: string | undefined;
-  return async (url, init = {}) => {
+  const authFetch: AuthFetch = async (url, init = {}) => {
     const list = await tokens();
     if (list.length === 0) throw new NoKeyError();
     // `tokens()` is already newest first.
@@ -60,7 +66,7 @@ export function makeAuthFetch(fetchFn: typeof fetch, tokens: () => Promise<strin
         redirect: 'error',
         referrerPolicy: 'no-referrer',
       });
-      if (res.status !== 401) {
+      if (res.status !== 401 && res.status !== 429) {
         working = token;
         return res;
       }
@@ -68,6 +74,11 @@ export function makeAuthFetch(fetchFn: typeof fetch, tokens: () => Promise<strin
     }
     return res!;
   };
+  return Object.assign(authFetch, {
+    reset() {
+      working = undefined;
+    },
+  });
 }
 
 /**

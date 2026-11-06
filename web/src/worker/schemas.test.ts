@@ -151,6 +151,23 @@ describe('list, cameras, status, coverage', () => {
       }).relay_id,
     ).toBe('home-mini');
     expect(() => parseStatus({ schema: 'zrec.status/2' })).toThrow(SchemaError);
+  });
+
+  it('accepts the status zview serves before any day is indexed (index_fresh_at: null)', () => {
+    const base = {
+      schema: 'zrec.status/1',
+      relay_id: 'home-mini',
+      version: '2.0.0',
+      updated_at: '2026-09-16T15:00:00Z',
+      key_id: 'a1b2c3d4e5f60718',
+      cameras: [],
+    };
+    const pre = parseStatus({ ...base, indexed_days: 0, invalid_sidecars: 0, index_fresh_at: null });
+    expect(pre.index_fresh_at ?? null).toBeNull();
+    expect(parseStatus({ ...base, index_fresh_at: '2026-09-16T15:00:00Z' }).index_fresh_at).toBe('2026-09-16T15:00:00Z');
+  });
+
+  it('validates coverage shapes', () => {
     expect(parseCoverage({ ready: [['2026-09-16T14:00:00Z', '2026-09-16T15:00:00Z']], dropped: [] }).ready).toHaveLength(1);
     expect(() => parseCoverage({ ready: 'nope', dropped: [] })).toThrow(SchemaError);
   });

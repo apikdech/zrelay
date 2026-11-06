@@ -215,7 +215,7 @@ const status = v.object({
   ),
   indexed_days: v.optional(nat),
   invalid_sidecars: v.optional(nat),
-  index_fresh_at: v.optional(capped),
+  index_fresh_at: v.nullish(capped),
 });
 export type Status = v.InferOutput<typeof status>;
 export const parseStatus = (input: unknown): Status => run(status, input, 'status');
