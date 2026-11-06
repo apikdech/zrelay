@@ -19,6 +19,7 @@ type FaultProxy struct {
 	killAfter int64 // bytes left before the cut; < 0 when disarmed
 	blackhole bool
 	conns     map[*proxyConn]struct{}
+	closed    bool // close has run; new connections are refused
 	wg        sync.WaitGroup
 }
 
@@ -97,13 +98,27 @@ func (p *FaultProxy) accept() {
 			continue
 		}
 		c := &proxyConn{client: client, server: server}
-		p.mu.Lock()
-		p.conns[c] = struct{}{}
-		p.mu.Unlock()
-		p.wg.Add(2)
+		if !p.track(c) {
+			continue
+		}
 		go p.pump(c, client, server, true)
 		go p.pump(c, server, client, false)
 	}
+}
+
+// track registers c and reserves its two pumps in p.wg. Once close has run it
+// closes c instead and returns false: close has already walked p.conns, so a
+// connection registered afterwards would never be closed.
+func (p *FaultProxy) track(c *proxyConn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		c.close()
+		return false
+	}
+	p.conns[c] = struct{}{}
+	p.wg.Add(2)
+	return true
 }
 
 // pump copies src to dst. Upstream-bound bytes are charged against the kill
@@ -175,6 +190,7 @@ func (p *FaultProxy) done(c *proxyConn, full bool) {
 func (p *FaultProxy) close() {
 	_ = p.ln.Close()
 	p.mu.Lock()
+	p.closed = true
 	for c := range p.conns {
 		c.close()
 		delete(p.conns, c)

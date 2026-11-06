@@ -23,14 +23,18 @@ var errNoSuchBucket = errors.New("s3: NoSuchBucket")
 //   - Transient: network and transport errors, deadlines and cancellation,
 //     5xx, 429, RequestTimeout and SlowDown.
 //   - Permanent: 403, NoSuchBucket, InvalidAccessKeyId, SignatureDoesNotMatch,
-//     any other 4xx, invalid keys and driver misuse (a closed writer).
+//     any other 4xx, invalid keys, driver misuse (a closed writer, Write after
+//     CompleteMultipartUpload was sent), an upload that is gone without its
+//     object, and an Abort that found the object already published.
 //   - NotFound: NoSuchKey, any other 404 (including NoSuchUpload) and
 //     storage.ErrNotFound.
 func Classify(err error) storage.ErrorClass {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
 		return storage.NotFound
-	case errors.Is(err, storage.ErrInvalidKey), errors.Is(err, errNoSuchBucket):
+	case errors.Is(err, storage.ErrInvalidKey), errors.Is(err, errNoSuchBucket),
+		errors.Is(err, errUnpublished), errors.Is(err, errAbortCommitted),
+		errors.Is(err, errCompleting):
 		return storage.Permanent
 	}
 

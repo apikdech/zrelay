@@ -35,6 +35,11 @@ type fakeS3 struct {
 	// response is lost: the upload completes, then the connection is cut
 	// before any response byte is written.
 	dropComplete int
+	// failHead is the number of HeadObject requests answered with
+	// headStatus/headCode before HEAD works again.
+	failHead   int
+	headStatus int
+	headCode   string
 }
 
 type fakeUpload struct {
@@ -79,6 +84,12 @@ func (f *fakeS3) dropCompleteResponses(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dropComplete = n
+}
+
+func (f *fakeS3) failHeadObject(n, status int, code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failHead, f.headStatus, f.headCode = n, status, code
 }
 
 func (f *fakeS3) failWith(status int, code string) {
@@ -137,6 +148,12 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if f.failStatus != 0 {
 		writeS3Error(w, r, f.failStatus, f.failCode)
+		return
+	}
+
+	if op == "object" && r.Method == http.MethodHead && f.failHead > 0 {
+		f.failHead--
+		writeS3Error(w, r, f.headStatus, f.headCode)
 		return
 	}
 

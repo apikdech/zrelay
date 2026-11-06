@@ -2,7 +2,9 @@ package storagetest
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -99,5 +101,34 @@ func TestFaultProxyBlackhole(t *testing.T) {
 	}
 	if got != "10" {
 		t.Fatalf("upstream read %s bytes, want 10", got)
+	}
+}
+
+// A connection accepted while close is running must not outlive it: close
+// has already walked the connection set, so registering it would leave it
+// open and keep the pumps (and close's wg.Wait) alive.
+func TestFaultProxyTrackAfterCloseClosesConn(t *testing.T) {
+	srv, _ := countingServer(t)
+	p := StartFaultProxy(t, srv.URL)
+	p.close()
+
+	client, clientPeer := net.Pipe()
+	server, serverPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer serverPeer.Close()
+	if p.track(&proxyConn{client: client, server: server}) {
+		t.Fatal("track after close = true, want false")
+	}
+	for name, peer := range map[string]net.Conn{"client": clientPeer, "server": serverPeer} {
+		_ = peer.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Errorf("%s side after track-after-close: Read error = %v, want EOF (closed)", name, err)
+		}
+	}
+	p.mu.Lock()
+	n := len(p.conns)
+	p.mu.Unlock()
+	if n != 0 {
+		t.Errorf("connections registered after close = %d, want 0", n)
 	}
 }

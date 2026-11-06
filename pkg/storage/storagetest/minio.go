@@ -15,9 +15,13 @@ import (
 )
 
 // MinIOImage is the pinned MinIO server image for integration tests. The
-// upstream minio/minio repository is no longer published on Docker Hub, so
-// this is the pgsty community build of the same server.
-const MinIOImage = "pgsty/minio:RELEASE.2026-08-04T00-00-00Z"
+// upstream minio/minio repository is no longer published on Docker Hub (and
+// quay.io/minio/minio has no manifest for the last release tag), so this is
+// the pgsty community build of the same server. It is a deviation from the
+// plan's minio/minio:RELEASE.* pin, pending orchestrator approval. The tag is
+// pinned to its multi-arch index digest to limit the third-party supply-chain
+// risk.
+const MinIOImage = "pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372"
 
 // MinIOBucket is the bucket StartMinIO creates.
 const MinIOBucket = "zrelay-test"

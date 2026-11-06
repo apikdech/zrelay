@@ -3,6 +3,7 @@ package s3_test
 import (
 	"bytes"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -126,8 +127,12 @@ func TestCommitRetryAfterLostResponse(t *testing.T) {
 			t.Fatal("Commit with a lost response error = nil, want an error")
 		}
 		f.del("cctv/" + key)
-		if err := w.Commit(ctx); err == nil {
+		err = w.Commit(ctx)
+		if err == nil {
 			t.Fatal("retried Commit with NoSuchUpload and no object error = nil, want error")
+		}
+		if c := s3.Classify(err); c != storage.Permanent {
+			t.Errorf("Classify(upload gone, object missing) = %d, want Permanent", c)
 		}
 	})
 
@@ -147,8 +152,111 @@ func TestCommitRetryAfterLostResponse(t *testing.T) {
 			t.Fatal("Commit with a lost response error = nil, want an error")
 		}
 		f.set("cctv/"+key, data[:10])
-		if err := w.Commit(ctx); err == nil {
+		err = w.Commit(ctx)
+		if err == nil {
 			t.Fatal("retried Commit with NoSuchUpload and a short object error = nil, want error")
+		}
+		if c := s3.Classify(err); c != storage.Permanent {
+			t.Errorf("Classify(upload gone, wrong size) = %d, want Permanent", c)
+		}
+	})
+
+	// lostCommit writes data and runs one Commit whose
+	// CompleteMultipartUpload succeeds upstream but loses its response.
+	lostCommit := func(t *testing.T, f *fakeS3, d *s3.Driver) storage.ObjectWriter {
+		t.Helper()
+		f.dropCompleteResponses(1)
+		w, err := d.Create(t.Context(), key)
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if _, err := w.Write(data); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if err := w.Commit(t.Context()); err == nil {
+			t.Fatal("Commit with a lost response error = nil, want an error")
+		}
+		return w
+	}
+
+	t.Run("HeadUnavailableIsTransient", func(t *testing.T) {
+		f := newFakeS3(t)
+		d := stubDriver(t, f.URL, "cctv")
+		w := lostCommit(t, f, d)
+		f.failHeadObject(1, http.StatusServiceUnavailable, "ServiceUnavailable")
+		err := w.Commit(t.Context())
+		if err == nil {
+			t.Fatal("retried Commit with HEAD 503 error = nil, want error")
+		}
+		if c := s3.Classify(err); c != storage.Transient {
+			t.Errorf("Classify(upload gone, HEAD 503) = %d, want Transient: %v", c, err)
+		}
+	})
+
+	t.Run("HeadRecoversThenCommitted", func(t *testing.T) {
+		f := newFakeS3(t)
+		d := stubDriver(t, f.URL, "cctv")
+		w := lostCommit(t, f, d)
+		f.failHeadObject(1, http.StatusServiceUnavailable, "ServiceUnavailable")
+		if err := w.Commit(t.Context()); err == nil {
+			t.Fatal("retried Commit with HEAD 503 error = nil, want error")
+		}
+		if err := w.Commit(t.Context()); err != nil {
+			t.Fatalf("Commit after HEAD recovered error = %v, want nil", err)
+		}
+		if n := f.callsOf("HEAD object"); n != 2 {
+			t.Errorf("HeadObject calls = %d, want 2", n)
+		}
+		if !bytes.Equal(f.get("cctv/"+key), data) {
+			t.Error("committed object content differs")
+		}
+	})
+
+	t.Run("WriteRefusedOnceCompleteStarted", func(t *testing.T) {
+		f := newFakeS3(t)
+		d := stubDriver(t, f.URL, "cctv")
+		w := lostCommit(t, f, d)
+		parts := f.callsOf("PUT part")
+		if _, err := w.Write(bytes.Repeat([]byte("x"), 5*mib)); err == nil {
+			t.Error("Write after CompleteMultipartUpload started error = nil, want error")
+		} else if c := s3.Classify(err); c != storage.Permanent {
+			t.Errorf("Classify(Write after Complete started) = %d, want Permanent", c)
+		}
+		off, err := w.Resume(t.Context())
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		if off != int64(len(data)) {
+			t.Errorf("Resume = %d, want %d", off, len(data))
+		}
+		if _, err := w.Write([]byte("x")); err == nil {
+			t.Error("Write after Resume past a started Complete error = nil, want error")
+		}
+		if n := f.callsOf("PUT part"); n != parts {
+			t.Errorf("UploadPart calls after Complete started = %d, want 0", n-parts)
+		}
+		if err := w.Commit(t.Context()); err != nil {
+			t.Fatalf("retried Commit: %v", err)
+		}
+		if !bytes.Equal(f.get("cctv/"+key), data) {
+			t.Error("committed object content differs")
+		}
+	})
+
+	t.Run("AbortAfterLostResponseReportsCommitted", func(t *testing.T) {
+		f := newFakeS3(t)
+		d := stubDriver(t, f.URL, "cctv")
+		w := lostCommit(t, f, d)
+		if err := w.Abort(t.Context()); err == nil {
+			t.Error("Abort of an upload that was already completed error = nil, want error")
+		} else if c := s3.Classify(err); c != storage.Permanent {
+			t.Errorf("Classify(Abort of a published object) = %d, want Permanent", c)
+		}
+		if n := f.callsOf("HEAD object"); n != 1 {
+			t.Errorf("HeadObject calls = %d, want 1", n)
+		}
+		if !bytes.Equal(f.get("cctv/"+key), data) {
+			t.Error("object published by the lost Complete was changed")
 		}
 	})
 }
