@@ -82,7 +82,16 @@ test.beforeAll(async () => {
   mkdirSync(store);
   cpSync(join(clipsDir, 'complete'), store, { recursive: true });
 
-  await build({ configFile: webRoot + 'vite.config.ts', root: webRoot, logLevel: 'warn', build: { outDir: app, emptyOutDir: true } });
+  // A dev server started earlier in this worker (other specs) leaves NODE_ENV=development behind, which
+  // would make this a development build without the service worker: build as production, then restore.
+  const nodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    await build({ configFile: webRoot + 'vite.config.ts', root: webRoot, mode: 'production', logLevel: 'warn', build: { outDir: app, emptyOutDir: true } });
+  } finally {
+    if (nodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = nodeEnv;
+  }
   goBuild(join(dir, 'livefixture'), './internal/testutil/cmd/livefixture');
   goBuild(join(dir, 'zview-server'), './cmd/zview-server');
 
@@ -335,7 +344,6 @@ test('after playback Cache Storage holds the hashed shell and no data', async ({
   await playFirstClip(page);
 
   // The worker registers once the page has loaded and takes control on activation.
-  await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
   await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null), { timeout: 30_000 }).toBe(true);
 
   const stored = await page.evaluate(async () => {
