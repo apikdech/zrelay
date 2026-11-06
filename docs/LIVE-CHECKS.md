@@ -789,3 +789,13 @@ This section supersedes the chaos results of "Task 29" (270.0 MiB peak, "breaker
 **Expected result:** zero CSP violations in the console in normal use; manifest installable; service worker activates without errors; Lighthouse best-practices has no failing CSP or HTTPS audit; the onboarding guide matches what the phones show. Record the Lighthouse scores here.
 **If the result differs, update:** a CSP violation means a directive in `contentSecurityPolicy` in `internal/zview/app.go` plus `csp_test.go` (`wantCSP`) and `app_test.go`, and ui-spec §2.4; prefer fixing the SPA over widening the policy. An installability failure: `web/static/manifest.webmanifest`, `web/scripts/gen-icons.py`, `web/index.html`. Wrong onboarding wording: `docs/family-onboarding.md` and the labels in `web/src/routes/onboarding/Onboarding.svelte`.
 **Status:** not run
+
+## Task 38 fix — App-level idle auto-lock
+**Automated in this task:** the idle lock is now shared and held by `App.svelte` for the page's lifetime (`web/src/routes/onboarding/idleService.ts`), so the saved `zview.idleLockMinutes` applies on Timeline, Live and Demo as well as Key; the Key page only changes the setting and mirrors a lock that happens while it is open. Tests first (red, then green): `App.test.ts` ("App-level idle auto-lock", hides the document on `#/timeline`, `#/live` and `#/demo` and expects `key.lock`) and `routes/onboarding/idleService.test.ts`. Not exercised: real mobile browsers freezing background timers or locking the phone.
+**Manual steps:**
+1. On a real phone, open the app, go to Key, import the key and set Auto-lock to 1 minute. Go to Timeline and play a clip, then lock the phone (or switch to another app) for over a minute.
+2. Return to the app: playback of new clips must fail until the key is pasted again, and Key shows "Locked: session keys were discarded."
+3. Repeat from the Live tab, and on an iPhone in the home-screen app.
+**Expected result:** the worker discards its derived keys after the set time with the app hidden, whichever view was open; coming back before the time cancels the lock.
+**If the result differs, update:** `createIdleLock` in `web/src/routes/onboarding/idleLock.ts` (browser visibility or timer behaviour) and `idleService.ts`, with their tests.
+**Status:** not run
