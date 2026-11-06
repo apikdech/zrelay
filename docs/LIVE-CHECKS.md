@@ -139,5 +139,44 @@ other host while 8554 connects.
   `deploy/compose.yaml` and the runbook.
 - `tailscale` not on `PATH` on macOS: `deploy/deploy.sh` (use
   `/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4`).
+## Task 8 — ONVIF events — rules, tracker, PullPoint client
+
+**Automated in this task:** the Tapo rules, the trigger tracker and the PullPoint client run
+against `testutil.StartFakeONVIF` (an in-process camera on ephemeral 127.0.0.1 ports) with the
+fake clock: `TestTapoRules`, `TestInitializedActiveSetsStateWithoutNewChange`,
+`TestPullTransportErrorRetriesSameSubscription` (5 dropped pulls, 5 `PullRetry`, one
+subscription), `TestRenewEvery60s`, `TestFailedRenewResubscribesAfterUnsubscribe`,
+`TestResubscribeBackoff` (5, 10, 20, 40, 60, 60 s), `TestNon200PullIsFailure`,
+`TestSubscriptionAddressHostRewritten`, `TestRedirectRefused`, `TestDigestUsesCameraClockOffset`,
+`TestClockResyncEvery30Minutes`, `TestConnectionCloseHeader`,
+`TestReadyFalseAndKindsResetWhenSubscriptionEnds`, `TestUnmatchedTopicCounted` and
+`TestResponseCappedAt1MiB` pass with `-race`. The fake mimics Tapo's dropped `PullMessages`
+connections, but none of this ran against a real camera.
+`TestLivePullPoint` is skipped unless `ZRELAY_LIVE_ONVIF_HOST` is set.
+
+**Manual steps:**
+1. On a host on the camera's network, from the repository root:
+   `export ZRELAY_LIVE_ONVIF_HOST=<tapo-ip> ZRELAY_LIVE_ONVIF_USER=<camera-account>` and
+   `read -s ZRELAY_LIVE_ONVIF_PASSWORD; export ZRELAY_LIVE_ONVIF_PASSWORD`.
+2. Run: `ZRELAY_LIVE_ONVIF_SECONDS=150 go test -race -count=1 -run TestLivePullPoint -v ./internal/relay/events/`
+3. During the 150 s, walk in front of the C220 (person), then stay out of view; if you can,
+   drive a car or pet through the scene, and trigger a Tapo smart event such as baby cry.
+4. Read the `signal`, `ready`, `pull retries`, `clock skew` and `unmatched` log lines.
+5. `unset ZRELAY_LIVE_ONVIF_HOST ZRELAY_LIVE_ONVIF_USER ZRELAY_LIVE_ONVIF_PASSWORD`.
+
+**Expected result:** `ready=true` once and `ready=false` only at shutdown (Renew every 60 s kept
+one subscription alive for 150 s, so the C220 supports Renew); `signal kind=motion active=true`
+then `active=false` when the scene settles; `kind=person` for the walk-through; a non-zero
+`pull retries` count (Tapo drops idle pulls) with no resubscribe; `clock skew` small; `unmatched`
+lists only topics the Tapo rules do not cover.
+
+**If the result differs, update:**
+- `ready=false` before shutdown, or a failed Renew: `renewEvery` and `renewBody` in
+  `internal/relay/events/onvif.go`, and design §4.3 / relay-spec §4.4 (Renew-as-health).
+- Wrong or missing kinds, or `IsVehicle` / the catch-all not seen: `TapoRules()` in
+  `internal/relay/events/rules.go`, `TestTapoRules`, and the design §4.3 built-in table.
+- Authentication failures: `buildEnvelope` in `internal/relay/events/soap.go` and
+  `TestDigestUsesCameraClockOffset`.
+- Unexpected topics in `unmatched`: add rules via `TapoRules()` and the table in design §4.3.
 
 **Status:** not run
