@@ -11,6 +11,10 @@ storage:
   root: "zrelay"
   local:
     base_dir: "/x/archive"
+live:
+  max_viewers: 0
+restream:
+  listen: ""
 cameras:
   - id: "Front"
     brand: "tapo"

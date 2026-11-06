@@ -22,6 +22,8 @@ storage:
     max_delay: "5m"
 live:
   max_viewers: 0
+restream:
+  listen: ""
 cameras:
   - id: "cam-1"
     brand: "tapo"
