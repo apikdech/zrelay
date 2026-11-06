@@ -13,6 +13,12 @@ if [ -z "$TAILSCALE_IP" ]; then
 fi
 export TAILSCALE_IP
 
+# Relay build version, stamped into sidecars and the status object.
+if [ -z "${ZRELAY_VERSION:-}" ]; then
+	ZRELAY_VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+fi
+export ZRELAY_VERSION
+
 # Both services need their config and secrets before they can start.
 for f in .env zrelay.yaml zview.yaml secrets/zrelay_master secrets/s3_secret_key \
 	secrets/api_token_sha256 secrets/s3_ro_secret_key; do
