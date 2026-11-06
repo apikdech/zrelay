@@ -34,6 +34,7 @@ func RunRecoverer(
 		{"PrefixByWholeElement", testIncompletePrefixByWholeElement},
 		{"NothingToRecover", testNothingToRecover},
 		{"StagingSidecarNotListed", testStagingSidecarNotListed},
+		{"ListStagingReturnsDotNamedSidecars", testListStaging},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -212,5 +213,65 @@ func testStagingSidecarNotListed(t *testing.T, p storage.Provider, r storage.Rec
 	}
 	if got := readAll(t, p, staging); string(got) != `{"clip_id":"01JC0000000000000000000009"}` {
 		t.Errorf("staging sidecar changed: %q", got)
+	}
+}
+
+// testListStaging pins ListStaging (Contract §7.3 step 0): it returns exactly
+// the dot-named staging sidecars ".<name>.json.part" under a prefix, by whole
+// path element, which List hides. Final objects, other dot-names and crashed
+// video streams are not staging sidecars.
+func testListStaging(t *testing.T, p storage.Provider, r storage.Recoverer, crash func(*testing.T, storage.ObjectWriter)) {
+	const (
+		mine      = "clips/front/2026/11/06/.120000000_01JC000000000000000000000B.json.part"
+		mineOther = "clips/front/2026/11/05/.130000000_01JC000000000000000000000C.json.part"
+		other     = "clips/front-door/2026/11/06/.120000000_01JC000000000000000000000A.json.part"
+	)
+	body := []byte(`{"clip_id":"x"}`)
+	put(t, p, mine, body)
+	put(t, p, mineOther, body)
+	put(t, p, other, body)
+	put(t, p, "clips/front/2026/11/06/120000000_01JC000000000000000000000B.json", []byte(`{}`))
+	put(t, p, "clips/front/2026/11/06/.stray.tmp", []byte(`{}`))
+	crashedWrite(t, p, "clips/front/2026/11/06/121212000_01JC000000000000000000000D.zrec", pattern(1000, 12), crash)
+
+	keys := func(prefix string) []string {
+		t.Helper()
+		infos, err := r.ListStaging(t.Context(), prefix)
+		if err != nil {
+			t.Fatalf("ListStaging(%q): %v", prefix, err)
+		}
+		var ks []string
+		for _, in := range infos {
+			if in.Size != int64(len(body)) {
+				t.Errorf("ListStaging(%q) %q Size = %d, want %d", prefix, in.Key, in.Size, len(body))
+			}
+			if in.ModTime.IsZero() || in.ModTime.Location() != time.UTC {
+				t.Errorf("ListStaging(%q) %q ModTime = %v, want non-zero UTC", prefix, in.Key, in.ModTime)
+			}
+			ks = append(ks, in.Key)
+		}
+		slices.Sort(ks)
+		return ks
+	}
+	if got, want := keys("clips/front"), []string{mineOther, mine}; !slices.Equal(got, want) {
+		t.Errorf("ListStaging(clips/front) = %q, want %q", got, want)
+	}
+	if got, want := keys("clips/front/2026/11/06"), []string{mine}; !slices.Equal(got, want) {
+		t.Errorf("ListStaging(day) = %q, want %q", got, want)
+	}
+	if got, want := keys(""), []string{other, mineOther, mine}; !slices.Equal(got, want) {
+		t.Errorf("ListStaging(\"\") = %q, want %q", got, want)
+	}
+	if got := keys("clips/missing"); len(got) != 0 {
+		t.Errorf("ListStaging(clips/missing) = %q, want none", got)
+	}
+	if _, err := r.ListStaging(t.Context(), "../x"); !errors.Is(err, storage.ErrInvalidKey) {
+		t.Errorf("ListStaging(../x) error = %v, want ErrInvalidKey", err)
+	}
+	// List still hides them (Contract §7.2).
+	for _, k := range listKeys(t, p, "clips/front") {
+		if k == mine || k == mineOther {
+			t.Errorf("List returned staging sidecar %q", k)
+		}
 	}
 }

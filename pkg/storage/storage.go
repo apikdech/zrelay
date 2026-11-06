@@ -117,6 +117,13 @@ type Incomplete struct {
 type Recoverer interface { // optional; used at startup (Contract §7.4)
 	ListIncomplete(ctx context.Context, prefix string, olderThan time.Duration) ([]Incomplete, error)
 	RecoverCommit(ctx context.Context, inc Incomplete) (ObjectInfo, error)
+
+	// ListStaging returns the staging sidecars ".<name>.json.part" (Contract
+	// §7.3 step 0) under prefix, which List hides because they are dot-names.
+	// Prefix matching is by whole path element, as List; an empty prefix lists
+	// everything and a malformed one yields ErrInvalidKey. Keys are full object
+	// keys including the dot-name. Order is unspecified.
+	ListStaging(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
 
 // ReadProvider is what zview-server binds to, so a data-mode deployment

@@ -101,12 +101,14 @@ func (d *Driver) ListIncomplete(ctx context.Context, prefix string, olderThan ti
 		return nil
 	}
 
-	finals, err := d.stagedFinalKeys(ctx, prefix, full)
+	staged, err := d.ListStaging(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-	for _, fk := range finals {
-		if err := d.eachUpload(ctx, prefix, fk, consider); err != nil {
+	for _, s := range staged {
+		dir, name := path.Split(s.Key)
+		base := strings.TrimSuffix(name, stagingSuffix)[1:] // ".<base>.json.part"
+		if err := d.eachUpload(ctx, prefix, d.objectKey(dir+base+finalSuffix), consider); err != nil {
 			return nil, err
 		}
 	}
@@ -116,15 +118,23 @@ func (d *Driver) ListIncomplete(ctx context.Context, prefix string, olderThan ti
 	return out, nil
 }
 
-// stagedFinalKeys returns the full object keys (root included) of the videos
-// whose staging sidecars ".<base>.json.part" exist under prefix. The public
-// List omits dot-names, so this lists the bucket directly.
-func (d *Driver) stagedFinalKeys(ctx context.Context, prefix, full string) ([]string, error) {
+// ListStaging implements storage.Recoverer: the staging sidecars
+// ".<name>.json.part" (Contract §7.3 step 0) under prefix, by whole path
+// element. The public List omits dot-names, so this lists the bucket directly
+// with ListObjectsV2 and keeps the objects whose base name begins with "."
+// and ends in ".json.part". Keys are relative to the root.
+func (d *Driver) ListStaging(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	if prefix != "" {
+		if _, err := storage.CleanKey(prefix); err != nil {
+			return nil, err
+		}
+	}
+	full := d.objectKey(prefix) // root/prefix, root alone, or ""
 	byPrefix := full
 	if prefix == "" && d.root != "" {
 		byPrefix = d.root + "/"
 	}
-	var out []string
+	var out []storage.ObjectInfo
 	pages := awss3.NewListObjectsV2Paginator(d.client, &awss3.ListObjectsV2Input{
 		Bucket: aws.String(d.bucket),
 		Prefix: aws.String(byPrefix),
@@ -139,12 +149,22 @@ func (d *Driver) stagedFinalKeys(ctx context.Context, prefix, full string) ([]st
 			if prefix != "" && k != full && !strings.HasPrefix(k, full+"/") {
 				continue
 			}
-			dir, name := path.Split(k)
-			base, ok := strings.CutSuffix(name, stagingSuffix)
+			if d.root != "" {
+				if !strings.HasPrefix(k, d.root+"/") {
+					continue
+				}
+				k = strings.TrimPrefix(k, d.root+"/")
+			}
+			base, ok := strings.CutSuffix(path.Base(k), stagingSuffix)
 			if !ok || !strings.HasPrefix(base, ".") || len(base) < 2 {
 				continue
 			}
-			out = append(out, dir+base[1:]+finalSuffix)
+			out = append(out, storage.ObjectInfo{
+				Key:     k,
+				Size:    aws.ToInt64(o.Size),
+				ModTime: aws.ToTime(o.LastModified).UTC(),
+				ETag:    aws.ToString(o.ETag),
+			})
 		}
 	}
 	return out, nil

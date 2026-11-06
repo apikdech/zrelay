@@ -452,3 +452,56 @@ seconds, see `writeAudio` (the track appears when the first audio packet arrives
 the stream and drops early clients) and `TestRestreamAudioTrackWhenPresent`. Design §5.2.
 
 **Status:** not run
+## Task 27 — Startup crash recovery
+
+**Automated in this task:** `internal/relay/recovery` runs every row of Contract §7.4's two tables
+(both present, upload without staging, staging with committed video and no sidecar, staging with a
+real sidecar, staging alone, descriptor mismatch, empty/unreadable descriptor, younger than the age
+threshold, scope of days and cameras, idempotent second run) against the `local` driver and, under
+`-tags integration`, against a throwaway MinIO container. `storage.Recoverer.ListStaging` is covered
+by a new `storagetest.RunRecoverer` case for both drivers and by a fake-S3 unit test. Not covered
+automatically: the Synology MinIO build, the relay's real S3 policy (design §6.5) and a real
+`kill -9` of `zrelay` mid-clip (recording is wired in later tasks).
+
+**Manual steps:**
+1. On the Mac mini with the relay running against the Synology MinIO, start a clip (trigger motion on
+   the Tapo C220) and wait until the log shows the clip's staging sidecar was written and at least one
+   8 MiB part uploaded (more than ~10 s of footage at the configured bitrate).
+2. `docker kill -s KILL zrelay` (SIGKILL; no shutdown path runs).
+3. With the relay credentials, list the leftovers:
+   `AWS_ACCESS_KEY_ID=<relay-key> AWS_SECRET_ACCESS_KEY=<relay-secret> aws --endpoint-url http://<nas>:9000 s3api list-multipart-uploads --bucket <bucket> --prefix <root>/clips/<cam>/`
+   and `aws ... s3 ls s3://<bucket>/<root>/clips/<cam>/<YYYY>/<MM>/<DD>/` (the dot-named
+   `.<HHMMSSmmm>_<ULID>.json.part` must be listed; no `.json` yet).
+4. Wait more than 2 minutes, then `docker start zrelay` and wait for the recovery log line.
+5. Repeat step 3 and fetch the new sidecar:
+   `aws ... s3 cp s3://<bucket>/<root>/clips/<cam>/<YYYY>/<MM>/<DD>/<HHMMSSmmm>_<ULID>.json -`
+6. Open the clip in zview and play it.
+
+**Expected result:** after step 4 there is no multipart upload and no `.json.part` left for the clip;
+the `.zrec` exists with the size of the uploaded parts; the `.json` sidecar has `"status":"incomplete"`,
+`"end_reason":"recovered"`, `end_time`, `duration_ms`, `video.plaintext_size_bytes` and
+`video.seek_index` all `null`, `"triggers":[]`, and `video.size_bytes` equal to the object size. zview
+lists the clip as incomplete and plays up to the truncation point. The relay's S3 policy allowed every
+call, including `DeleteObject` on the dot-named staging key.
+
+**If the result differs, update:**
+- `AccessDenied` on deleting the staging sidecar or listing multipart uploads: the relay policy in the
+  runbook and design §6.5 (`s3:DeleteObject` on `<root>/clips/*/.*`, `s3:ListBucketMultipartUploads`).
+- The upload is not found after a restart (MinIO cache behaviour): `ListIncomplete`
+  (`pkg/storage/s3/recover.go`) and Task 19's live check.
+- The staging sidecar lacks `schema` or `recorder.time_source`, so recovery counts the clip as orphaned:
+  the step-0 writer (Task 25/26) or the staging requirements in `buildSidecar`
+  (`internal/relay/recovery/recovery.go`) and Contract §7.3 step 0.
+- Server timestamps far from the host clock: the staging age check in `recovery.scan` and the 2-minute
+  age (Contract §7.4).
+
+**Status:** not run
+
+## Task 27 (fix) — Startup crash recovery: age filter and step-0 format
+**Automated in this task:** `recovery.scan` now lists every incomplete (`ListIncomplete(ctx, prefix, 0)`) and applies `OlderThan` to videos and staging sidecars alike against `Config.Now`; a young interrupted video is left untouched and its staging sidecar is treated as paired. New sub-tests: `OldStagingWithYoungVideoIsUntouched`, `StagingWithoutSchemaIsRecovered` (both on `local` and MinIO), `TestDefaultOlderThan` (OlderThan 0 = 2 min), `TestRunRejectsBadConfig` (nil Provider/Recoverer, zero `Now`). `make vet test` and `make integration` pass.
+**Dependency for Task 25/26 (step-0 writer):** recovery supplies `schema` (`sidecar.Schema`) when the staging sidecar lacks it, but every other field `sidecar.Decode` and `Validate` require, including `recorder.*`, must still be in the staging sidecar. `testClip.stagingDoc` in `internal/relay/recovery/harness_test.go` is the reference shape. A staging sidecar that fails validation is counted as Orphaned.
+**Manual steps:**
+1. Against the Synology MinIO, start a clip, `kill -9` the relay after about 3 minutes of recording, and restart it within 2 minutes. Run `zrelay` startup recovery, then restart again after 2 more minutes.
+**Expected result:** the first restart changes nothing (no `Discarded`, the staging sidecar and the multipart upload are still there); the second restart recovers the clip (`Recovered: 1`) with an `incomplete` sidecar.
+**If the result differs, update:** the age comparison in `recovery.scan` (`internal/relay/recovery/recovery.go`) and Contract §7.4. If host and MinIO clocks differ, see the clock-skew note in the Task 27 entry above.
+**Status:** not run
