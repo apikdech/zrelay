@@ -65,6 +65,7 @@ func TestCamerasEndpoint(t *testing.T) {
 	e.f.writeStatus(testNow, camStatus("front", "up"))
 	e.f.addClip(clipOpt{Camera: "front", Start: utc(2026, 11, 6, 9, 0, 0)})
 
+	e.do("GET", "/api/v1/clips?from=2026-11-06T00:00:00Z&to=2026-11-07T00:00:00Z", "") // index the day
 	rec := e.do("GET", "/api/v1/cameras", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
@@ -312,8 +313,9 @@ func TestClipIDNeverReachesStorageAsAPath(t *testing.T) {
 	for _, p := range payloads {
 		for _, suffix := range []string{"", "/video"} {
 			rec := e.do("GET", "/api/v1/clips/"+p+suffix, "")
+			// The mux redirects paths it cleans (307); everything else is rejected.
 			switch rec.Code {
-			case http.StatusBadRequest, http.StatusNotFound, http.StatusMovedPermanently, http.StatusPermanentRedirect, http.StatusMethodNotAllowed:
+			case http.StatusBadRequest, http.StatusNotFound, http.StatusTemporaryRedirect, http.StatusMovedPermanently:
 			default:
 				t.Errorf("clip id %q%s: status %d", p, suffix, rec.Code)
 			}

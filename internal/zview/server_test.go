@@ -67,7 +67,7 @@ func newEnv(t *testing.T) *srvEnv {
 	cfg := &Config{
 		Version: 2,
 		Server:  ServerConfig{Listen: "127.0.0.1:0", APITokenSHA256: []string{hash}, AppDir: appDir},
-		Index:   IndexConfig{AssumedMaxClipSeconds: 300},
+		Index:   IndexConfig{AssumedMaxClipSeconds: 300, CamerasFallback: []string{"front", "back"}},
 	}
 	idx := f.index(cr, cfg.Index)
 	return &srvEnv{t: t, f: f, cr: cr, h: NewServer(cfg, idx, cr, live), token: hdr, appDir: appDir, live: live}
