@@ -19,9 +19,6 @@ const (
 	// DropShutdown is the drop reason for clips abandoned at shutdown
 	// (relay-spec §4.8; coverage cannot be published while storage is down).
 	DropShutdown = "shutdown"
-	// DropError is the drop reason for a clip whose upload cannot continue
-	// for a reason retrying cannot fix (the multipart upload vanished).
-	DropError = "error"
 
 	// abortTimeout bounds the Abort and staging cleanup of a dropped clip, in
 	// real time: it runs when storage may be unreachable.
@@ -43,7 +40,7 @@ type Config struct {
 	// Classify maps a storage error to its retry class (s3.Classify).
 	Classify func(error) storage.ErrorClass
 	// OnDrop reports a dropped clip: its camera, the reason ("backlog",
-	// "shutdown", "error") and approximately how many ms of footage it held.
+	// "shutdown") and approximately how many ms of footage it held.
 	OnDrop func(camera, reason string, approxMs int64)
 	// OnCommitted reports a clip that became visible (video committed and
 	// final sidecar stored).

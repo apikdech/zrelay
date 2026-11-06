@@ -49,6 +49,17 @@ type fakeStore struct {
 	down bool
 	// commitGate, when non-nil, blocks Commit until closed (or ctx ends).
 	commitGate chan struct{}
+	// finalGate, when non-nil, blocks PutSmall of a final (non-staging)
+	// sidecar until closed (or ctx ends).
+	finalGate chan struct{}
+	// putFails makes the next N PutSmall calls fail with errTransient.
+	putFails int
+	// deleteErr, when set, is returned by every Delete (after it is recorded).
+	deleteErr error
+	// resumeErrs are returned, one per Resume call, before Resume succeeds.
+	resumeErrs []error
+	// commitErrs are returned, one per Commit call, before Commit succeeds.
+	commitErrs []error
 
 	writeCalls, writeErrs, resumes int
 }
@@ -79,7 +90,20 @@ func (s *fakeStore) count(op string) int {
 
 func (s *fakeStore) PutSmall(ctx context.Context, key string, data []byte, contentType string) error {
 	s.mu.Lock()
+	if gate := s.finalGate; gate != nil && !strings.Contains(key, "/.") {
+		s.mu.Unlock()
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		s.mu.Lock()
+	}
 	defer s.mu.Unlock()
+	if s.putFails > 0 {
+		s.putFails--
+		return errTransient
+	}
 	s.record("put", key)
 	s.small[key] = bytes.Clone(data)
 	return nil
@@ -89,6 +113,9 @@ func (s *fakeStore) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("delete", key)
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	delete(s.small, key)
 	return nil
 }
@@ -146,6 +173,11 @@ func (o *fakeObj) Resume(ctx context.Context) (int64, error) {
 	o.s.mu.Lock()
 	defer o.s.mu.Unlock()
 	o.s.resumes++
+	if len(o.s.resumeErrs) > 0 {
+		err := o.s.resumeErrs[0]
+		o.s.resumeErrs = o.s.resumeErrs[1:]
+		return 0, err
+	}
 	o.data = o.data[:o.durable] // the driver repairs its own position
 	return int64(o.durable), nil
 }
@@ -154,7 +186,14 @@ func (o *fakeObj) Commit(ctx context.Context) error {
 	s := o.s
 	s.mu.Lock()
 	gate := s.commitGate
+	var cerr error
+	if len(s.commitErrs) > 0 {
+		cerr, s.commitErrs = s.commitErrs[0], s.commitErrs[1:]
+	}
 	s.mu.Unlock()
+	if cerr != nil {
+		return cerr
+	}
 	if gate != nil {
 		select {
 		case <-gate:
@@ -216,17 +255,28 @@ func (r *egressRig) dropList() []drop {
 // own recovery loop is started only by startBreaker.
 func newEgressRig(t *testing.T, workers int, limit int64, store *fakeStore) *egressRig {
 	t.Helper()
+	return newEgressRigOpts(t, workers, limit, store, true)
+}
+
+// newEgressRigOpts is newEgressRig with the breaker optional: without one the
+// Egress falls back to its fixed retry delay.
+func newEgressRigOpts(t *testing.T, workers int, limit int64, store *fakeStore, withBreaker bool) *egressRig {
+	t.Helper()
 	clk := clock.NewFake(time.Date(2026, 11, 6, 14, 59, 0, 0, time.UTC))
 	r := &egressRig{t: t, store: store, clk: clk, runDone: make(chan struct{})}
-	r.br = NewBreaker(BreakerConfig{FailureThreshold: 5, BaseDelay: time.Second, MaxDelay: time.Minute}, clk,
-		func(ctx context.Context) error { return nil }, nil)
+	var br *Breaker
+	if withBreaker {
+		br = NewBreaker(BreakerConfig{FailureThreshold: 5, BaseDelay: time.Second, MaxDelay: time.Minute}, clk,
+			func(ctx context.Context) error { return nil }, nil)
+		r.br = br
+	}
 	r.e = New(Config{
 		Storage:      store,
 		Workers:      workers,
 		BacklogLimit: limit,
-		Breaker:      r.br,
+		Breaker:      br,
 		Clock:        clk,
-		Classify:     func(error) storage.ErrorClass { return storage.Transient },
+		Classify:     classify, // retry_test.go: errMissing is NotFound, errPermanent Permanent
 		OnDrop: func(camera, reason string, ms int64) {
 			r.mu.Lock()
 			r.drops = append(r.drops, drop{camera, reason, ms})
@@ -275,6 +325,12 @@ type testClip struct {
 
 func (r *egressRig) begin(camera, id string) *testClip {
 	r.t.Helper()
+	return r.beginWith(camera, id, nil)
+}
+
+// beginWith is begin with a hook that may adjust the PendingClip first.
+func (r *egressRig) beginWith(camera, id string, tweak func(*recorder.PendingClip)) *testClip {
+	r.t.Helper()
 	dir := "clips/" + camera + "/2026/11/06"
 	pc := &recorder.PendingClip{
 		Keys: sidecar.ClipKeySet{
@@ -285,6 +341,9 @@ func (r *egressRig) begin(camera, id string) *testClip {
 		},
 		Staging: []byte(`{"staging":"` + id + `"}`),
 		Final:   func() ([]byte, error) { return []byte(`{"final":"` + id + `"}`), nil },
+	}
+	if tweak != nil {
+		tweak(pc)
 	}
 	w, err := r.e.Begin(pc)
 	if err != nil {
@@ -606,5 +665,316 @@ func TestForceFinalizeIsForwarded(t *testing.T) {
 	defer r.mu.Unlock()
 	if !slices.Equal(r.forced, []string{"front"}) {
 		t.Fatalf("ForceFinalize calls = %v, want [front]", r.forced)
+	}
+}
+
+// advanceUntil advances the fake clock in small steps until cond holds, so
+// workers sleeping on the fake clock make progress.
+func advanceUntil(t *testing.T, clk *clock.Fake, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		clk.Advance(500 * time.Millisecond)
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (s *fakeStore) writes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeCalls
+}
+
+// A storage outage that fails every Write, while Resume (local in the S3
+// driver) keeps succeeding, must still open the breaker after
+// FailureThreshold failures, back off between writes, park the worker and let
+// Run return on cancel. No manual Breaker.Failure call is involved.
+func TestWriteFailuresOpenBreakerAndParkWorker(t *testing.T) {
+	st := newFakeStore()
+	st.durableStep = 1 << 30
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	eventually(t, "created", func() bool { return st.obj(c.pc.Keys.Video) != nil })
+	st.mu.Lock()
+	st.down = true
+	st.mu.Unlock()
+	c.write(t, make([]byte, 100))
+
+	advanceUntil(t, r.clk, "breaker to open from write failures", func() bool {
+		s, _ := r.br.State()
+		return s == Open
+	})
+	// The worker is parked: no further writes however long we wait.
+	time.Sleep(30 * time.Millisecond)
+	parked := st.writes()
+	if parked != 5 {
+		t.Fatalf("writes before the breaker opened = %d, want FailureThreshold (5)", parked)
+	}
+	for range 20 {
+		r.clk.Advance(2 * time.Second)
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := st.writes(); got != parked {
+		t.Fatalf("worker kept writing while the breaker was open: %d -> %d", parked, got)
+	}
+	if got := r.e.BacklogBytes(); got != 100 {
+		t.Fatalf("BacklogBytes = %d, want the 100 bytes to stay buffered", got)
+	}
+
+	r.cancel()
+	select {
+	case <-r.runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+}
+
+// Consecutive write failures are paced by backoff on the clock, not retried in
+// a tight loop.
+func TestWriteFailuresBackOff(t *testing.T) {
+	st := newFakeStore()
+	st.durableStep = 1 << 30
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	eventually(t, "created", func() bool { return st.obj(c.pc.Keys.Video) != nil })
+	st.mu.Lock()
+	st.down = true
+	st.mu.Unlock()
+	c.write(t, make([]byte, 100))
+	eventually(t, "first failed write", func() bool { return st.writes() >= 1 })
+	time.Sleep(50 * time.Millisecond) // without backoff this spins thousands of times
+	if got := st.writes(); got > 2 {
+		t.Fatalf("%d writes in 50 ms of real time without the clock advancing: no backoff", got)
+	}
+}
+
+// A committed clip is no longer backlog: while its final sidecar is blocked,
+// another clip overflowing the limit must not evict it.
+func TestCommittedClipSurvivesBacklogOverflow(t *testing.T) {
+	st := newFakeStore()
+	st.durableStep = 4096 // the tail below one step stays buffered until Commit
+	st.finalGate = make(chan struct{})
+	r := newEgressRig(t, 2, 1000, st)
+	a := r.begin("front", "A")
+	a.write(t, make([]byte, 800))
+	a.finish()
+	eventually(t, "A committed", func() bool { return st.count("commit") == 1 })
+	r.clk.Advance(time.Second)
+
+	b := r.begin("back", "B")
+	b.write(t, make([]byte, 500)) // 500 <= 1000 once A no longer counts
+	time.Sleep(30 * time.Millisecond)
+	if ds := r.dropList(); len(ds) != 0 {
+		t.Fatalf("drops = %+v, want none: A is already committed", ds)
+	}
+	if st.count("abort") != 0 {
+		t.Fatalf("aborts = %d, want 0", st.count("abort"))
+	}
+
+	close(st.finalGate)
+	k := a.pc.Keys
+	eventually(t, "A's final sidecar", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return string(st.small[k.Sidecar]) == `{"final":"A"}`
+	})
+	eventually(t, "A's staging delete", func() bool { return st.count("delete") == 1 })
+}
+
+// The upload vanished (NotFound on Resume) while the stream still holds every
+// byte: the clip is re-created and restarted, and the committed object equals
+// the stream.
+func TestUploadGoneRestartsFromStream(t *testing.T) {
+	st := newFakeStore()
+	st.failFirstWrite = true
+	st.resumeErrs = []error{errMissing}
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	payload := randBytes(300_000, 7)
+	for off := 0; off < len(payload); off += 50_000 {
+		c.write(t, payload[off:off+50_000])
+	}
+	c.finish()
+
+	advanceUntil(t, r.clk, "commit after restart", func() bool { return st.count("commit") == 1 })
+	if st.count("create") != 2 || st.count("abort") != 1 {
+		t.Fatalf("events = %v, want a re-Create and one Abort of the vanished upload", st.snapshot())
+	}
+	st.mu.Lock()
+	got := st.objects[c.pc.Keys.Video]
+	st.mu.Unlock()
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("object differs from the stream (%d vs %d bytes)", len(got), len(payload))
+	}
+	if ds := r.dropList(); len(ds) != 0 {
+		t.Fatalf("drops = %+v, want none", ds)
+	}
+}
+
+// When the upload vanished and the bytes are no longer all held, the clip is
+// abandoned: the writer is aborted, the staging sidecar removed, and no drop
+// reason outside the coverage enum is reported.
+func TestUploadGoneAbandonsWhenBytesReleased(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		deleteErr error
+	}{
+		{"staging deleted", nil},
+		{"staging already gone", errMissing},
+		{"staging delete fails", errTransient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.deleteErr = tc.deleteErr
+			r := newEgressRig(t, 1, 1<<30, st)
+			c := r.begin("front", "A")
+			c.write(t, make([]byte, 1000))
+			eventually(t, "bytes durable and released", func() bool {
+				return st.obj(c.pc.Keys.Video) != nil && r.e.BacklogBytes() == 0
+			})
+			st.mu.Lock()
+			st.down = true
+			st.resumeErrs = []error{errMissing}
+			st.mu.Unlock()
+			c.write(t, make([]byte, 100))
+
+			advanceUntil(t, r.clk, "abandon", func() bool { return st.count("abort") == 1 && st.count("delete") == 1 })
+			eventually(t, "backlog freed", func() bool { return r.e.BacklogBytes() == 0 })
+			if st.count("commit") != 0 {
+				t.Fatal("abandoned clip was committed")
+			}
+			if ds := r.dropList(); len(ds) != 0 {
+				t.Fatalf("drops = %+v, want none (no reason outside the coverage enum)", ds)
+			}
+		})
+	}
+}
+
+// A clip is restarted at most once; a second vanished upload abandons it.
+func TestUploadGoneTwiceAbandons(t *testing.T) {
+	st := newFakeStore()
+	st.down = true
+	st.resumeErrs = []error{errMissing, errMissing}
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	c.write(t, make([]byte, 100))
+	advanceUntil(t, r.clk, "both uploads aborted", func() bool { return st.count("abort") == 2 })
+	if st.count("create") != 2 || st.count("commit") != 0 {
+		t.Fatalf("events = %v", st.snapshot())
+	}
+	eventually(t, "backlog freed", func() bool { return r.e.BacklogBytes() == 0 })
+	if ds := r.dropList(); len(ds) != 0 {
+		t.Fatalf("drops = %+v, want none", ds)
+	}
+}
+
+// Without a circuit breaker a failing request is retried after a fixed delay.
+func TestPersistWithoutBreakerRetriesAfterDelay(t *testing.T) {
+	st := newFakeStore()
+	st.putFails = 4 // more than one Do's three attempts
+	r := newEgressRigOpts(t, 1, 1<<30, st, false)
+	c := r.begin("front", "A")
+	c.write(t, []byte("payload"))
+	c.finish()
+	advanceUntil(t, r.clk, "commit", func() bool { return st.count("commit") == 1 })
+	eventually(t, "staging delete", func() bool { return st.count("delete") == 1 })
+	if st.count("put") < 2 {
+		t.Fatalf("events = %v", st.snapshot())
+	}
+}
+
+// If the final sidecar cannot be built the video stays committed and the
+// staging sidecar is left for the recovery sweep.
+func TestFinalSidecarErrorLeavesStagingForRecovery(t *testing.T) {
+	st := newFakeStore()
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.beginWith("front", "A", func(pc *recorder.PendingClip) {
+		pc.Final = func() ([]byte, error) { return nil, errors.New("finalize failed") }
+	})
+	c.write(t, []byte("payload"))
+	c.finish()
+	eventually(t, "commit", func() bool { return st.count("commit") == 1 })
+	eventually(t, "job finished", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		return len(r.e.jobs) == 0
+	})
+	k := c.pc.Keys
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if _, ok := st.small[k.Sidecar]; ok {
+		t.Fatal("a final sidecar was stored")
+	}
+	if _, ok := st.small[k.StagingSidecar]; !ok {
+		t.Fatal("the staging sidecar was removed")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.committed) != 0 {
+		t.Fatal("OnCommitted fired without a final sidecar")
+	}
+}
+
+func TestCameraOf(t *testing.T) {
+	for in, want := range map[string]string{
+		"clips/front/2026/11/06": "front",
+		"clips/front":            "front",
+		"front":                  "front",
+		"":                       "",
+	} {
+		if got := cameraOf(in); got != want {
+			t.Errorf("cameraOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A Resume that fails transiently is retried (after backoff) and the upload
+// continues from the offset the later Resume reports.
+func TestResumeErrorIsRetried(t *testing.T) {
+	st := newFakeStore()
+	st.failFirstWrite = true
+	st.resumeErrs = []error{errTransient, errTransient}
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	payload := randBytes(100_000, 9)
+	c.write(t, payload)
+	c.finish()
+	advanceUntil(t, r.clk, "commit", func() bool { return st.count("commit") == 1 })
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.resumes != 3 {
+		t.Fatalf("resumes = %d, want 3 (two failures, one success)", st.resumes)
+	}
+	if !bytes.Equal(st.objects[c.pc.Keys.Video], payload) {
+		t.Fatal("object differs from the stream")
+	}
+}
+
+// Commit answering NotFound (the multipart upload is gone) with every byte
+// still in the stream restarts the clip rather than dropping it.
+func TestCommitNotFoundRestartsFromStream(t *testing.T) {
+	st := newFakeStore()
+	st.durableStep = 1 << 30 // nothing durable before Commit: no byte is released
+	st.commitErrs = []error{errMissing}
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	payload := randBytes(100_000, 11)
+	c.write(t, payload)
+	c.finish()
+	eventually(t, "commit after restart", func() bool { return st.count("commit") == 1 })
+	if st.count("create") != 2 || st.count("abort") != 1 {
+		t.Fatalf("events = %v, want a re-Create and one Abort", st.snapshot())
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !bytes.Equal(st.objects[c.pc.Keys.Video], payload) {
+		t.Fatal("object differs from the stream")
+	}
+	if ds := r.dropList(); len(ds) != 0 {
+		t.Fatalf("drops = %+v, want none", ds)
 	}
 }
