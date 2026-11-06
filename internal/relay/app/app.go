@@ -28,7 +28,9 @@ import (
 	"github.com/apikdech/zrelay-v2/internal/relay/config"
 	"github.com/apikdech/zrelay-v2/internal/relay/egress"
 	"github.com/apikdech/zrelay-v2/internal/relay/events"
+	"github.com/apikdech/zrelay-v2/internal/relay/httpapi"
 	"github.com/apikdech/zrelay-v2/internal/relay/live"
+	"github.com/apikdech/zrelay-v2/internal/relay/metrics"
 	"github.com/apikdech/zrelay-v2/internal/relay/recorder"
 	"github.com/apikdech/zrelay-v2/internal/relay/recovery"
 	"github.com/apikdech/zrelay-v2/internal/relay/restream"
@@ -39,6 +41,7 @@ import (
 	"github.com/apikdech/zrelay-v2/pkg/storage/local"
 	"github.com/apikdech/zrelay-v2/pkg/storage/s3"
 	"github.com/apikdech/zrelay-v2/pkg/zrec"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Options are the parts of Run that tests replace.
@@ -57,6 +60,14 @@ type Options struct {
 // at once (design §6.5); this keeps a quiet relay, which never opens its
 // breaker, from staying unrecovered. A variable so tests can shorten it.
 var recoveryRetryEvery = time.Minute
+
+// healthBreakerOpen is how long the storage breaker may stay out of the
+// closed state before /healthz turns unhealthy (design §6.3).
+const healthBreakerOpen = 5 * time.Minute
+
+// gopSampleEvery is how often the pre-roll rings are sampled for the longest
+// GOP (zrelay_gop_max_seconds).
+const gopSampleEvery = time.Second
 
 const (
 	// httpShutdownGrace bounds the HTTP servers' own graceful stop.
@@ -132,6 +143,7 @@ type cam struct {
 	force    chan struct{}
 	lastClip atomic.Pointer[time.Time]
 
+	ring      *ring.Ring
 	recCancel context.CancelFunc
 	recDone   chan struct{}
 	evDone    chan struct{} // closed when the event source has unsubscribed
@@ -205,6 +217,9 @@ type app struct {
 	opts Options
 	clk  clock.Clock
 
+	m        *metrics.Metrics
+	stopping atomic.Bool // shutdown began: /healthz turns unhealthy
+
 	prov storage.Provider
 	rec  storage.Recoverer
 
@@ -269,6 +284,9 @@ func (a *app) start() error {
 	}
 	keys := zrec.Derive(mk)
 
+	// Metrics: every component below reports into it through its hook.
+	a.m = metrics.New(prometheus.NewRegistry())
+
 	// Storage.
 	a.prov, a.rec, err = a.opts.NewStorage(cfg)
 	if err != nil {
@@ -317,7 +335,9 @@ func (a *app) start() error {
 		Breaker:      a.breaker,
 		Clock:        a.clk,
 		Classify:     s3.Classify,
+		Metrics:      a.m,
 		OnDrop: func(camera, reason string, approxMs int64) {
+			a.m.ClipDropped(camera, reason)
 			if cm := byID[camera]; cm != nil {
 				cm.cov.Drop(a.clk.Now(), reason, approxMs)
 			}
@@ -338,6 +358,8 @@ func (a *app) start() error {
 		},
 	})
 
+	a.m.SetBacklogSource(a.eg.BacklogBytes)
+
 	// Cameras: supervisor, recorder and clip machine each.
 	var camCtx context.Context
 	camCtx, a.camCancel = context.WithCancel(context.Background())
@@ -348,6 +370,7 @@ func (a *app) start() error {
 		}
 		hubs[cm.cfg.ID] = cm.handle.Hub
 	}
+	go a.watchGOPs(camCtx)
 
 	// Live view.
 	if cfg.Live.MaxViewers > 0 {
@@ -417,13 +440,9 @@ func (a *app) start() error {
 	a.pubDone = make(chan struct{})
 	go func() { defer close(a.pubDone); a.pub.Run(pubCtx) }()
 
-	// HTTP: /healthz (Task 30 adds /metrics).
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	if err := a.serve(cfg.Relay.HTTPListen, mux); err != nil {
+	// HTTP: /healthz and /metrics.
+	api := httpapi.New(cfg.Relay.HTTPListen, a.m, a.healthErr)
+	if err := a.serve(api.Addr, api.Handler); err != nil {
 		return fmt.Errorf("http_listen: %w", err)
 	}
 	return nil
@@ -453,7 +472,11 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 	if err != nil {
 		return fmt.Errorf("camera %q: %w", c.ID, err)
 	}
-	src := newDoneSource(ctx, newEventSource(c, rules, a.clk), cm.evDone)
+	evSrc := newEventSource(c, rules, a.clk)
+	if pp, ok := evSrc.(*events.PullPoint); ok {
+		pp.Metrics = a.m.Pull(c.ID)
+	}
+	src := newDoneSource(ctx, evSrc, cm.evDone)
 	cm.handle = camera.Supervise(ctx, camera.SuperviseConfig{
 		ID:             c.ID,
 		RTSPURL:        a.cfg.RTSPURL(c),
@@ -461,6 +484,7 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 		TriggerTimeout: c.TriggerTimeout,
 		Clock:          a.clk,
 		OnState: func(s camera.Status) {
+			a.m.CameraState(c.ID, s.RTSP == "up", s.Events == "up")
 			cm.cov.SetReady(s.State == camera.StateReady, a.clk.Now())
 			slog.Info("camera state", "camera", c.ID, "state", string(s.State), "rtsp", s.RTSP, "events", s.Events)
 		},
@@ -477,11 +501,32 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 	b := int64(c.MaxBitrateKbps) * 1000 / 8
 	capBytes := b * int64((c.PreRoll+c.MaxGOP)/time.Second) * 5 / 4 // the budget's ring term
 	r := ring.New(c.PreRoll, capBytes, func() {
+		a.m.PreRollTruncated(c.ID)
 		slog.Warn("pre-roll ring truncated by its byte cap", "camera", c.ID)
 	})
-	cm.machine = clip.New(clip.Config{Camera: c.ID, PostRoll: c.PostRoll, MaxClip: c.MaxClip}, a.clk, r, rec)
+	cm.ring = r
+	out := &countingOutput{Output: rec, camera: c.ID, m: a.m}
+	cm.machine = clip.New(clip.Config{Camera: c.ID, PostRoll: c.PostRoll, MaxClip: c.MaxClip}, a.clk, r, out)
 
 	sub := cm.handle.Hub.Subscribe(camera.ClassRecorder, c.RecorderQueueFrames)
+	a.m.RegisterCamera(c.ID, metrics.CameraSources{
+		RingBytes:   r.Bytes,
+		RecorderLag: sub.Lagged,
+		// live and restream start after the cameras, and a scrape can only
+		// come once the HTTP endpoint (the last thing started) serves.
+		LiveViewers: func() int {
+			if a.live == nil {
+				return 0
+			}
+			return a.live.Viewers(c.ID)
+		},
+		RestreamClients: func() int {
+			if a.rs == nil {
+				return 0
+			}
+			return a.rs.Clients(c.ID)
+		},
+	})
 	limit := int64(a.cfg.Relay.EgressBacklogMB) << 20
 	resume := func() bool { return a.eg.BacklogBytes() < limit/resumeBacklogFraction }
 	var rctx context.Context
@@ -514,20 +559,110 @@ func (a *app) cameraStatus() []sidecar.CameraStatus {
 // onBreaker logs every breaker transition and, on a close, wakes the
 // recovery loop. It must not block.
 func (a *app) onBreaker(s egress.BreakerState) {
-	name := "unknown"
-	switch s {
-	case egress.Closed:
-		name = "closed"
+	a.m.BreakerChanged(int(s))
+	if s == egress.Closed {
 		select {
 		case a.kick <- struct{}{}:
 		default:
 		}
-	case egress.HalfOpen:
-		name = "half_open"
-	case egress.Open:
-		name = "open"
 	}
-	slog.Warn("storage breaker", "state", name)
+	slog.Warn("storage breaker", "state", breakerName(s))
+}
+
+func breakerName(s egress.BreakerState) string {
+	switch s {
+	case egress.Closed:
+		return "closed"
+	case egress.HalfOpen:
+		return "half_open"
+	case egress.Open:
+		return "open"
+	}
+	return "unknown"
+}
+
+// healthErr is /healthz: the relay is healthy while it is running and the
+// storage breaker has not been out of the closed state for more than
+// healthBreakerOpen. A short outage is tolerated by design (the backlog
+// absorbs it), so it must not make the container restart.
+func (a *app) healthErr() error {
+	if a.stopping.Load() {
+		return errors.New("shutting down")
+	}
+	if st, since := a.breaker.State(); st != egress.Closed {
+		if d := a.clk.Now().Sub(since); d > healthBreakerOpen {
+			return fmt.Errorf("storage breaker %s for %s", breakerName(st), d.Round(time.Second))
+		}
+	}
+	return nil
+}
+
+// watchGOPs samples every camera's pre-roll ring for the longest GOP it
+// holds, until ctx ends (relay-spec §4.3: zrelay_gop_max_seconds, and a
+// warning when it exceeds max_gop_seconds).
+func (a *app) watchGOPs(ctx context.Context) {
+	for {
+		t := a.clk.NewTimer(gopSampleEvery)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C():
+		}
+		for _, cm := range a.cams {
+			span := gopSpan(cm.ring.Retained()).Seconds()
+			if a.m.ObserveGOP(cm.cfg.ID, span) && cm.cfg.MaxGOP > 0 && span > cm.cfg.MaxGOP.Seconds() {
+				slog.Warn("GOP longer than max_gop_seconds; pre-roll memory grows",
+					"camera", cm.cfg.ID, "gop_seconds", span, "max_gop_seconds", cm.cfg.MaxGOP.Seconds())
+			}
+		}
+	}
+}
+
+// gopSpan is the longest GOP of gops: the distance between the IDR times of
+// neighbours, and for the open last one the time it has run so far.
+func gopSpan(gops []*ring.GOP) time.Duration {
+	var longest time.Duration
+	for i, g := range gops {
+		var d time.Duration
+		if i+1 < len(gops) {
+			d = gops[i+1].Start.Sub(g.Start)
+		} else if n := len(g.AUs); n > 0 {
+			d = g.AUs[n-1].Wall.Sub(g.Start)
+		}
+		longest = max(longest, d)
+	}
+	return longest
+}
+
+// countingOutput counts every finished clip segment by its end reason
+// (zrelay_clips_total).
+type countingOutput struct {
+	clip.Output
+	camera string
+	m      *metrics.Metrics
+}
+
+func (o *countingOutput) Open(info clip.OpenInfo) (clip.ClipWriter, error) {
+	w, err := o.Output.Open(info)
+	if err != nil {
+		return nil, err
+	}
+	return &countingWriter{ClipWriter: w, camera: o.camera, m: o.m}, nil
+}
+
+type countingWriter struct {
+	clip.ClipWriter
+	camera string
+	m      *metrics.Metrics
+}
+
+func (w *countingWriter) Finalize(f clip.FinalInfo) error {
+	err := w.ClipWriter.Finalize(f)
+	if err == nil {
+		w.m.ClipEnded(w.camera, string(f.Reason))
+	}
+	return err
 }
 
 // recoverLoop runs startup crash recovery (design §6.5): at once, then again
@@ -570,6 +705,7 @@ func (a *app) recoverLoop(ctx context.Context, ids []string) {
 // machines, egress drain, final status flush, live and restream, then the
 // ONVIF subscriptions.
 func (a *app) shutdown() {
+	a.stopping.Store(true)
 	deadline := time.Now().Add(a.grace())
 	left := func() time.Duration { return max(0, time.Until(deadline)) }
 

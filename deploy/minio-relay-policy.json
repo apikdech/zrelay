@@ -1,0 +1,46 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RelayObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListMultipartUploadParts",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": ["arn:aws:s3:::cctv/zrelay/*"]
+    },
+    {
+      "Sid": "RelayList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::cctv"],
+      "Condition": {
+        "StringLike": { "s3:prefix": ["zrelay", "zrelay/*"] }
+      }
+    },
+    {
+      "Sid": "RelayHeadBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::cctv"],
+      "Condition": {
+        "Null": { "s3:prefix": "true" }
+      }
+    },
+    {
+      "Sid": "RelayListUploads",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucketMultipartUploads"],
+      "Resource": ["arn:aws:s3:::cctv"]
+    },
+    {
+      "Sid": "RelayDeleteStagingOnly",
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::cctv/zrelay/clips/*/.*"]
+    }
+  ]
+}

@@ -47,6 +47,20 @@ type Config struct {
 	OnCommitted func(camera string, at time.Time)
 	// ForceFinalize asks the camera's recorder to finalize its current clip.
 	ForceFinalize func(camera string)
+	// Metrics (may be nil) observes the upload path.
+	Metrics UploadMetrics
+}
+
+// UploadMetrics observes the upload path (zrelay_upload_* metrics). The
+// implementation must not block.
+type UploadMetrics interface {
+	// UploadBytes reports n more ciphertext bytes made durable in storage.
+	UploadBytes(n int64)
+	// UploadError reports a failed storage request by error class:
+	// "transient", "permanent" or "not_found".
+	UploadError(kind string)
+	// UploadResume reports a multipart upload resumed after a failed write.
+	UploadResume()
 }
 
 // Egress is the memory-only upload path: it implements recorder.ClipSink,
@@ -104,6 +118,27 @@ func New(cfg Config) *Egress {
 	e.hctx, e.hcancel = context.WithCancel(context.Background())
 	e.acct = NewAccountant(cfg.BacklogLimit, e.reportDrop, cfg.ForceFinalize)
 	return e
+}
+
+func (e *Egress) uploadBytes(n int64) {
+	if e.cfg.Metrics != nil && n > 0 {
+		e.cfg.Metrics.UploadBytes(n)
+	}
+}
+
+// uploadError reports err, a failed storage request, with its class.
+func (e *Egress) uploadError(err error) {
+	if e.cfg.Metrics == nil {
+		return
+	}
+	switch e.cfg.Classify(err) {
+	case storage.Permanent:
+		e.cfg.Metrics.UploadError("permanent")
+	case storage.NotFound:
+		e.cfg.Metrics.UploadError("not_found")
+	default:
+		e.cfg.Metrics.UploadError("transient")
+	}
 }
 
 // BacklogBytes returns the ciphertext bytes produced but not yet durable.

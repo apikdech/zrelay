@@ -103,7 +103,8 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 
 	buf := make([]byte, copyBufSize)
 	var off int64
-	fails := 0 // consecutive failed Write or Resume calls
+	var counted int64 // bytes already reported to UploadMetrics (the durable high-water mark)
+	fails := 0        // consecutive failed Write or Resume calls
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -131,6 +132,7 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 					return err
 				}
 				off = roff
+				counted = e.countDurable(counted, w.DurableOffset())
 				c.Stream.Release(w.DurableOffset())
 				continue
 			}
@@ -144,6 +146,7 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 			if durable := w.DurableOffset(); durable > before {
 				fails = 0
 				e.success()
+				counted = e.countDurable(counted, durable)
 				c.Stream.Release(durable)
 			}
 		}
@@ -160,6 +163,7 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 	if err := e.persist(ctx, j, w.Commit); err != nil {
 		return err
 	}
+	e.countDurable(counted, off) // the tail that only Commit makes durable
 	// The video is durable: mark it first so the accountant skips the clip,
 	// then release its tail so it no longer counts as backlog. Neither the
 	// accountant nor Shutdown evicts or reports the clip while the final
@@ -193,6 +197,9 @@ func (e *Egress) resume(ctx context.Context, w storage.ObjectWriter, fails *int)
 		}
 		off, err := w.Resume(ctx)
 		if err == nil {
+			if e.cfg.Metrics != nil {
+				e.cfg.Metrics.UploadResume()
+			}
 			return off, nil
 		}
 		if ctx.Err() != nil {
@@ -316,6 +323,7 @@ func (e *Egress) success() {
 // failure reports a failed streaming Write to the breaker. Write has no retry
 // of its own; the resume that follows is the retry.
 func (e *Egress) failure(err error) {
+	e.uploadError(err)
 	if e.cfg.Breaker != nil {
 		e.cfg.Breaker.Failure(e.cfg.Classify(err) == storage.Permanent)
 	}
@@ -323,7 +331,21 @@ func (e *Egress) failure(err error) {
 
 // do runs op with the per-request retry and breaker accounting.
 func (e *Egress) do(ctx context.Context, op func(ctx context.Context) error) error {
-	return Do(ctx, e.cfg.Clock, e.cfg.Classify, e.cfg.Breaker, op)
+	err := Do(ctx, e.cfg.Clock, e.cfg.Classify, e.cfg.Breaker, op)
+	if err != nil && ctx.Err() == nil {
+		e.uploadError(err)
+	}
+	return err
+}
+
+// countDurable reports the bytes between the already reported high-water mark
+// and durable, and returns the new mark.
+func (e *Egress) countDurable(counted, durable int64) int64 {
+	if durable <= counted {
+		return counted
+	}
+	e.uploadBytes(durable - counted)
+	return durable
 }
 
 // errUploadGone reports an operation that can never succeed (NotFound).

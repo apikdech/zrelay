@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ZviewRead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::cctv/zrelay/*"]
+    },
+    {
+      "Sid": "ZviewList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::cctv"],
+      "Condition": {
+        "StringLike": { "s3:prefix": ["zrelay", "zrelay/*"] }
+      }
+    },
+    {
+      "Sid": "ZviewHeadBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::cctv"],
+      "Condition": {
+        "Null": { "s3:prefix": "true" }
+      }
+    }
+  ]
+}
