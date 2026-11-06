@@ -16,6 +16,11 @@ describe('describeIntegrity (ui-spec §4.4 wording)', () => {
   it('verifying shows a spinner', () => {
     expect(describeIntegrity(st({ integrity: 'verifying' }))).toMatchObject({ kind: 'verifying', spinner: true });
   });
+  it('verifying stops spinning once opening failed', () => {
+    const d = describeIntegrity(st({ integrity: 'verifying', message: 'ErrNoKey' }));
+    expect(d.spinner).toBe(false);
+    expect(d.text).toBe('Could not verify this recording');
+  });
   it('verified shows a subtle badge with the tooltip text', () => {
     expect(describeIntegrity(st({ integrity: 'verified' }))).toMatchObject({
       kind: 'verified',

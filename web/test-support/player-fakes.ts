@@ -315,7 +315,11 @@ export const tick = async (n = 20): Promise<void> => {
 /** Polls `cond` over macrotasks until true. */
 export async function until(cond: () => boolean, what = 'condition'): Promise<void> {
   for (let i = 0; i < 400; i++) {
-    if (cond()) return;
+    try {
+      if (cond()) return;
+    } catch {
+      /* not ready yet (e.g. the SourceBuffer is not created) */
+    }
     await new Promise<void>((r) => setTimeout(r, 2));
   }
   throw new Error(`timed out waiting for ${what}`);

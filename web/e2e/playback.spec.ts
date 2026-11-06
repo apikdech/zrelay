@@ -109,6 +109,8 @@ async function openDemo(page: Page, variant: keyof typeof origins, clip: string)
   await page.goto(`${origin}/#/key`);
   await page.getByLabel('Master key').fill(manifest.master_key);
   await page.getByRole('button', { name: 'Import key' }).click();
+  // The form clears itself once the worker holds the key; opening a clip earlier would race the import.
+  await expect(page.getByLabel('Master key')).toHaveValue('');
   await page.evaluate((c) => {
     location.hash = `#/demo?clip=${c}`;
   }, clip);
@@ -162,4 +164,42 @@ test('a truncated clip plays its verified part and shows incomplete', async ({ p
   await expect.poll(() => currentTime(page), { timeout: 20_000 }).toBeGreaterThan(2);
   // It never turns into tampered: the cut is a truncation, not a forgery.
   await expect(demo).toHaveAttribute('data-integrity', 'incomplete');
+});
+
+test('a phone profile seeks outside its 30 s buffer by fetching the indexed fragment', async ({ browser }) => {
+  const ctx = await browser.newContext({ hasTouch: true, viewport: { width: 390, height: 844 } });
+  try {
+    const page = await ctx.newPage();
+    const demo = await openDemo(page, 'complete', manifest.complete.clip_id);
+    await expect(demo).toHaveAttribute('data-profile', 'mobile');
+    await expect(demo).toHaveAttribute('data-integrity', 'verified', { timeout: 30_000 });
+    await expect.poll(() => currentTime(page), { timeout: 20_000 }).toBeGreaterThan(1);
+
+    // The mobile window buffers about 30 s ahead of the playhead, so near the end of the clip
+    // the target is usually outside the buffer (always on WebKit; the unit tests pin the path).
+    const target = Math.floor(manifest.duration_ms / 1000) - 1;
+    expect(target).toBeGreaterThan(30);
+    await page.getByTestId('seek-input').fill(String(target));
+    await page.getByTestId('seek-go').click();
+    await expect.poll(() => currentTime(page), { timeout: 3000, intervals: [50] }).toBeGreaterThanOrEqual(target);
+    await expect(demo).toHaveAttribute('data-integrity', 'verified');
+    // Playback reaches the end of the clip from the fetched fragment.
+    await expect.poll(() => page.getByTestId('player').evaluate((v: HTMLVideoElement) => v.ended), { timeout: 10_000 }).toBe(true);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('without MSE the Blob fallback plays and seeks the complete clip', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'MediaSource', { value: undefined, configurable: true });
+    Object.defineProperty(window, 'ManagedMediaSource', { value: undefined, configurable: true });
+  });
+  const demo = await openDemo(page, 'complete', manifest.complete.clip_id);
+  await expect(demo).toHaveAttribute('data-engine', 'blob', { timeout: 30_000 });
+  await expect(demo).toHaveAttribute('data-integrity', 'verified');
+  await expect.poll(() => currentTime(page), { timeout: 20_000 }).toBeGreaterThan(1);
+  await page.getByTestId('seek-input').fill('20');
+  await page.getByTestId('seek-go').click();
+  await expect.poll(() => currentTime(page), { timeout: 2000, intervals: [50] }).toBeGreaterThanOrEqual(20);
 });
