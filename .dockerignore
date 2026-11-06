@@ -1,0 +1,13 @@
+# Keep secrets, env files and local state out of the build context.
+.git
+.claude
+**/.env
+**/.env.*
+deploy/secrets
+deploy/zrelay.yaml
+**/node_modules
+web/dist
+*.zrec
+*.test
+coverage.out
+.DS_Store

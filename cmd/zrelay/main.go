@@ -1,0 +1,114 @@
+// Command zrelay is the relay daemon and its tools (relay-spec §6).
+//
+// Exit codes: 0 OK, 1 the check failed (memory budget over 80% of
+// max_memory_mb), 2 usage error or invalid configuration.
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/apikdech/zrelay-v2/internal/relay/config"
+	"github.com/apikdech/zrelay-v2/pkg/secretref"
+)
+
+const usage = `usage: zrelay [--env-file <path>] <command> [flags]
+
+commands:
+  config check --config <path>   validate the config and print the memory budget
+`
+
+const (
+	exitOK      = 0
+	exitFailed  = 1
+	exitInvalid = 2
+)
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run parses the global flags and dispatches to a subcommand.
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("zrelay", stderr)
+	envFile := fs.String("env-file", "", "load KEY=VALUE lines into the environment before resolving ENV: references")
+	if code, ok := parse(fs, args); !ok {
+		return code
+	}
+	if code, ok := loadEnvFile(*envFile, stderr); !ok {
+		return code
+	}
+	rest := fs.Args()
+	switch {
+	case len(rest) >= 2 && rest[0] == "config" && rest[1] == "check":
+		return configCheck(rest[2:], stdout, stderr)
+	default:
+		fmt.Fprint(stderr, usage)
+		return exitInvalid
+	}
+}
+
+// configCheck implements "zrelay config check" (relay-spec §5.3, design
+// §8.1): load and validate the config, print the budget table, and fail
+// when the budget is over 80% of max_memory_mb.
+func configCheck(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("zrelay config check", stderr)
+	path := fs.String("config", "", "config file `path`")
+	envFile := fs.String("env-file", "", "load KEY=VALUE lines into the environment before resolving ENV: references")
+	if code, ok := parse(fs, args); !ok {
+		return code
+	}
+	if *path == "" || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: zrelay config check --config <path>")
+		return exitInvalid
+	}
+	if code, ok := loadEnvFile(*envFile, stderr); !ok {
+		return code
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		fmt.Fprintf(stderr, "zrelay: config check: %v\n", err)
+		return exitInvalid
+	}
+	r := config.Budget(cfg)
+	r.WriteTable(stdout)
+	if !r.OK {
+		fmt.Fprintf(stderr, "zrelay: config check: memory budget exceeds 80%% of max_memory_mb (total %d bytes > limit %d bytes)\n", r.Total, r.Limit)
+		return exitFailed
+	}
+	return exitOK
+}
+
+func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	return fs
+}
+
+// parse parses args into fs. It returns ok false with the exit code when
+// the caller should stop: 0 for -h, 2 for a flag error.
+func parse(fs *flag.FlagSet, args []string) (code int, ok bool) {
+	switch err := fs.Parse(args); {
+	case err == nil:
+		return 0, true
+	case errors.Is(err, flag.ErrHelp):
+		return exitOK, false
+	default:
+		return exitInvalid, false
+	}
+}
+
+// loadEnvFile loads path when it is set (relay-spec §6 --env-file).
+func loadEnvFile(path string, stderr io.Writer) (code int, ok bool) {
+	if path == "" {
+		return 0, true
+	}
+	if err := secretref.LoadEnvFile(path); err != nil {
+		fmt.Fprintf(stderr, "zrelay: %v\n", err)
+		return exitInvalid, false
+	}
+	return 0, true
+}

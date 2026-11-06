@@ -15,3 +15,7 @@ web/playwright-report/
 
 # OS
 .DS_Store
+
+# Deployment secrets and the deployed config (deploy/compose.yaml)
+deploy/secrets/
+deploy/zrelay.yaml
