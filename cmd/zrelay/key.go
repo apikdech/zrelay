@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 
@@ -98,12 +99,12 @@ func keyFromRef(name string, args []string, stdout, stderr io.Writer, derive fun
 		fmt.Fprintf(stderr, "usage: zrelay key %s --key <ref>\n", name)
 		return exitInvalid
 	}
-	if !secretref.IsRef(*ref) {
+	text, err := secretref.Resolve(*ref, false)
+	if errors.Is(err, secretref.ErrLiteral) {
 		// Never echo the value: it may be the key itself.
 		fmt.Fprintf(stderr, "zrelay: key %s: --key takes a reference (ENV:NAME or FILE:/path), never a literal\n", name)
 		return exitInvalid
 	}
-	text, err := secretref.Resolve(*ref, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "zrelay: key %s: %v\n", name, err)
 		return exitInvalid

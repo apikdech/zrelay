@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
@@ -128,6 +129,43 @@ func TestKeyCLIRejectsLiteral(t *testing.T) {
 				t.Errorf("the literal key leaked into the output")
 			}
 		})
+	}
+}
+
+func TestKeyCLIUnsupportedSchemeIsNotCalledLiteral(t *testing.T) {
+	for _, sub := range []string{"fingerprint", "api-token-hash"} {
+		t.Run(sub, func(t *testing.T) {
+			code, _, errOut := runCLI("key", sub, "--key", "KEYCHAIN:zrelay")
+			if code != 2 {
+				t.Errorf("exit %d, want 2", code)
+			}
+			if strings.Contains(errOut, "never a literal") {
+				t.Errorf("a KEYCHAIN: reference was called a literal:\n%s", errOut)
+			}
+			if !strings.Contains(errOut, "unsupported") {
+				t.Errorf("stderr does not say the scheme is unsupported:\n%s", errOut)
+			}
+		})
+	}
+}
+
+type failReader struct{}
+
+func (failReader) Read([]byte) (int, error) { return 0, errors.New("entropy source broke") }
+
+func TestKeyGenerateRandFailureExitsOne(t *testing.T) {
+	old := randReader
+	randReader = failReader{}
+	t.Cleanup(func() { randReader = old })
+	code, out, errOut := runCLI("key", "generate")
+	if code != 1 {
+		t.Fatalf("exit %d, want 1; stderr:\n%s", code, errOut)
+	}
+	if out != "" {
+		t.Errorf("stdout not empty on failure:\n%s", out)
+	}
+	if !strings.Contains(errOut, "entropy source broke") {
+		t.Errorf("stderr lacks the cause:\n%s", errOut)
 	}
 }
 

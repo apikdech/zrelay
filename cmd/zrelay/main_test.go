@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,7 +129,9 @@ func TestConfigCheckErrorsDoNotLeakSecrets(t *testing.T) {
 	setExampleEnv(t)
 	path := exampleConfigFile(t, func(s string) string { return s + "mlock: true\n" })
 	_, out, errOut := runCLI("config", "check", "--config", path)
-	for _, v := range []string{"s3-secret", "s3-access", "cam-pass", "restream-pass", "zk1-example-master-key"} {
+	mk := seqMaster()
+	for _, v := range []string{"s3-secret", "s3-access", "cam-pass", "restream-pass",
+		mk.String(), mk.Upper(), hex.EncodeToString(mk[:])} {
 		if strings.Contains(out+errOut, v) {
 			t.Errorf("output contains secret %q:\n%s%s", v, out, errOut)
 		}

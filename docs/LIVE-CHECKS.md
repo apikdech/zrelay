@@ -110,6 +110,11 @@ and nothing was run on the Mac mini or against Tailscale.
 2. Create `deploy/.env` with `S3_ENDPOINT`, `S3_ACCESS_KEY`, `RESTREAM_USER`, `RESTREAM_PASS`,
    `CAMERA_IP`, `CAMERA_USERNAME`, `CAMERA_PASSWORD`, and `mkdir -m 700 deploy/secrets` holding
    `zrelay_master`, `s3_secret_key` and `api_token_sha256`, each `chmod 600`.
+   Since Task 10b, `config check` parses the master key, so `zrelay_master` must hold a valid
+   `zk1-` key, not a dummy string. Create it from the `key:` line of
+   `docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint /zrelay zrelay key generate`,
+   written as the bare `zk1-...` text only (no `key:` label, no QR), e.g.
+   `printf '%s\n' 'zk1-...' > deploy/secrets/zrelay_master && chmod 600 deploy/secrets/zrelay_master`.
 3. `export TAILSCALE_IP=$(tailscale ip -4 | head -n 1)`, then
    `docker compose -f deploy/compose.yaml build` and
    `docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint /zrelay zrelay config check --config /etc/zrelay/zrelay.yaml; echo "exit $?"`
@@ -119,7 +124,9 @@ and nothing was run on the Mac mini or against Tailscale.
    `nc -vz <tailscale-ip> 9464` and `nc -vz <tailscale-ip> 8554`.
 
 **Expected result:** step 3 prints the budget table with one `camera tapo-c220` row, `TOTAL`
-591.5 MiB and `budget OK`, then `exit 0`, with no `WARN secret file mode` lines and no
+591.5 MiB and `budget OK`, a `key fingerprint: <xxxx-xxxx-xxxx-xxxx>` line equal to the output of
+`docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint /zrelay zrelay key fingerprint --key FILE:/run/secrets/zrelay_master`
+(and to the `fingerprint:` line printed by `key generate`), then `exit 0`, with no `WARN secret file mode` lines and no
 "permission denied" on `/run/secrets/*` (the files are read as uid 65534). Step 4: `deploy.sh`
 picks up the Tailscale IP by itself; `ReadonlyRootfs` is `true`; `Mounts` lists only the config and
 the three secrets (bind, read-only) with no volume or tmpfs; ports bind 8554/tcp and 8189/udp on the
@@ -127,6 +134,12 @@ Tailscale IP and 9464 on `127.0.0.1` only; `/healthz` answers locally; 9464 is r
 other host while 8554 connects.
 
 **If the result differs, update:**
+- Fingerprint line missing or different from `key fingerprint`, or `config check` exits 2 with
+  `encryption.master_key: ...` on a key made by `key generate`: the fingerprint code in
+  `cmd/zrelay/main.go` / `internal/relay/config/budget.go`, `zrec.ParseMasterKey` (a trailing
+  newline or CRLF in the secret file), and `TestConfigCheckPrintsKeyFingerprint` /
+  `TestKeyFingerprint`; if the secret file was written with a `key:` label or QR block, fix this
+  step instead.
 - Secrets unreadable by uid 65534 under OrbStack (permission denied with `chmod 600`): the
   `secrets:` block in `deploy/compose.yaml` (bind-mounted secrets keep the host owner and mode;
   use the long syntax with `uid`/`gid`/`mode` if OrbStack honours it, or document the needed mode
@@ -253,5 +266,37 @@ staging sidecar.
   (Contract §7.4, design §6.5).
 - Step 5 or 6 denied: add `s3:ListMultipartUploadParts` / `s3:AbortMultipartUpload` to the relay
   policy (design §6.5).
+
+**Status:** not run
+
+## Task 10b — Key CLI subcommands and `config check` fingerprint
+
+**Automated in this task:** `zrelay key generate [--qr]`, `key fingerprint --key REF` and
+`key api-token-hash --key REF` (in `cmd/zrelay/key.go`) and the `key fingerprint:` line of
+`config check` are covered by the `cmd/zrelay` tests (`TestKeyGenerate`,
+`TestKeyGenerateQRUsesUppercaseForm`, `TestKeyFingerprint*`, `TestKeyAPITokenHash*`,
+`TestKeyCLIRejectsLiteral`, `TestKeyCLIUnsupportedSchemeIsNotCalledLiteral`,
+`TestKeyGenerateRandFailureExitsOne`, `TestConfigCheckPrintsKeyFingerprint`) and
+`internal/relay/config` `TestKeyFingerprint`, all passing under `make vet test`. The QR output was
+compared with `qrterminal` output of the uppercase key, but no phone scanned it.
+
+**Manual steps:**
+1. `docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint /zrelay zrelay key generate --qr`
+   and scan the QR code with the zview phone app; note the `fingerprint:` line.
+2. Write the `key:` value to `deploy/secrets/zrelay_master` (bare text, `chmod 600`), then
+   `docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint /zrelay zrelay key fingerprint --key FILE:/run/secrets/zrelay_master`
+   and `... key api-token-hash --key FILE:/run/secrets/zrelay_master`.
+3. `... key fingerprint --key zk1-anything` and `... key fingerprint --key KEYCHAIN:x`.
+
+**Expected result:** step 1 prints `key: zk1-<64 hex>-<4 hex>` and `fingerprint: xxxx-xxxx-xxxx-xxxx`,
+and the phone app decodes the QR to the same key (it accepts the uppercase form) and shows the same
+fingerprint. Step 2 prints the same fingerprint, then a 64-hex hash that matches the one entered in
+`api_token_sha256` for zview-server. Step 3 exits 2: the first says `--key takes a reference ... never
+a literal` and does not echo the value, the second says the `KEYCHAIN:` scheme is unsupported.
+
+**If the result differs, update:** the QR config in `keyGenerate` (`cmd/zrelay/key.go`: error
+level, `HalfBlocks`, quiet zone) and `TestKeyGenerateQRUsesUppercaseForm` if the phone cannot scan
+it; `zrec.Derive` / `zrec.FormatKeyID` and Contract §3 if the app derives a different fingerprint or
+token hash.
 
 **Status:** not run
