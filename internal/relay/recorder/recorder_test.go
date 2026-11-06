@@ -49,6 +49,11 @@ func testKeys() zrec.Keys {
 	return zrec.Derive(m)
 }
 
+func keyIDHex() string {
+	id := testKeys().ID
+	return hex.EncodeToString(id[:])
+}
+
 func testCamera() config.Camera {
 	return config.Camera{ID: cameraID, Name: "Front Door", Brand: "tapo", Tags: []string{"exterior", "entrance"}}
 }
@@ -242,7 +247,7 @@ func recordClip(t testing.TB, rec *recorder.Recorder, c camera.Codec, gops []*ri
 
 func TestFinalSidecarDescribesClip(t *testing.T) {
 	d, base := newLocal(t)
-	rec := newRecorder(t, d, 32<<10)
+	rec := newRecorder(t, d, 64<<10)
 	c, gops := fixture(t, t0)
 	info := openInfo(t, c, t0, 0)
 	fin := clip.FinalInfo{
@@ -280,7 +285,7 @@ func TestFinalSidecarDescribesClip(t *testing.T) {
 	if sc.Video.SizeBytes != int64(len(video)) {
 		t.Errorf("size_bytes = %d, file is %d", sc.Video.SizeBytes, len(video))
 	}
-	if sc.Video.ChunkSize != 32<<10 || sc.Video.KeyID != hex.EncodeToString(testKeys().ID[:]) {
+	if sc.Video.ChunkSize != 64<<10 || sc.Video.KeyID != keyIDHex() {
 		t.Errorf("chunk_size/key_id = %d / %s", sc.Video.ChunkSize, sc.Video.KeyID)
 	}
 	pt := decrypt(t, video)
@@ -328,11 +333,11 @@ func TestKeysUseSegmentStartDay(t *testing.T) {
 func TestStagingSidecarWrittenBeforeFirstChunk(t *testing.T) {
 	d, base := newLocal(t)
 	sp := newSpy(d)
-	rec := newRecorder(t, sp, 4<<10)
+	rec := newRecorder(t, sp, 64<<10)
 	c, gops := fixture(t, t0)
 	info := openInfo(t, c, t0, 0)
 	keys := sidecar.ClipKeys(cameraID, t0, info.ClipID)
-	recordClip(t, rec, c, gops[:3], info, clip.FinalInfo{End: t0.Add(6 * time.Second), DurationMs: 6000, Reason: clip.ReasonPostRollElapsed})
+	recordClip(t, rec, c, gops, info, clip.FinalInfo{End: t0.Add(6 * time.Second), DurationMs: 6000, Reason: clip.ReasonPostRollElapsed})
 
 	ops := sp.opLog()
 	stage := slices.Index(ops, "putsmall "+keys.StagingSidecar)
@@ -409,7 +414,7 @@ func TestStagingSidecarHasAllRecoveryFields(t *testing.T) {
 		t.Errorf("identity fields wrong: %+v", sc)
 	}
 	v := sc.Video
-	if v.Object != sidecar.ObjectName(t0, info.ClipID, "zrec") || v.FormatVersion != 1 || v.KeyID != hex.EncodeToString(testKeys().ID[:]) ||
+	if v.Object != sidecar.ObjectName(t0, info.ClipID, "zrec") || v.FormatVersion != 1 || v.KeyID != keyIDHex() ||
 		v.ChunkSize != 1<<20 || v.Container != "fmp4" || v.Codec != wantCodec || v.Width != 640 || v.Height != 360 {
 		t.Errorf("video = %+v", v)
 	}
@@ -432,10 +437,10 @@ func TestStagingSidecarHasAllRecoveryFields(t *testing.T) {
 func TestNoPlaintextReachesSink(t *testing.T) {
 	d, base := newLocal(t)
 	sp := newSpy(d)
-	rec := newRecorder(t, sp, 4<<10)
+	rec := newRecorder(t, sp, 64<<10)
 	c, gops := fixture(t, t0)
 	info := openInfo(t, c, t0, 0)
-	recordClip(t, rec, c, gops[:3], info, clip.FinalInfo{End: t0.Add(6 * time.Second), DurationMs: 6000, Reason: clip.ReasonPostRollElapsed})
+	recordClip(t, rec, c, gops, info, clip.FinalInfo{End: t0.Add(6 * time.Second), DurationMs: 6000, Reason: clip.ReasonPostRollElapsed})
 
 	if len(c.SPS) < 8 {
 		t.Fatalf("fixture SPS too short: %d", len(c.SPS))
