@@ -3,6 +3,7 @@ package live
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -24,21 +25,49 @@ const (
 	benchGOP     = 2 * benchFPS
 )
 
-// Env vars that turn TestHelperWHEPClient into a client child process.
+// Env vars that turn the test binary into a client child process (see
+// TestMain).
 const (
 	envClientURL   = "ZRELAY_BENCH_WHEP_URL"
 	envClientToken = "ZRELAY_BENCH_WHEP_TOKEN"
 )
 
-// TestHelperWHEPClient is not a test: BenchmarkViewerMemory re-executes the
-// test binary to run it as a viewer in its own process, so the client's
-// memory is not counted against the server's. It prints "ready" once video
-// flows and exits when stdin closes.
-func TestHelperWHEPClient(t *testing.T) {
-	base := os.Getenv(envClientURL)
-	if base == "" {
-		t.Skip("helper process for BenchmarkViewerMemory")
+// TestMain lets BenchmarkViewerMemory re-execute the test binary as a viewer
+// in its own process, so the client's memory is not counted against the
+// server's. With envClientURL set the binary runs the client and exits
+// instead of running tests, so no Test function needs to skip.
+func TestMain(m *testing.M) {
+	if base := os.Getenv(envClientURL); base != "" {
+		os.Exit(runHelperWHEPClient(base))
 	}
+	os.Exit(m.Run())
+}
+
+// helperTB adapts the helper process to the testing.TB newOfferClient takes:
+// failures end the process, cleanups run on exit.
+type helperTB struct {
+	testing.TB
+	cleanups []func()
+}
+
+func (h *helperTB) Helper()                           {}
+func (h *helperTB) Cleanup(f func())                  { h.cleanups = append(h.cleanups, f) }
+func (h *helperTB) Fatal(args ...any)                 { h.fail(fmt.Sprint(args...)) }
+func (h *helperTB) Fatalf(format string, args ...any) { h.fail(fmt.Sprintf(format, args...)) }
+func (h *helperTB) fail(msg string) {
+	fmt.Fprintln(os.Stderr, "helper client:", msg)
+	os.Exit(1)
+}
+
+// runHelperWHEPClient is the viewer child process. It prints "ready" once
+// video flows and returns when stdin closes.
+func runHelperWHEPClient(base string) int {
+	t := &helperTB{}
+	defer func() {
+		for _, f := range t.cleanups {
+			f()
+		}
+	}()
 	c, offer := newOfferClient(t, false)
 	req, _ := http.NewRequest(http.MethodPost, base+"/live/bench", strings.NewReader(offer))
 	req.Header.Set("Content-Type", "application/sdp")
@@ -66,7 +95,7 @@ func TestHelperWHEPClient(t *testing.T) {
 				os.Stdout.WriteString("ready\n")
 			}
 		case <-stdinClosed:
-			return
+			return 0
 		case <-time.After(60 * time.Second):
 			t.Fatal("helper client timed out")
 		}
@@ -139,7 +168,7 @@ func BenchmarkViewerMemory(b *testing.B) {
 		before, sysBefore := heapNow()
 		var afterFirst uint64
 		for i := 0; i < benchViewers; i++ {
-			cmd := exec.Command(os.Args[0], "-test.run=^TestHelperWHEPClient$", "-test.count=1")
+			cmd := exec.Command(os.Args[0])
 			cmd.Env = append(os.Environ(), envClientURL+"="+ts.http.URL, envClientToken+"="+ts.token)
 			in, _ := cmd.StdinPipe()
 			out, _ := cmd.StdoutPipe()

@@ -264,12 +264,17 @@ client on loopback (ephemeral ports only): `TestWHEPOfferAnswerDeliversVideo` (H
 `TestWHEPNoAudioTrackWhenCameraHasNone`, `TestWHEPAuth` (401, no pion session created),
 `TestWHEPMaxViewers` (503), `TestWHEPDeleteEndsSession`, `TestWHEPUnknownCamera404`,
 `TestWHEPWrongContentType415`, `TestWHEPBodyLimit413`, `TestWHEPBadOffer400`,
-`TestViewerLagResyncsAtIDR`, `TestSessionClosedOnICEDisconnect` (peer closes, slot freed),
+`TestViewerLagResyncsAtIDR`, `TestSessionClosedOnICEDisconnect` (peer closes DTLS, slot freed),
+`TestSessionClosedWhenPeerGoesSilent` (client socket closed without a DTLS close; ICE timeouts shortened
+through the `iceDisconnected`/`iceFailed` variables), `TestICETimeoutsClosePeerWithin30Seconds`
+(defaults sum to 30 s), `TestServerCloseDuringNegotiation` (Close during an in-flight POST, under
+`-race`), `TestWHEPDisabledWithZeroMaxViewers` (503), `TestWHEPRejectsH265With501`,
+`TestPeerThatNeverConnectsIsClosedAfterTimeout` (fake clock), `TestNewServerValidation`/`Defaults`,
 `TestServerCloseEndsSessions`. `BenchmarkViewerMemory` (four viewer processes at 400 KiB/s) measured
 about 2.2 MiB of heap and stacks per added viewer (2.27 to 2.36 MB across three runs), so
 `config.LivePerViewerBytes` is now 3 MiB and design §8.1 says so. Not covered: a real browser, a
-real camera, ICE across the tailnet, and the 30 s no-traffic timeout (the ICE failed timeout is
-30 s; only the peer-closed path is tested).
+real camera, and ICE across the tailnet. The 30 s silent-peer timeout is tested only with shortened
+ICE timeouts; the production values (5 s disconnected + 25 s failed) are not waited out.
 
 **Manual steps:**
 1. On the Mac mini, with zrelay running against the Tapo C220, `live.advertise_ip` set to the

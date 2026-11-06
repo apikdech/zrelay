@@ -8,6 +8,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
+	"github.com/apikdech/zrelay-v2/internal/clock"
 	"github.com/apikdech/zrelay-v2/internal/relay/camera"
 )
 
@@ -57,6 +58,7 @@ func (v *viewer) run() {
 			// The Hub resumes this subscriber at an IDR with a fresh
 			// session or after a lag; DTS may restart from 0.
 			v.haveDTS = false
+			v.haveTS = false
 		case camera.EventVideo:
 			v.writeVideo(ev.AU)
 		case camera.EventAudio:
@@ -139,10 +141,10 @@ type session struct {
 	srv    *Server
 	id     string
 	camera string
-	pc     *webrtc.PeerConnection
 	done   chan struct{}
 
 	mu      sync.Mutex
+	pc      *webrtc.PeerConnection // set by attach; guarded by mu
 	stopped bool
 	started bool
 	sub     *camera.Sub
@@ -185,6 +187,7 @@ func (sess *session) stop() {
 		sess.mu.Lock()
 		sess.stopped = true
 		sub := sess.sub
+		pc := sess.pc // attach refuses a pc after this point; its caller closes it
 		sess.mu.Unlock()
 		close(sess.done)
 		if sub != nil {
@@ -193,16 +196,34 @@ func (sess *session) stop() {
 		// pc.Close waits for pion callbacks, one of which may be calling us.
 		go func() {
 			defer s.wg.Done()
-			if sess.pc != nil {
-				_ = sess.pc.Close()
+			if pc != nil {
+				_ = pc.Close()
 			}
 		}()
 	})
 }
 
-// watchConnect closes the session if the peer never connects.
-func (sess *session) watchConnect() {
-	t := sess.srv.cfg.Clock.NewTimer(connectTimeout)
+// attach records pc as the session's peer connection. It reports false when
+// the session was already stopped, in which case the caller owns pc.
+func (sess *session) attach(pc *webrtc.PeerConnection) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.stopped {
+		return false
+	}
+	sess.pc = pc
+	return true
+}
+
+func (sess *session) isStopped() bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.stopped
+}
+
+// watchConnect closes the session if the peer never connects. The caller
+// creates t, so the deadline is fixed before the answer is sent.
+func (sess *session) watchConnect(t clock.Timer) {
 	defer t.Stop()
 	select {
 	case <-t.C():

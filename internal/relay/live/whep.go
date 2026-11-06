@@ -84,13 +84,22 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	answer, status, err := s.negotiate(sess, string(body))
 	if err != nil {
+		if sess.isStopped() {
+			// Close ran while we negotiated: a shutdown, not a bad offer.
+			status, err = http.StatusServiceUnavailable, errShuttingDown
+		}
 		sess.stop()
 		s.log().Warn("WHEP negotiation failed", "camera", camID, "err", err)
 		http.Error(w, "negotiation failed", status)
 		return
 	}
-	go sess.watchConnect()
-	s.log().Info("viewer connected", "camera", camID, "session", id)
+	if sess.isStopped() {
+		sess.stop()
+		http.Error(w, errShuttingDown.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	go sess.watchConnect(s.cfg.Clock.NewTimer(connectTimeout))
+	s.log().Info("offer answered", "camera", camID, "session", id)
 
 	w.Header().Set("Content-Type", "application/sdp")
 	w.Header().Set("Location", "/live/"+url.PathEscape(camID)+"/"+id)
@@ -129,7 +138,10 @@ func (s *Server) negotiate(sess *session, offer string) (string, int, error) {
 	if err != nil {
 		return "", http.StatusInternalServerError, err
 	}
-	sess.pc = pc
+	if !sess.attach(pc) {
+		_ = pc.Close()
+		return "", http.StatusServiceUnavailable, errShuttingDown
+	}
 
 	// No fmtp: the track binds to whichever H.264 entry the browser accepted.
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000}, "video", "camera")
@@ -155,6 +167,7 @@ func (s *Server) negotiate(sess *session, offer string) (string, int, error) {
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		switch st {
 		case webrtc.PeerConnectionStateConnected:
+			s.log().Info("viewer connected", "camera", sess.camera, "session", sess.id)
 			sess.start(videoTrack, audio, audioCodec)
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			sess.stop()
@@ -172,9 +185,11 @@ func (s *Server) negotiate(sess *session, offer string) (string, int, error) {
 	if err := pc.SetLocalDescription(answer); err != nil {
 		return "", http.StatusInternalServerError, err
 	}
+	gatherTimer := s.cfg.Clock.NewTimer(gatherTimeout)
+	defer gatherTimer.Stop()
 	select {
 	case <-gathered:
-	case <-time.After(gatherTimeout):
+	case <-gatherTimer.C():
 		return "", http.StatusInternalServerError, errors.New("ICE gathering timed out")
 	}
 	return pc.LocalDescription().SDP, 0, nil

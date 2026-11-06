@@ -34,10 +34,15 @@ const (
 	audioFreshness = 5 * time.Second
 	// connectTimeout closes a session whose peer never connects.
 	connectTimeout = 30 * time.Second
-	// ICE timeouts: a peer silent for iceFailed (no media, RTCP or ICE
-	// consent traffic) is gone and its session is closed (design §5.1).
+)
+
+// ICE timeouts, variables so tests can shorten them. pion fails an agent
+// iceFailed after it was marked disconnected, so a peer that goes silent is
+// closed iceDisconnected + iceFailed = 30 s after its last traffic (no media,
+// RTCP or consent check), as design §5.1 requires.
+var (
 	iceDisconnected = 5 * time.Second
-	iceFailed       = 30 * time.Second
+	iceFailed       = 25 * time.Second
 	iceKeepAlive    = 2 * time.Second
 )
 
@@ -106,15 +111,17 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.MaxViewers == 0 {
 		return s, nil
 	}
+	for id, hub := range cfg.Hubs {
+		if hub == nil {
+			return nil, fmt.Errorf("live: camera %q has no hub", id)
+		}
+	}
 	api, err := s.newAPI()
 	if err != nil {
 		return nil, err
 	}
 	s.api = api
-	for id, hub := range cfg.Hubs {
-		if hub == nil {
-			return nil, fmt.Errorf("live: camera %q has no hub", id)
-		}
+	for _, hub := range cfg.Hubs {
 		s.watchers = append(s.watchers, newAudioWatcher(hub, cfg.Clock))
 	}
 	return s, nil
@@ -211,15 +218,6 @@ func (s *Server) newAPI() (*webrtc.API, error) {
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se)), nil
 }
 
-// ICEAddr returns the address of the shared ICE UDP socket, or nil when
-// live view is disabled.
-func (s *Server) ICEAddr() net.Addr {
-	if s.conn == nil {
-		return nil
-	}
-	return s.conn.LocalAddr()
-}
-
 // Viewers returns how many sessions camera has, counting those still
 // negotiating.
 func (s *Server) Viewers(camera string) int {
@@ -264,7 +262,7 @@ func (s *Server) reserve(camera, id string) (*session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, errors.New("live view is shutting down")
+		return nil, errShuttingDown
 	}
 	if len(s.sessions) >= s.cfg.MaxViewers {
 		return nil, errMaxViewers
@@ -275,7 +273,10 @@ func (s *Server) reserve(camera, id string) (*session, error) {
 	return sess, nil
 }
 
-var errMaxViewers = errors.New("maximum number of viewers reached")
+var (
+	errMaxViewers   = errors.New("maximum number of viewers reached")
+	errShuttingDown = errors.New("live view is shutting down")
+)
 
 // lookup returns the session id of camera, if any.
 func (s *Server) lookup(camera, id string) *session {

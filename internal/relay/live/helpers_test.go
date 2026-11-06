@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -137,8 +138,14 @@ type testServer struct {
 
 func newTestServer(t testing.TB, hubs map[string]*camera.Hub, maxViewers int) *testServer {
 	t.Helper()
+	return newTestServerWith(t, hubs, maxViewers, nil)
+}
+
+// newTestServerWith is newTestServer with a hook to adjust the Config.
+func newTestServerWith(t testing.TB, hubs map[string]*camera.Hub, maxViewers int, adjust func(*Config)) *testServer {
+	t.Helper()
 	ver, token := testToken(t)
-	s, err := NewServer(Config{
+	cfg := Config{
 		Listen:      "127.0.0.1:0",
 		AdvertiseIP: "127.0.0.1",
 		MaxViewers:  maxViewers,
@@ -146,7 +153,11 @@ func newTestServer(t testing.TB, hubs map[string]*camera.Hub, maxViewers int) *t
 		Hubs:        hubs,
 		ViewerQueue: 64,
 		Clock:       clock.Real,
-	})
+	}
+	if adjust != nil {
+		adjust(&cfg)
+	}
+	s, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -165,6 +176,13 @@ type offerClient struct {
 
 func newOfferClient(t testing.TB, wantAudio bool) (*offerClient, string) {
 	t.Helper()
+	return newOfferClientOn(t, wantAudio, nil)
+}
+
+// newOfferClientOn is newOfferClient with all ICE traffic on conn, so a test
+// can silence the client by closing conn without closing the peer connection.
+func newOfferClientOn(t testing.TB, wantAudio bool, conn net.PacketConn) (*offerClient, string) {
+	t.Helper()
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		t.Fatal(err)
@@ -173,6 +191,9 @@ func newOfferClient(t testing.TB, wantAudio bool) (*offerClient, string) {
 	se.SetIncludeLoopbackCandidate(true)
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	if conn != nil {
+		se.SetICEUDPMux(webrtc.NewICEUDPMux(nil, conn))
+	}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
