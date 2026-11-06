@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DashClient, FakePlayer, fakePlayerFactory, ids, sidecar } from '../../test-support/dashboard-fakes';
 import type { Request } from '../worker/protocol';
@@ -50,14 +50,17 @@ function client(): DashClient {
 const mountPage = (c: DashClient) =>
   render(Page, { client: c, factory: fakePlayerFactory, zone: 'Asia/Jakarta', nowMs: NOW, profile: 'desktop' });
 
-const selected = () => screen.queryByRole('option', { selected: true })?.getAttribute('data-clip') ?? null;
+// The camera and trigger <select>s have <option>s too: look only inside the recordings list.
+const list = () => within(screen.getByRole('listbox', { name: /recordings/i }));
+const listRows = async () => within(await screen.findByRole('listbox', { name: /recordings/i })).findAllByRole('option');
+const selected = () => list().queryByRole('option', { selected: true })?.getAttribute('data-clip') ?? null;
 const getsFor = (c: DashClient, path: string) =>
   c.calls.filter((m): m is Extract<Request, { type: 'api.get' }> => m.type === 'api.get' && m.path === path);
 
 describe('timeline dashboard', () => {
   it('lists the day newest first, in local time', async () => {
     mountPage(client());
-    const rows = await screen.findAllByRole('option');
+    const rows = await listRows();
     expect(rows.map((r) => r.getAttribute('data-clip'))).toEqual([ids.c, ids.b, ids.a]);
     // 12:00Z is 19:00 in Jakarta.
     expect(rows[0]).toHaveTextContent('19:00:00');
@@ -66,7 +69,7 @@ describe('timeline dashboard', () => {
   it('asks for the Jakarta day in UTC', async () => {
     const c = client();
     mountPage(c);
-    await screen.findAllByRole('option');
+    await listRows();
     expect(getsFor(c, '/api/v1/clips')[0]!.query).toMatchObject({
       from: '2026-11-05T17:00:00.000Z',
       to: '2026-11-06T17:00:00.000Z',
@@ -75,7 +78,7 @@ describe('timeline dashboard', () => {
 
   it('K selects the next clip and J the previous one', async () => {
     mountPage(client());
-    await screen.findAllByRole('option');
+    await listRows();
     expect(selected()).toBeNull();
     await fireEvent.keyDown(window, { key: 'k' }); // nothing selected: the newest
     expect(selected()).toBe(ids.c);
@@ -92,7 +95,7 @@ describe('timeline dashboard', () => {
 
   it('ignores the shortcuts while typing in a field', async () => {
     mountPage(client());
-    await screen.findAllByRole('option');
+    await listRows();
     const date = screen.getByLabelText('Date');
     await fireEvent.keyDown(date, { key: 'k' });
     expect(selected()).toBeNull();
@@ -100,7 +103,7 @@ describe('timeline dashboard', () => {
 
   it('selecting a row loads that clip', async () => {
     mountPage(client());
-    const rows = await screen.findAllByRole('option');
+    const rows = await listRows();
     await fireEvent.click(rows[1]!);
     expect(selected()).toBe(ids.b);
     await waitFor(() => expect(FakePlayer.instances[0]?.loads).toEqual([ids.b]));
@@ -122,7 +125,7 @@ describe('timeline dashboard', () => {
     const c = client();
     c.failStatus = true;
     mountPage(c);
-    await screen.findAllByRole('option');
+    await listRows();
     await waitFor(() => expect(screen.getByRole('img', { name: /relay/i }).dataset.level).toBe('unknown'));
   });
 
@@ -133,7 +136,7 @@ describe('timeline dashboard', () => {
       { id: 'yard', name: 'Yard' },
     ];
     mountPage(c);
-    await screen.findAllByRole('option');
+    await listRows();
     await fireEvent.change(screen.getByLabelText('Camera'), { target: { value: 'yard' } });
     await fireEvent.change(screen.getByLabelText('Trigger'), { target: { value: 'person' } });
     await waitFor(() => {
@@ -145,7 +148,7 @@ describe('timeline dashboard', () => {
   it('re-queries for another day', async () => {
     const c = client();
     mountPage(c);
-    await screen.findAllByRole('option');
+    await listRows();
     await fireEvent.change(screen.getByLabelText('Date'), { target: { value: '2026-11-05' } });
     await waitFor(() => {
       expect(getsFor(c, '/api/v1/clips').at(-1)!.query).toMatchObject({
@@ -175,14 +178,14 @@ describe('timeline dashboard', () => {
     const c = client();
     c.clips = [sidecar(ids.a, '2026-11-06T10:00:00Z', { status: 'incomplete', end_time: null, duration_ms: null })];
     mountPage(c);
-    const row = await screen.findByRole('option');
+    const row = (await listRows())[0]!;
     expect(row.querySelector('[data-integrity="incomplete"]')).not.toBeNull();
   });
 
   it('records the integrity the player reports in the list', async () => {
     FakePlayer.nextIntegrity = 'tampered';
     mountPage(client());
-    const rows = await screen.findAllByRole('option');
+    const rows = await listRows();
     await fireEvent.click(rows[0]!);
     await waitFor(() => expect(rows[0]!.querySelector('[data-integrity="tampered"]')).not.toBeNull());
   });
@@ -190,7 +193,7 @@ describe('timeline dashboard', () => {
   it('locks the key from the menu', async () => {
     const c = client();
     mountPage(c);
-    await screen.findAllByRole('option');
+    await listRows();
     await fireEvent.click(screen.getByRole('button', { name: 'Lock' }));
     expect(c.calls.some((m) => m.type === 'key.lock')).toBe(true);
   });

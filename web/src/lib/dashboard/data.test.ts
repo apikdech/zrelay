@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Request } from '../../worker/protocol';
 import type { Sidecar } from '../../worker/schemas';
-import { ASSUMED_MAX_CLIP_MS, loadDay, toCoverage, toTimelineClip } from './data';
+import { ASSUMED_MAX_CLIP_MS, loadDay, localDayOf, toCoverage, toTimelineClip } from './data';
 
 const clip = (over: Partial<Sidecar> = {}): Sidecar =>
   ({
@@ -108,5 +108,13 @@ describe('loadDay', () => {
     };
     const out = await loadDay(c, { day: '2026-11-06', zone: 'UTC', camera: '', trigger: '', cameras: ['a'] });
     expect(out.coverage).toEqual([]);
+  });
+});
+
+describe('localDayOf', () => {
+  it('is the calendar day in the zone, not in UTC', () => {
+    expect(localDayOf(Date.UTC(2026, 10, 6, 17, 0, 0), 'Asia/Jakarta')).toBe('2026-11-07');
+    expect(localDayOf(Date.UTC(2026, 10, 6, 16, 59, 59), 'Asia/Jakarta')).toBe('2026-11-06');
+    expect(localDayOf(Date.UTC(2026, 10, 6, 17, 0, 0), 'UTC')).toBe('2026-11-06');
   });
 });

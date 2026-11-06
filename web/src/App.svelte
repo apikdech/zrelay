@@ -1,17 +1,18 @@
 <script lang="ts">
   import Onboarding from './routes/onboarding/Onboarding.svelte';
+  import TimelinePage from './routes/+page.svelte';
   import LivePage from './routes/live/+page.svelte';
   import DemoPage from './routes/demo/+page.svelte';
 
-  // Top-level views (design §7.2). Timeline joins them when its page lands.
+  // Top-level views (design §7.2). The timeline is the home view.
   // `#/demo?clip=<id>` is the playback engine's demo page.
-  const views = { '#/live': 'Live', '#/demo': 'Demo', '#/key': 'Key' } as const;
+  const views = { '#/timeline': 'Timeline', '#/live': 'Live', '#/demo': 'Demo', '#/key': 'Key' } as const;
   type Hash = keyof typeof views;
 
   /** The route part of the hash, without its query. */
   const route = (): Hash => {
     const r = location.hash.split('?')[0];
-    return r === '#/live' || r === '#/demo' ? r : '#/key';
+    return r === '#/live' || r === '#/demo' || r === '#/key' ? r : '#/timeline';
   };
   const clip = (): string => new URLSearchParams(location.hash.split('?')[1] ?? '').get('clip') ?? '';
 
@@ -36,6 +37,8 @@
   <LivePage />
 {:else if hash === '#/demo'}
   <DemoPage {clipId} />
-{:else}
+{:else if hash === '#/key'}
   <Onboarding />
+{:else}
+  <TimelinePage />
 {/if}

@@ -9,7 +9,15 @@ import ExportDialog from './ExportDialog.svelte';
 import IntegrityBadge from './IntegrityBadge.svelte';
 import Player from './Player.svelte';
 
+// jsdom has no ResizeObserver; `bind:clientHeight` needs one.
+class FakeResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
 beforeEach(() => {
+  globalThis.ResizeObserver = FakeResizeObserver as unknown as typeof ResizeObserver;
   FakePlayer.instances = [];
   FakePlayer.nextIntegrity = 'verified';
   HTMLMediaElement.prototype.play = () => Promise.resolve();
@@ -34,7 +42,7 @@ describe('EventList', () => {
     const rows = screen.getAllByRole('option');
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.length).toBeLessThan(60);
-    expect(screen.getByRole('listbox')).toHaveAttribute('aria-rowcount', '5000');
+    expect(rows[0]).toHaveAttribute('aria-setsize', '5000');
   });
 
   it('renders further rows after scrolling, newest first', async () => {
@@ -44,8 +52,9 @@ describe('EventList', () => {
     list.scrollTop = 56 * 2000;
     await fireEvent.scroll(list);
     const first = within(list).getAllByRole('option')[0]!;
-    expect(Number(first.getAttribute('aria-rowindex'))).toBeGreaterThan(1900);
-    expect(first.dataset.clip).toBe('id3000');
+    expect(Number(first.getAttribute('aria-posinset'))).toBeGreaterThan(1900);
+    // The window starts a few rows above the viewport; rows stay in newest-first order.
+    expect(first.dataset.clip).toBe(`id${5000 - (Number(first.getAttribute('aria-posinset')) - 1)}`);
   });
 
   it('shows local time in the zone, camera, trigger glyphs, duration and the integrity badge', () => {
@@ -139,7 +148,7 @@ describe('ExportDialog', () => {
 describe('Player', () => {
   const props = (over: Record<string, unknown> = {}) => ({
     client: { call: async () => ({}) } as never,
-    target: { clipId: ids.a, offsetMs: 0, n: 1 },
+    cue: { clipId: ids.a, offsetMs: 0, n: 1 },
     factory: fakePlayerFactory,
     zone: 'Asia/Jakarta',
     profile: 'desktop' as const,
@@ -152,14 +161,14 @@ describe('Player', () => {
   });
 
   it('seeks to the offset after loading', async () => {
-    render(Player, props({ target: { clipId: ids.a, offsetMs: 12_000, n: 1 } }));
+    render(Player, props({ cue: { clipId: ids.a, offsetMs: 12_000, n: 1 } }));
     await waitFor(() => expect(FakePlayer.instances[0]?.seeks).toEqual([12_000]));
   });
 
   it('seeks within the loaded clip instead of reloading it', async () => {
     const { rerender } = render(Player, props());
     await waitFor(() => expect(FakePlayer.instances[0]?.loads).toHaveLength(1));
-    await rerender(props({ target: { clipId: ids.a, offsetMs: 30_000, n: 2 } }));
+    await rerender(props({ cue: { clipId: ids.a, offsetMs: 30_000, n: 2 } }));
     await waitFor(() => expect(FakePlayer.instances[0]?.seeks).toEqual([30_000]));
     expect(FakePlayer.instances[0]?.loads).toHaveLength(1);
   });
@@ -179,7 +188,7 @@ describe('Player', () => {
   });
 
   it('keeps export disabled while verifying', () => {
-    render(Player, props({ target: null }));
+    render(Player, props({ cue: null }));
     expect(screen.getByRole('button', { name: 'Export' })).toBeDisabled();
   });
 
@@ -215,6 +224,55 @@ describe('Player', () => {
     const s: PlayerState = { ...initialState(), clipId: ids.a, integrity: 'tampered', failedAtMs: 83_000 };
     FakePlayer.instances[0]!.emit(s);
     expect(await screen.findByRole('alert')).toHaveTextContent('failed verification at ~01:23');
+  });
+
+  it('exports through the confirmation, then restores the playing clip', async () => {
+    const written: number[] = [];
+    const calls: string[] = [];
+    const client = {
+      call: async (m: { type: string; chunk?: number }) => {
+        calls.push(m.type);
+        if (m.type === 'clip.open') return { numChunks: 2, plaintextSizeBytes: 8 };
+        if (m.type === 'clip.read') return { plaintext: new Uint8Array(4).fill((m.chunk ?? 0) + 1).buffer, final: m.chunk === 1 };
+        return {};
+      },
+    };
+    const env = {
+      isIOS: false,
+      showSaveFilePicker: async () => ({
+        createWritable: async () => ({
+          write: async (b: Uint8Array) => void written.push(b[0]!),
+          close: async () => {},
+          abort: async () => {},
+        }),
+      }),
+      download: () => {},
+    };
+    render(Player, props({ client, env }));
+    const btn = await screen.findByRole('button', { name: 'Export' });
+    await waitFor(() => expect(btn).toBeEnabled());
+    await fireEvent.click(btn);
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(written).toEqual([1, 2]);
+    // The export replaced the worker's session for this clip, so the player opens it again.
+    await waitFor(() => expect(FakePlayer.instances[0]!.loads).toEqual([ids.a, ids.a]));
+  });
+
+  it('keeps the dialog open with the reason when the export fails', async () => {
+    const client = {
+      call: async (m: { type: string }) => {
+        if (m.type === 'clip.open') throw new Error('network down');
+        return {};
+      },
+    };
+    const env = { isIOS: false, download: () => {} };
+    render(Player, props({ client, env }));
+    const btn = await screen.findByRole('button', { name: 'Export' });
+    await waitFor(() => expect(btn).toBeEnabled());
+    await fireEvent.click(btn);
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('dialog')).toHaveTextContent(/network down/);
   });
 
   it('destroys the engine on unmount', async () => {

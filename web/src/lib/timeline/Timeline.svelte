@@ -30,12 +30,14 @@
     zone?: string;
     /** Test hook and "now" override; defaults to the wall clock. */
     nowMs?: number;
+    /** A clip selected from outside (list, keyboard): drawn highlighted. */
+    selectedClipId?: string | null;
     onSelect: (clipId: string, offsetMs: number) => void;
     /** Reports the CPU cost (ms) of each drawn frame. */
     onFrame?: (ms: number) => void;
   }
 
-  let { cameras, clips, coverage, day, zone = browserZone(), nowMs, onSelect, onFrame }: Props = $props();
+  let { cameras, clips, coverage, day, zone = browserZone(), nowMs, selectedClipId, onSelect, onFrame }: Props = $props();
 
   const range = $derived(localDayRange(day, zone));
   // Plain copies: reading a deep reactive proxy for every clip on every frame is slow.
@@ -97,6 +99,13 @@
     sched?.invalidate();
   });
 
+  // A selection made elsewhere repaints with the highlight.
+  $effect(() => {
+    if (selectedClipId === undefined) return;
+    selectedId = selectedClipId;
+    sched?.invalidate();
+  });
+
   // Any change of data repaints.
   $effect(() => {
     void [data, nowMs, zone];
@@ -132,6 +141,18 @@
   function setView(v: View): void {
     view = v;
     sched?.invalidate();
+  }
+
+  /** Zooms to the next preset span in or out, around the current time if it is on screen, else the view's centre. */
+  export function stepZoom(dir: 'in' | 'out'): void {
+    const now = currentNow();
+    const onScreen = now >= view.startMs && now <= view.startMs + view.spanMs;
+    setView(stepPreset(view, dir, onScreen ? now : view.startMs + view.spanMs / 2, range));
+  }
+
+  /** Centres the view on the current time (clamped to the day). */
+  export function jumpToNow(): void {
+    setView(panBy(view, currentNow() - view.spanMs / 2 - view.startMs, range));
   }
 
   function local(e: { clientX: number; clientY: number }): { x: number; y: number } {
