@@ -89,11 +89,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 
 	idx := zview.NewIndex(store, cfg.Index, clock.Real)
 	// The live proxy (design §7.1) forwards WHEP signaling to zrelay.
-	verifier, err := bearer.New(cfg.Server.APITokenSHA256)
-	if err != nil {
-		fmt.Fprintf(stderr, "zview-server: %v\n", err)
-		return exitInvalid
-	}
+	// LoadConfig has already validated the hashes, so bearer.New cannot fail.
+	verifier, _ := bearer.New(cfg.Server.APITokenSHA256)
 	handler := zview.NewServer(cfg, idx, store, zview.NewLiveProxy(cfg.Live.Upstream, verifier))
 
 	ln, err := net.Listen("tcp", cfg.Server.Listen)

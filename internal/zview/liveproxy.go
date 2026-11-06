@@ -45,8 +45,6 @@ func NewLiveProxy(upstream string, v *bearer.Verifier) http.Handler {
 	}
 	basePath := strings.TrimRight(target.EscapedPath(), "/")
 
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = liveHeaderTimeout
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
@@ -58,10 +56,10 @@ func NewLiveProxy(upstream string, v *bearer.Verifier) http.Handler {
 				}
 			}
 		},
-		Transport: tr,
+		Transport: newLiveTransport(),
 		ModifyResponse: func(resp *http.Response) error {
 			if loc := resp.Header.Get("Location"); loc != "" {
-				resp.Header.Set("Location", proxyLocation(loc, basePath))
+				resp.Header.Set("Location", proxyLocation(loc, resp.Request.URL, basePath))
 			}
 			return nil
 		},
@@ -114,12 +112,26 @@ func NewLiveProxy(upstream string, v *bearer.Verifier) http.Handler {
 	return mux
 }
 
+// newLiveTransport returns the upstream transport. It never uses a proxy
+// from the environment: the offer and the forwarded K_api go straight to
+// zrelay.
+func newLiveTransport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = nil
+	tr.ResponseHeaderTimeout = liveHeaderTimeout
+	return tr
+}
+
 // proxyLocation turns the upstream's Location into the proxy's path: scheme,
-// host and the upstream's own path prefix are dropped.
-func proxyLocation(loc, basePath string) string {
+// host and the upstream's own path prefix are dropped. A relative reference
+// is first resolved against reqURL, the URL the proxy requested.
+func proxyLocation(loc string, reqURL *url.URL, basePath string) string {
 	u, err := url.Parse(loc)
 	if err != nil {
 		return "/live/"
+	}
+	if reqURL != nil {
+		u = reqURL.ResolveReference(u)
 	}
 	p := u.EscapedPath()
 	if basePath != "" && strings.HasPrefix(p, basePath+"/") {

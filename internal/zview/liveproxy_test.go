@@ -173,6 +173,11 @@ func TestLiveProxyRewritesLocation(t *testing.T) {
 		{"relative", "/live/front/sess1", "/live/front/sess1"},
 		{"absolute internal URL", up.srv.URL + "/live/front/sess1", "/live/front/sess1"},
 		{"absolute with port and escaping", "http://zrelay:9465/live/a%20b/sess1", "/live/a%20b/sess1"},
+		// Relative references resolve against the outgoing request URL
+		// (/live/front), as a client would resolve them against the upstream.
+		{"relative reference with a camera segment", "front/sess1", "/live/front/sess1"},
+		{"relative reference of one segment", "sess1", "/live/sess1"},
+		{"dot-dot relative reference", "../live/front/sess1", "/live/front/sess1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			up.setRespond(func(w http.ResponseWriter, _ *http.Request) {
@@ -381,5 +386,23 @@ func TestLiveProxyMountedInServer(t *testing.T) {
 	rec = proxyDo(h, "POST", "/live/front", hdr, "application/sdp", strings.NewReader(sdpOffer))
 	if rec.Code != http.StatusCreated || rec.Header().Get("Location") != "/live/front/sess1" {
 		t.Fatalf("status = %d, Location = %q", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+func TestLiveTransportIgnoresProxyEnvironment(t *testing.T) {
+	// The offer and the forwarded K_api must go straight to zrelay, never to
+	// a proxy named in the container environment. http.ProxyFromEnvironment
+	// reads the environment once per process and skips loopback hosts, so the
+	// transport is checked directly instead of through a round trip.
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:3128")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+	t.Setenv("http_proxy", "http://127.0.0.1:3128")
+	t.Setenv("https_proxy", "http://127.0.0.1:3128")
+	tr := newLiveTransport()
+	if tr.Proxy != nil {
+		t.Fatal("live transport has a Proxy func; it must dial the upstream directly")
+	}
+	if tr.ResponseHeaderTimeout != liveHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, liveHeaderTimeout)
 	}
 }

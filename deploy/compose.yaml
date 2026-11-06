@@ -14,6 +14,10 @@
 #   secrets/s3_ro_secret_key zview-server's read-only MinIO secret key
 #                            (.env also needs S3_RO_ACCESS_KEY)
 #
+# .env is passed to zrelay whole (env_file). zview-server gets only
+# S3_ENDPOINT and S3_RO_ACCESS_KEY, interpolated from .env by compose, so the
+# camera, restream and relay S3 credentials never enter its environment.
+#
 # Inside the container, zrelay.yaml must set relay.http_listen to
 # "0.0.0.0:9464" for the loopback-only publish below to reach /metrics;
 # the host side stays bound to 127.0.0.1. live.listen (9465) is not
@@ -57,7 +61,12 @@ services:
     image: zview:local
     restart: unless-stopped
     read_only: true
-    env_file: .env
+    # Only what zview.yaml references. It must not get .env wholesale: that
+    # holds the camera and restream passwords and the relay's S3 key, none of
+    # which a network-facing, read-only viewer may reach.
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:?S3_ENDPOINT is unset in deploy/.env}
+      S3_RO_ACCESS_KEY: ${S3_RO_ACCESS_KEY:?S3_RO_ACCESS_KEY is unset in deploy/.env}
     configs:
       - source: zview_config
         target: /etc/zview/zview.yaml
