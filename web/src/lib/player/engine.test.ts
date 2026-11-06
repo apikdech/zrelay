@@ -921,9 +921,9 @@ describe('seek sequences over the fixture layout (2 s fragments at mid-chunk off
     }
   }
 
-  async function rig(hold: number[] = []) {
+  async function rig(hold: number[] = [], webkit = false) {
     env.restore();
-    env = installMedia({ mms: false, layout: L });
+    env = installMedia({ mms: false, layout: L, webkit });
     const c = new FakeClient({ open: layoutOpen(L) });
     const { p } = make(c, 'mobile');
     await p.load(CLIP);
@@ -986,8 +986,8 @@ describe('seek sequences over the fixture layout (2 s fragments at mid-chunk off
     }
   }
 
-  async function execute(label: string, ops: Op[], hold: number[]) {
-    const { c, p } = await rig(hold);
+  async function execute(label: string, ops: Op[], hold: number[], webkit: boolean) {
+    const { c, p } = await rig(hold, webkit);
     const pending: Promise<void>[] = [];
     const { target, marker } = await run(c, p, ops, pending);
     c.releaseAll();
@@ -1037,10 +1037,14 @@ describe('seek sequences over the fixture layout (2 s fragments at mid-chunk off
     ['seek to the last fragment, then back', [{ k: 'seek', t: 119_000 }, { k: 'wait' }, { k: 'seek', t: 4000 }], [fragChunk(119_000)]],
   ];
 
+  // Every sequence runs twice: once with buffered time per whole fragment, once the way WebKit reports it
+  // (a part-appended fragment already counts as buffered).
   for (const [name, ops, hold] of table) {
-    it(name, async () => {
-      await execute(name, ops, hold);
-    });
+    for (const webkit of [false, true]) {
+      it(`${name}${webkit ? ' (WebKit)' : ''}`, async () => {
+        await execute(name, ops, hold, webkit);
+      });
+    }
   }
 
   it('the playhead plays on from the resume point: contiguous past 30 s, 30 s ahead, never to the clip end', async () => {
@@ -1128,79 +1132,84 @@ describe('seek sequences over the fixture layout (2 s fragments at mid-chunk off
     expect(holding(2)).toBeUndefined();
   }
 
-  it('a fetch seek whose fragment spans chunks sets currentTime only once the fragment is buffered', async () => {
-    expect(spansChunks(2000)).toBe(true);
-    const f = fragChunk(2000);
-    const { c, p } = await rig();
-    await playToEnd(c);
-    const before = sb().appends.length;
-    c.hold.add(f + 1);
-    env.video.currentTime = 118;
-    const s = p.seek(2000);
-    await until(() => sb().appends.length > before, 'first chunk of the fragment appended');
-    await tick(50);
-    // The fragment is still partial: the playhead stays where it was, and the seek has not resolved.
-    expect(holding(2)).toBeUndefined();
-    expect(env.video.currentTime).toBe(118);
-    let resolved = false;
-    void s.then(() => (resolved = true));
-    await tick(50);
-    expect(resolved).toBe(false);
-    c.releaseAll();
-    await s;
-    expect(holding(2)).toBeDefined();
-    expect(env.video.currentTime).toBe(2);
-    expect(sb().violations).toEqual([]);
-    p.destroy();
-  });
+  for (const webkit of [false, true]) {
+    const mode = webkit ? 'WebKit reports partial fragments' : 'buffered time per whole fragment';
+    it(`a fetch seek whose fragment spans chunks sets currentTime only once the fragment is buffered (${mode})`, async () => {
+      expect(spansChunks(2000)).toBe(true);
+      const f = fragChunk(2000);
+      const { c, p } = await rig([], webkit);
+      await playToEnd(c);
+      const before = sb().appends.length;
+      c.hold.add(f + 1);
+      env.video.currentTime = 118;
+      const s = p.seek(2000);
+      await until(() => sb().appends.length > before, 'first chunk of the fragment appended');
+      await tick(50);
+      // The fragment is still partial: the playhead stays where it was, and the seek has not resolved. WebKit
+      // already reports the part of the fragment that was parsed as buffered time; that must not move the playhead.
+      if (webkit) expect(holding(2)![1], 'WebKit shows the partial fragment as buffered').toBeLessThan(4);
+      else expect(holding(2)).toBeUndefined();
+      expect(env.video.currentTime).toBe(118);
+      let resolved = false;
+      void s.then(() => (resolved = true));
+      await tick(50);
+      expect(resolved).toBe(false);
+      c.releaseAll();
+      await s;
+      expect(holding(2)).toBeDefined();
+      expect(env.video.currentTime).toBe(2);
+      expect(sb().violations).toEqual([]);
+      p.destroy();
+    });
 
-  it('after the clip has ended, a backward seek whose first chunk only part-fills the fragment survives a jump of currentTime to the duration', async () => {
-    expect(spansChunks(2000)).toBe(true);
-    const f = fragChunk(2000);
-    const { c, p } = await rig();
-    await playToEnd(c);
-    env.video.currentTime = 118;
-    const reads = c.reads.length;
-    const removes = sb().removes.length;
-    const before = sb().appends.length;
-    c.hold.add(f + 1);
-    const s = p.seek(2000);
-    await until(() => sb().appends.length > before, 'first chunk of the fragment appended');
-    await tick(50);
-    // WebKit settles a seek on the end of the partial range, then reports the end of the clip, with no 'seeking'.
-    env.video.currentTime = 120;
-    env.video.fire('seeked');
-    env.video.fire('timeupdate');
-    await tick(50);
-    c.releaseAll();
-    await settle(c);
-    await s;
-    expect(env.video.currentTime, 'the seek ends at its target').toBe(2);
-    // The same jump after the seek has settled: still not a seek, still no window move towards the end.
-    env.video.currentTime = 120;
-    env.video.fire('timeupdate');
-    await settle(c);
-    expect(holding(2), 'the target is still buffered').toBeDefined();
-    expect(holding(2)![1]).toBeGreaterThanOrEqual(2 + AHEAD);
-    expect(sb().removes.slice(removes).filter(([a, b]) => a <= 3 && b > 2), 'the target is never evicted').toEqual([]);
-    for (const r of c.reads.slice(reads)) expect(r, `read ${r} is beyond the window of 2 s`).toBeLessThanOrEqual(lastChunk(2000 + (AHEAD + 4) * 1000));
-    expect(sb().violations).toEqual([]);
-    p.destroy();
-  });
+    it(`after the clip has ended, a backward seek whose first chunk only part-fills the fragment survives a jump of currentTime to the duration (${mode})`, async () => {
+      expect(spansChunks(2000)).toBe(true);
+      const f = fragChunk(2000);
+      const { c, p } = await rig([], webkit);
+      await playToEnd(c);
+      env.video.currentTime = 118;
+      const reads = c.reads.length;
+      const removes = sb().removes.length;
+      const before = sb().appends.length;
+      c.hold.add(f + 1);
+      const s = p.seek(2000);
+      await until(() => sb().appends.length > before, 'first chunk of the fragment appended');
+      await tick(50);
+      // WebKit settles a seek on the end of the partial range, then reports the end of the clip, with no 'seeking'.
+      env.video.currentTime = 120;
+      env.video.fire('seeked');
+      env.video.fire('timeupdate');
+      await tick(50);
+      c.releaseAll();
+      await settle(c);
+      await s;
+      expect(env.video.currentTime, 'the seek ends at its target').toBe(2);
+      // The same jump after the seek has settled: still not a seek, still no window move towards the end.
+      env.video.currentTime = 120;
+      env.video.fire('timeupdate');
+      await settle(c);
+      expect(holding(2), 'the target is still buffered').toBeDefined();
+      expect(holding(2)![1]).toBeGreaterThanOrEqual(2 + AHEAD);
+      expect(sb().removes.slice(removes).filter(([a, b]) => a <= 3 && b > 2), 'the target is never evicted').toEqual([]);
+      for (const r of c.reads.slice(reads)) expect(r, `read ${r} is beyond the window of 2 s`).toBeLessThanOrEqual(lastChunk(2000 + (AHEAD + 4) * 1000));
+      expect(sb().violations).toEqual([]);
+      p.destroy();
+    });
 
-  it('once the playhead reports a time inside the target\'s range, the window follows it again', async () => {
-    const { c, p } = await rig();
-    await playToEnd(c);
-    await p.seek(2000);
-    await settle(c);
-    expect(env.video.currentTime).toBe(2);
-    env.video.currentTime = 12;
-    env.video.fire('seeked');
-    await settle(c);
-    expect(holding(12)![1]).toBeGreaterThanOrEqual(12 + AHEAD);
-    expect(holding(12)![1]).toBeLessThanOrEqual(12 + AHEAD + 6);
-    p.destroy();
-  });
+    it(`once the playhead reports a time inside the target's range, the window follows it again (${mode})`, async () => {
+      const { c, p } = await rig([], webkit);
+      await playToEnd(c);
+      await p.seek(2000);
+      await settle(c);
+      expect(env.video.currentTime).toBe(2);
+      env.video.currentTime = 12;
+      env.video.fire('seeked');
+      await settle(c);
+      expect(holding(12)![1]).toBeGreaterThanOrEqual(12 + AHEAD);
+      expect(holding(12)![1]).toBeLessThanOrEqual(12 + AHEAD + 6);
+      p.destroy();
+    });
+  }
 
   // Seeded random sequences: forward and backward, buffered and unbuffered, seek() and native scrubs, with
   // reads held so that a new seek arrives while an earlier one is still settling.
@@ -1221,12 +1230,12 @@ describe('seek sequences over the fixture layout (2 s fragments at mid-chunk off
   const SEEDS = Number(process.env.SEEK_SEEDS ?? 60);
   const seeds = [...new Set([...REGRESSION, ...Array.from({ length: SEEDS }, (_, i) => i + 1)])];
   for (const seed of seeds) {
-    it(`random sequence ${seed}`, async () => {
+    for (const webkit of [false, true]) it(`random sequence ${seed}${webkit ? ' (WebKit)' : ''}`, async () => {
       const rnd = prng(seed);
       const pick = <T>(a: T[]): T => a[Math.floor(rnd() * a.length)]!;
       const hold: number[] = [];
       for (let i = 0; i < 6; i++) hold.push(33 + Math.floor(rnd() * (NCHUNKS - 33)));
-      const { c, p } = await rig(hold);
+      const { c, p } = await rig(hold, webkit);
       const pending: Promise<void>[] = [];
       const log: string[] = [];
       let target = 0;

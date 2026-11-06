@@ -6,7 +6,7 @@ import type { ClipOpenResult, ClipReadResult, Request, Verification } from '../.
 import { ErrAuth, ErrAuthHeader, ErrFormat, ErrTrailingData, ErrTruncated, ErrUnknownKey } from '../zrec/errors';
 import type { WorkerClient } from '../workerClient';
 import { findNextClip } from './advance';
-import { BLOB_LRU, BLOB_MAX, WINDOWS, alignToFragments, failureTimeMs, feedsRange, isBuffered, needsMore, planEviction, planResume, planSeek, playheadSettled, type Profile } from './buffer';
+import { BLOB_LRU, BLOB_MAX, WINDOWS, alignToFragments, failureTimeMs, feedsRange, fragmentComplete, isBuffered, needsMore, planEviction, planResume, planSeek, playheadSettled, type Profile } from './buffer';
 import { BlobLru, blobFromParts } from './blob';
 import { mseCtor, mseSupports, openSink, type MseKind, type Sink } from './mse';
 import { initialState } from './status';
@@ -134,8 +134,12 @@ class PlayerImpl implements Player {
    */
   #confirmSeek(): void {
     const t = this.#assignedMs;
-    if (t === null || this.#seekHead === null || !this.#sink) return;
-    if (playheadSettled(this.#sink.buffered(), t, this.video.currentTime)) this.#endSeek();
+    const open = this.#open;
+    if (t === null || this.#seekHead === null || !this.#sink || !open) return;
+    // WebKit reports a part-parsed fragment as buffered time, so the playhead being inside the range is not
+    // enough: the target's whole fragment has to be there before a stray report can no longer move the window.
+    const b = this.#sink.buffered();
+    if (playheadSettled(b, t, this.video.currentTime) && fragmentComplete(b, t, open.seekIndex, this.#sink.ended)) this.#endSeek();
   }
 
   #set(patch: Partial<PlayerState>): void {
@@ -527,18 +531,20 @@ class PlayerImpl implements Player {
     // The fill below still runs, because this seek already stopped the previous one.)
     await this.#evictAhead(g, open, sink, this.#head());
     if (g !== this.#gen) return;
-    // The fragment may span several chunks: wait until the target itself is buffered (or its fragment has been
-    // appended in full), with the fill running on meanwhile.
+    // The fragment may span several chunks: wait until all of it has been appended, with the fill running on
+    // meanwhile. The buffered ranges say nothing about that: WebKit reports a fragment as buffered from its first
+    // chunk on. (The fill also resolves when it ends first, at the last fragment or on an error.)
     const nextFragment = open.seekIndex.find(([t]) => t > plan.fragmentMs);
     const fragmentEnd = nextFragment ? nextFragment[1] : Infinity;
     await new Promise<void>((resolve) => {
       void this.#fill(g, open, sink, plan.chunk, plan.intraOffset, {
-        done: (appendedTo) => isBuffered(sink.buffered(), target / 1000) || appendedTo >= fragmentEnd,
+        done: (appendedTo) => appendedTo >= fragmentEnd,
         resolve,
       });
     });
-    // Move the playhead only once its fragment is buffered. Setting it earlier makes WebKit settle on the nearest
-    // buffered time instead of waiting for the data, and report some other time (the end of the clip) afterwards.
+    // Move the playhead only once its fragment is buffered in full. Setting it earlier makes WebKit settle on the
+    // nearest buffered time instead of waiting for the data, and report some other time (the end of the clip)
+    // afterwards.
     // The window keeps following the target (`#seekHead`) until the playhead reports a time inside its range.
     if (g === this.#gen && tok === this.#seekTok) {
       this.#assignedMs = target;

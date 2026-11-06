@@ -102,6 +102,11 @@ export class FakeSourceBuffer extends EventTarget {
   source: FakeMediaSource | null = null;
   /** With a layout, buffered time comes from completed fragments instead of the chunk number. */
   layout: Layout | null = null;
+  /**
+   * WebKit mode (needs a layout): a fragment that is only partly appended already counts as buffered time,
+   * in proportion to the bytes parsed so far (WebKit reports the frames it has decoded), and an abort() keeps them.
+   */
+  webkit = false;
   /** Appends that broke the parser's rules (a gap without abort, a fragment-less start after abort). */
   violations: string[] = [];
   private known = false;
@@ -179,7 +184,12 @@ export class FakeSourceBuffer extends EventTarget {
       const f = l.seekIndex[this.asm];
       if (!f) break;
       const fEnd = l.seekIndex[this.asm + 1]?.[1] ?? l.totalBytes;
-      if (end < fEnd) break;
+      if (end < fEnd) {
+        const dur = (l.seekIndex[this.asm + 1]?.[0] ?? l.durationMs) - f[0];
+        const frac = Math.max(0, end - f[1]) / (fEnd - f[1]);
+        if (this.webkit && frac > 0) done.push([f[0] / 1000, (f[0] + dur * frac) / 1000]);
+        break;
+      }
       done.push([f[0] / 1000, (l.seekIndex[this.asm + 1]?.[0] ?? l.durationMs) / 1000]);
       this.asm++;
     }
@@ -211,12 +221,14 @@ export class FakeMediaSource extends EventTarget {
   mime = '';
   /** Applied to every SourceBuffer this source creates. */
   layout: Layout | null = null;
+  webkit = false;
   endedWith: string | undefined | null = null;
   addSourceBuffer(mime: string): FakeSourceBuffer {
     this.mime = mime;
     this.sb = new FakeSourceBuffer();
     this.sb.source = this;
     this.sb.layout = this.layout;
+    this.sb.webkit = this.webkit;
     return this.sb;
   }
   endOfStream(err?: string): void {
@@ -287,7 +299,7 @@ export interface Env {
 type G = Record<string, unknown>;
 
 /** Installs MediaSource/ManagedMediaSource globals and URL.createObjectURL stubs. */
-export function installMedia(opts: { mms?: boolean; mse?: boolean; layout?: Layout } = {}): Env {
+export function installMedia(opts: { mms?: boolean; mse?: boolean; layout?: Layout; webkit?: boolean } = {}): Env {
   const g = globalThis as unknown as G;
   const saved = {
     MediaSource: g.MediaSource,
@@ -306,6 +318,7 @@ export function installMedia(opts: { mms?: boolean; mse?: boolean; layout?: Layo
     constructor() {
       super();
       this.layout = opts.layout ?? null;
+      this.webkit = opts.webkit ?? false;
       created.push(this);
     }
   };
@@ -313,6 +326,7 @@ export function installMedia(opts: { mms?: boolean; mse?: boolean; layout?: Layo
     constructor() {
       super();
       this.layout = opts.layout ?? null;
+      this.webkit = opts.webkit ?? false;
       created.push(this);
     }
   };

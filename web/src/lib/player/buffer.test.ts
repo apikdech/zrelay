@@ -14,6 +14,7 @@ import {
   planResume,
   planSeek,
   playheadSettled,
+  fragmentComplete,
   type Range,
 } from './buffer';
 
@@ -283,5 +284,29 @@ describe('playheadSettled (has the playhead reached the seek target\'s range?)',
   });
   it('ignores another range that holds the time', () => {
     expect(playheadSettled([[2, 10], [60, 90]], 3000, 70)).toBe(false);
+  });
+});
+
+describe('fragmentComplete (is the whole fragment holding the target buffered?)', () => {
+  // 2 s fragments; WebKit reports a part-parsed fragment as buffered time, so a range holding the target is not enough.
+  const idx: [number, number][] = [[0, 0], [2000, 100_000], [4000, 200_000]];
+  it('is false while the range holding the target stops short of the next fragment start', () => {
+    expect(fragmentComplete([[2, 2.8]], 2000, idx, false)).toBe(false);
+    expect(fragmentComplete([[2, 3.5]], 3000, idx, false)).toBe(false);
+  });
+  it('is true once the range reaches the next fragment start (a hair of slack)', () => {
+    expect(fragmentComplete([[2, 4]], 2000, idx, false)).toBe(true);
+    expect(fragmentComplete([[2, 3.95]], 2000, idx, false)).toBe(true);
+    expect(fragmentComplete([[0, 6]], 3000, idx, false)).toBe(true);
+  });
+  it('the last fragment has no next start: complete only once the stream has ended', () => {
+    expect(fragmentComplete([[4, 5]], 4000, idx, false)).toBe(false);
+    expect(fragmentComplete([[4, 5]], 4000, idx, true)).toBe(true);
+  });
+  it('is false when the target is not buffered', () => {
+    expect(fragmentComplete([[2, 4]], 5000, idx, true)).toBe(false);
+  });
+  it('without an index the range holding the target counts', () => {
+    expect(fragmentComplete([[2, 2.8]], 2000, [], false)).toBe(true);
   });
 });

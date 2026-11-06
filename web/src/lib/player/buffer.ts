@@ -74,6 +74,20 @@ export function playheadSettled(ranges: readonly Range[], targetMs: number, t: n
   return r !== undefined && t >= targetMs / 1000 - START_SLACK && t < r[1];
 }
 
+/**
+ * True when the buffered range holding `tMs` reaches the end of the fragment that contains it: the start of the
+ * next fragment (a hair short is fine), or for the last fragment the end of the stream. A range that stops
+ * earlier holds a fragment that is only partly buffered, which WebKit already reports as buffered time.
+ * Without an index the range holding the target counts.
+ */
+export function fragmentComplete(ranges: readonly Range[], tMs: number, seekIndex: readonly SeekEntry[], ended: boolean): boolean {
+  const r = holding(ranges, tMs / 1000);
+  if (!r) return false;
+  if (seekIndex.length === 0) return true;
+  const next = seekIndex.find(([t]) => t > tMs);
+  return next ? r[1] >= next[0] / 1000 - END_SLACK : ended;
+}
+
 /** Seconds buffered from `t` to the end of its range; 0 when `t` is not buffered. */
 export function bufferedAhead(ranges: readonly Range[], t: number): number {
   const r = holding(ranges, t);
