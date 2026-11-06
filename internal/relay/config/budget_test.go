@@ -2,11 +2,41 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/apikdech/zrelay-v2/pkg/zrec"
 )
+
+func TestKeyFingerprint(t *testing.T) {
+	var m zrec.MasterKey
+	for i := range m {
+		m[i] = byte(i)
+	}
+	c := &Config{Encryption: Encryption{MasterKeyText: m.String()}}
+	got, err := KeyFingerprint(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := zrec.FormatKeyID(zrec.Derive(m).ID); got != want {
+		t.Errorf("fingerprint %q, want %q", got, want)
+	}
+
+	// A bad key is reported as a key error and the error never carries the
+	// key text.
+	bad := m.String()[:len(m.String())-1] + "z"
+	c.Encryption.MasterKeyText = bad
+	_, err = KeyFingerprint(c)
+	if !errors.Is(err, zrec.ErrKeyFormat) && !errors.Is(err, zrec.ErrKeyChecksum) {
+		t.Fatalf("err %v, want a key error", err)
+	}
+	if strings.Contains(err.Error(), bad) {
+		t.Errorf("error leaks the key text: %v", err)
+	}
+}
 
 // workedExample is the budget worked example of the plan (Task 4): 3
 // cameras at 3200 kbps, 15 s pre-roll, 2 s GOP, 1 MiB chunks, 8 MiB parts,

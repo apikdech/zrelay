@@ -11,6 +11,7 @@ require (
 	github.com/aws/smithy-go v1.28.8
 	github.com/bluenviron/gortsplib/v5 v5.6.7
 	github.com/bluenviron/mediacommon/v2 v2.9.6
+	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/oklog/ulid/v2 v2.1.2
 	github.com/pion/rtcp v1.2.20
 	github.com/pion/rtp v1.10.6
@@ -86,6 +87,8 @@ require (
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/tools v0.51.0 // indirect
 	honnef.co/go/tools v0.8.2 // indirect
+	rsc.io/qr v0.2.0 // indirect
 )

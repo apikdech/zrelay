@@ -24,10 +24,13 @@ import (
 const usage = `usage: zrelay [--env-file <path>] <command> [flags]
 
 commands:
-  config check --config <path>   validate the config and print the memory budget
+  config check --config <path>   validate the config and print the memory budget and key fingerprint
   onvif discover --config <path> --camera <id> [--listen 60s]
                                  list the camera's ONVIF event topics, stream its
                                  notifications and suggest rules
+  key generate [--qr]            print a new master key (see "zrelay key")
+  key fingerprint --key <ref>
+  key api-token-hash --key <ref>
 `
 
 const (
@@ -56,6 +59,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return configCheck(rest[2:], stdout, stderr)
 	case len(rest) >= 2 && rest[0] == "onvif" && rest[1] == "discover":
 		return onvifDiscover(rest[2:], stdout, stderr)
+	case len(rest) >= 1 && rest[0] == "key":
+		return keyCmd(rest[1:], stdout, stderr)
 	default:
 		fmt.Fprint(stderr, usage)
 		return exitInvalid
@@ -84,8 +89,14 @@ func configCheck(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "zrelay: config check: %v\n", err)
 		return exitInvalid
 	}
+	fp, err := config.KeyFingerprint(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "zrelay: config check: encryption.master_key: %v\n", err)
+		return exitInvalid
+	}
 	r := config.Budget(cfg)
 	r.WriteTable(stdout)
+	fmt.Fprintf(stdout, "key fingerprint: %s\n", fp)
 	if !r.OK {
 		fmt.Fprintf(stderr, "zrelay: config check: memory budget exceeds 80%% of max_memory_mb (total %d bytes > limit %d bytes)\n", r.Total, r.Limit)
 		return exitFailed

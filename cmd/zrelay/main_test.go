@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,7 +38,7 @@ func writeFile(t *testing.T, dir, name, content string) string {
 func exampleConfigFile(t *testing.T, edit func(string) string) string {
 	t.Helper()
 	dir := t.TempDir()
-	writeFile(t, dir, "zrelay_master", "zk1-example-master-key\n")
+	writeFile(t, dir, "zrelay_master", seqMaster().String()+"\n")
 	writeFile(t, dir, "s3_secret_key", "s3-secret\n")
 	writeFile(t, dir, "api_token_sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n")
 	src, err := os.ReadFile(exampleConfig)
@@ -128,7 +129,9 @@ func TestConfigCheckErrorsDoNotLeakSecrets(t *testing.T) {
 	setExampleEnv(t)
 	path := exampleConfigFile(t, func(s string) string { return s + "mlock: true\n" })
 	_, out, errOut := runCLI("config", "check", "--config", path)
-	for _, v := range []string{"s3-secret", "s3-access", "cam-pass", "restream-pass", "zk1-example-master-key"} {
+	mk := seqMaster()
+	for _, v := range []string{"s3-secret", "s3-access", "cam-pass", "restream-pass",
+		mk.String(), mk.Upper(), hex.EncodeToString(mk[:])} {
 		if strings.Contains(out+errOut, v) {
 			t.Errorf("output contains secret %q:\n%s%s", v, out, errOut)
 		}
