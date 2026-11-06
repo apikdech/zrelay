@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +15,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/apikdech/zrelay-v2/internal/clock"
 	"github.com/apikdech/zrelay-v2/internal/relay/app"
 	"github.com/apikdech/zrelay-v2/internal/relay/config"
 	"github.com/apikdech/zrelay-v2/internal/relay/events"
@@ -34,6 +37,10 @@ const h264Fixture = "../../../testdata/video/h264-640x360-gop2-10s.h264"
 
 // grace is shutdown_grace_seconds of the test configs.
 const grace = 3 * time.Second
+
+// graceSlack is the scheduling tolerance on the grace bound: Run is measured
+// from this goroutine's cancel to the receive of its result.
+const graceSlack = 50 * time.Millisecond
 
 // rig is one fake camera (RTSP and ONVIF) and a config pointing at it.
 type rig struct {
@@ -265,6 +272,8 @@ type downStorage struct {
 	rec storage.Recoverer
 
 	down atomic.Bool
+	// recoveryFails makes the recovery scan fail while writes still work.
+	recoveryFails atomic.Bool
 
 	mu          sync.Mutex
 	healthCalls int
@@ -339,7 +348,7 @@ func (s *downStorage) ListStaging(ctx context.Context, prefix string) ([]storage
 	s.mu.Lock()
 	s.listCalls++
 	s.mu.Unlock()
-	if s.down.Load() {
+	if s.down.Load() || s.recoveryFails.Load() {
 		return nil, errDown
 	}
 	return s.rec.ListStaging(ctx, prefix)
@@ -417,9 +426,12 @@ func TestRunShutdownWithStorageDownExitsWithinGrace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if took > grace+time.Second {
-		t.Errorf("Run took %v with storage down, want about %v", took, grace)
+	// The spec bound is shutdown_grace_seconds itself; the slack covers only
+	// the scheduling of this test's own goroutines.
+	if took > grace+graceSlack {
+		t.Errorf("Run took %v with storage down, want <= shutdown grace %v", took, grace)
 	}
+	t.Logf("shutdown with storage down took %v of %v", took, grace)
 	if !strings.Contains(logs.text(), "reason=shutdown") {
 		t.Errorf("the dropped clip was not logged with reason shutdown:\n%s", logs.text())
 	}
@@ -522,5 +534,216 @@ func TestRunSetsMemoryLimit(t *testing.T) {
 	}
 	if got := debug.SetMemoryLimit(-1); got != prev {
 		t.Errorf("memory limit after Run = %d, want the previous %d", got, prev)
+	}
+}
+
+// TestRunServesLiveWithBearerAuth wires live.max_viewers > 0: the WHEP server
+// listens on live.listen, rejects a request without the K_api bearer (401),
+// answers a valid bearer for an unknown camera with 404, and stops with Run.
+func TestRunServesLiveWithBearerAuth(t *testing.T) {
+	r := newRig(t, "")
+	mk, err := zrec.ParseMasterKey(r.cfg.Encryption.MasterKeyText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := zrec.Derive(mk)
+	hash := zrec.APITokenHash(keys)
+	listen := freePort(t)
+	r.cfg.Live = config.Live{
+		Listen:         listen,
+		AdvertiseIP:    "127.0.0.1",
+		MaxViewers:     1,
+		APITokenSHA256: []string{hex.EncodeToString(hash[:])},
+	}
+	run := start(t, r.cfg, app.Options{Version: "test"})
+
+	post := func(path, bearer string) (int, error) {
+		req, err := http.NewRequest(http.MethodPost, "http://"+listen+path, strings.NewReader("v=0\r\n"))
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Content-Type", "application/sdp")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		resp.Body.Close()
+		return resp.StatusCode, nil
+	}
+
+	var noAuth int
+	eventually(t, "the live port", 20*time.Second, func() bool {
+		code, err := post("/live/cam-1", "")
+		noAuth = code
+		return err == nil
+	})
+	if noAuth != http.StatusUnauthorized {
+		t.Errorf("POST /live/cam-1 without a bearer = %d, want 401", noAuth)
+	}
+	if code, err := post("/live/cam-1", "not-the-token"); err != nil || code != http.StatusUnauthorized {
+		t.Errorf("POST /live/cam-1 with a wrong bearer = %d, %v, want 401", code, err)
+	}
+	if code, err := post("/live/unknown", zrec.BearerToken(keys)); err != nil || code != http.StatusNotFound {
+		t.Errorf("POST /live/unknown with a valid bearer = %d, %v, want 404", code, err)
+	}
+
+	if _, err := run.stop(t); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := net.DialTimeout("tcp", listen, time.Second); err == nil {
+		c.Close()
+		t.Errorf("live port %s still accepts connections after Run returned", listen)
+	}
+}
+
+// shiftClock is the real clock running ahead by an offset the test sets: wall
+// time jumps, timers still run in real time.
+type shiftClock struct {
+	clock.Clock
+	off atomic.Int64
+}
+
+func (c *shiftClock) Now() time.Time          { return c.Clock.Now().Add(time.Duration(c.off.Load())) }
+func (c *shiftClock) advance(d time.Duration) { c.off.Add(int64(d)) }
+
+// TestRecoveryRetryNeverTouchesThisProcessesClips: recovery handles the
+// leftovers of a previous process, so its reference time is the moment this
+// process started. A retry that used the current time would, after more than
+// two minutes, take this process's own in-flight clip for a crashed one,
+// commit its upload under the live writer and delete its staging sidecar.
+func TestRecoveryRetryNeverTouchesThisProcessesClips(t *testing.T) {
+	logs := captureLogs(t)
+	t.Cleanup(app.SetRecoveryRetryEvery(100 * time.Millisecond))
+	r := newRig(t, "")
+	// The jump of the clock must not end the clip by itself.
+	r.cfg.Cameras[0].TriggerTimeout = time.Hour
+	r.cfg.Cameras[0].MaxClip = time.Hour
+	st := newDown(t, r.base)
+	st.down.Store(false)
+	st.recoveryFails.Store(true)
+	clk := &shiftClock{Clock: clock.Real}
+	o := st.opts(t)
+	o.Clock = clk
+	start(t, r.cfg, o)
+
+	eventually(t, "the startup recovery attempt", 20*time.Second, func() bool {
+		_, list, _ := st.counts()
+		return list >= 1
+	})
+	r.motion(true)
+	inFlight := func(suffix string) []string {
+		return files(r.base, func(rel string) bool { return strings.Contains(rel, "/clips/") && strings.HasSuffix(rel, suffix) })
+	}
+	eventually(t, "an upload in flight with its staging sidecar", 60*time.Second, func() bool {
+		return len(inFlight(".zrec.part")) > 0 && len(inFlight(".json.part")) > 0
+	})
+
+	// More than two minutes pass, then the retry gets through.
+	clk.advance(5 * time.Minute)
+	st.recoveryFails.Store(false)
+	eventually(t, "the recovery retry to succeed", 20*time.Second, func() bool {
+		return strings.Contains(logs.text(), "startup recovery done")
+	})
+
+	if len(inFlight(".zrec.part")) == 0 {
+		t.Error("the in-flight upload was committed by recovery")
+	}
+	if len(inFlight(".json.part")) == 0 {
+		t.Error("the in-flight clip's staging sidecar was deleted by recovery")
+	}
+	if got := clipSidecars(r.base); len(got) != 0 {
+		t.Errorf("recovery published a sidecar for a clip still being written: %v", got)
+	}
+	if !strings.Contains(logs.text(), "recovered=0 promoted=0 discarded=0 orphaned=0") {
+		t.Errorf("recovery touched something:\n%s", logs.text())
+	}
+}
+
+// TestRunShutdownWithONVIFDownIsPrompt: review focus 5, the camera's event
+// endpoint refuses connections while RTSP works. Shutdown must not wait out
+// the grace period for an ONVIF unsubscribe that has nothing to unsubscribe.
+func TestRunShutdownWithONVIFDownIsPrompt(t *testing.T) {
+	logs := captureLogs(t)
+	r := newRig(t, "")
+	_, port, err := net.SplitHostPort(freePort(t)) // nothing listens there
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.cfg.Cameras[0].EventsPort = p
+	run := start(t, r.cfg, app.Options{Version: "test"})
+
+	eventually(t, "the events link to be reported down", 30*time.Second, func() bool {
+		return strings.Contains(logs.text(), "onvif events interrupted")
+	})
+	took, err := run.stop(t)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if took > grace/2 {
+		t.Errorf("Run took %v to stop with ONVIF down, want well under the %v grace", took, grace)
+	}
+	if strings.Contains(logs.text(), "gave up waiting for an ONVIF unsubscribe") {
+		t.Errorf("shutdown waited out the grace for the ONVIF unsubscribe:\n%s", logs.text())
+	}
+}
+
+// TestRunForceFinalizesThroughTheBacklogPolicy drives the egress backlog
+// policy through the wiring, in CI: with storage down and a 1 MiB backlog,
+// the accountant asks to force-finalize the recording camera (egress
+// ForceFinalize -> the app -> the recorder's WithBacklogPolicy -> the clip
+// machine). The finalized clip is then evicted, the backlog empties, the
+// recorder releases the suppressed camera (resume), a new clip starts, and
+// the backlog policy finalizes that one too. A clip only ends here through
+// the policy: max_clip_seconds is 60 and the trigger stays active.
+func TestRunForceFinalizesThroughTheBacklogPolicy(t *testing.T) {
+	logs := captureLogs(t)
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("relay log:\n%s", logs.text())
+		}
+	})
+	r := newRig(t, "")
+	r.cfg.Relay.EgressBacklogMB = 1
+	st := newDown(t, r.base)
+	start(t, r.cfg, st.opts(t))
+
+	r.motion(true)
+	// The fixture is about 70 kB/s: a clip fills 1 MiB in ~15 s.
+	eventually(t, "the backlog policy to force-finalize a clip, resume the camera and finalize another",
+		120*time.Second, func() bool {
+			return strings.Count(logs.text(), "backlog full: finalizing the active clip") >= 2
+		})
+	if !strings.Contains(logs.text(), "reason=backlog") {
+		t.Errorf("the finalized clip was not dropped by the backlog policy:\n%s", logs.text())
+	}
+}
+
+// TestRunTightensTheGCPercent: with only the memory limit, the collector
+// lets the heap grow with garbage up to the limit, and the runtime's total
+// memory (which also counts pages already returned to the OS) ends above
+// max_memory_mb. The ring buffers are pointer-free, so a low GC percent costs
+// little; Run sets it and restores the previous value when it returns.
+func TestRunTightensTheGCPercent(t *testing.T) {
+	read := func() int {
+		p := debug.SetGCPercent(100)
+		debug.SetGCPercent(p)
+		return p
+	}
+	prev := read()
+	r := newRig(t, "")
+	run := start(t, r.cfg, app.Options{Version: "test"})
+	eventually(t, "the GC percent to be set", 10*time.Second, func() bool { return read() == app.GCPercent })
+	if _, err := run.stop(t); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != prev {
+		t.Errorf("GC percent after Run = %d, want the previous %d", got, prev)
 	}
 }

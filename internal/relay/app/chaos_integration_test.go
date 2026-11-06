@@ -58,11 +58,8 @@ var memClasses = []string{
 // dropped clips show up in coverage, that clips are committed again after the
 // outage, and that the Go runtime never holds more than max_memory_mb.
 //
-// The runtime figure is /memory/classes/total:bytes minus
-// /memory/classes/heap/released:bytes, sampled every second: debug.
-// SetMemoryLimit bounds the memory the runtime holds, which excludes pages it
-// already returned to the OS, while the total keeps counting them. Both are
-// logged.
+// The memory criterion is /memory/classes/total:bytes, as the plan specifies,
+// not the figure net of memory returned to the OS.
 //
 // It takes about fifteen minutes and is not part of `make test` or
 // `make integration`: run it with `make chaos`.
@@ -107,8 +104,8 @@ func TestChaos(t *testing.T) {
 	})
 
 	// Sample the runtime's total memory every second.
-	var peak, peakTotal atomic.Uint64
-	var peakDetail atomic.Value // string: the classes at the peak
+	var peakTotal, peakHeld atomic.Uint64
+	var peakDetail atomic.Value // string: the classes when the total peaked
 	stopSampling := make(chan struct{})
 	var sampling sync.WaitGroup
 	sampling.Add(1)
@@ -127,21 +124,17 @@ func TestChaos(t *testing.T) {
 			case <-tick.C:
 				metrics.Read(sample)
 				total, released := sample[0].Value.Uint64(), sample[3].Value.Uint64()
+				// What debug.SetMemoryLimit bounds; logged for diagnosis only.
+				if v := total - released; v > peakHeld.Load() {
+					peakHeld.Store(v)
+				}
 				if total > peakTotal.Load() {
 					peakTotal.Store(total)
-				}
-				// The memory limit (debug.SetMemoryLimit) bounds what the
-				// runtime holds, which excludes memory it has already
-				// returned to the OS; that is the figure compared with
-				// max_memory_mb.
-				if v := total - released; v > peak.Load() {
-					peak.Store(v)
 					var b strings.Builder
 					for _, sm := range sample {
 						fmt.Fprintf(&b, " %s=%.1fMiB", strings.TrimSuffix(strings.TrimPrefix(sm.Name, "/memory/classes/"), ":bytes"), float64(sm.Value.Uint64())/(1<<20))
 					}
 					peakDetail.Store(b.String())
-
 				}
 			}
 		}
@@ -183,7 +176,7 @@ func TestChaos(t *testing.T) {
 
 	// Warm up: clips flow while storage is healthy.
 	eventually(t, "a clip committed before the outage", chaosWarmup+2*time.Minute, func() bool { return committed(time.Time{}) > 0 })
-	t.Logf("warm-up done; peak memory so far %.1f MiB", float64(peak.Load())/(1<<20))
+	t.Logf("warm-up done; peak memory so far %.1f MiB", float64(peakTotal.Load())/(1<<20))
 
 	// The outage.
 	proxy.Blackhole(true)
@@ -195,7 +188,7 @@ func TestChaos(t *testing.T) {
 	time.Sleep(time.Until(outageStart.Add(outage)))
 	proxy.Blackhole(false)
 	healed := time.Now()
-	t.Logf("storage restored; peak memory %.1f MiB", float64(peak.Load())/(1<<20))
+	t.Logf("storage restored; peak memory %.1f MiB", float64(peakTotal.Load())/(1<<20))
 
 	eventually(t, "the breaker to close again", chaosRecovery, func() bool {
 		s := logs.text()
@@ -222,14 +215,16 @@ func TestChaos(t *testing.T) {
 	close(stopSampling)
 	sampling.Wait()
 
-	t.Logf("/memory/classes/total:bytes peaked at %.1f MiB (includes memory already returned to the OS)", float64(peakTotal.Load())/(1<<20))
-	if p := peak.Load(); p > chaosMaxMemoryMB<<20 {
-		t.Errorf("runtime memory (total minus released) peaked at %.1f MiB, want <= %d MiB", float64(p)/(1<<20), chaosMaxMemoryMB)
-	} else {
-		t.Logf("runtime memory (total minus released) peaked at %.1f MiB of %d MiB", float64(p)/(1<<20), chaosMaxMemoryMB)
-	}
+	// The design §9 and Task 29 criterion: /memory/classes/total:bytes, which
+	// keeps counting pages the runtime already returned to the OS, never goes
+	// above max_memory_mb.
+	t.Logf("/memory/classes/total:bytes peaked at %.1f MiB of %d MiB (total minus released: %.1f MiB)",
+		float64(peakTotal.Load())/(1<<20), chaosMaxMemoryMB, float64(peakHeld.Load())/(1<<20))
 	if d, ok := peakDetail.Load().(string); ok {
 		t.Logf("memory classes at the peak:%s", d)
+	}
+	if p := peakTotal.Load(); p > chaosMaxMemoryMB<<20 {
+		t.Errorf("/memory/classes/total:bytes peaked at %.1f MiB, want <= %d MiB", float64(p)/(1<<20), chaosMaxMemoryMB)
 	}
 
 	// Dropped clips are in coverage. The shutdown flush wrote the running

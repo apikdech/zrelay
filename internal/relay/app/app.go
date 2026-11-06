@@ -52,12 +52,13 @@ type Options struct {
 	NewStorage func(*config.Config) (storage.Provider, storage.Recoverer, error)
 }
 
+// recoveryRetryEvery is how often a failed startup recovery is retried while
+// the breaker stays closed and nothing else triggers it. Breaker closes retry
+// at once (design §6.5); this keeps a quiet relay, which never opens its
+// breaker, from staying unrecovered. A variable so tests can shorten it.
+var recoveryRetryEvery = time.Minute
+
 const (
-	// recoveryRetryEvery is how often a failed startup recovery is retried
-	// while the breaker stays closed and nothing else triggers it. Breaker
-	// closes retry at once (design §6.5); this keeps a quiet relay, which
-	// never opens its breaker, from staying unrecovered.
-	recoveryRetryEvery = time.Minute
 	// httpShutdownGrace bounds the HTTP servers' own graceful stop.
 	httpShutdownGrace = 2 * time.Second
 	// resumeBacklogFraction: a camera suppressed by the backlog policy
@@ -65,6 +66,10 @@ const (
 	// §4.5, 50%).
 	resumeBacklogFraction = 2
 )
+
+// gcPercent is the garbage collector target (GOGC) of the relay: the next
+// collection starts when the heap has grown by this share over the live data.
+const gcPercent = 20
 
 // s3ResponseTimeout is how long an S3 request may wait for the response
 // headers after sending its request.
@@ -132,18 +137,48 @@ type cam struct {
 	evDone    chan struct{} // closed when the event source has unsubscribed
 }
 
-// doneSource closes done once its inner source has returned for good (its
-// context ended), which is after the ONVIF unsubscribe.
+// doneSource closes done once its inner source is finished for good: its
+// context ended and the source either returned from Run, which is after the
+// ONVIF unsubscribe, or was not running at that moment. The second case is
+// the supervisor's event loop sleeping in its backoff after the source
+// returned early; it exits on the context without calling Run again, so
+// waiting for a Run to return would use up the whole shutdown grace.
 type doneSource struct {
 	events.Source
 	done chan struct{}
 	once sync.Once
+
+	mu      sync.Mutex
+	running int
 }
 
+// newDoneSource wraps src; ctx is the context the supervisor runs it under.
+func newDoneSource(ctx context.Context, src events.Source, done chan struct{}) *doneSource {
+	d := &doneSource{Source: src, done: done}
+	go func() {
+		<-ctx.Done()
+		d.mu.Lock()
+		idle := d.running == 0
+		d.mu.Unlock()
+		if idle {
+			d.finish()
+		}
+	}()
+	return d
+}
+
+func (d *doneSource) finish() { d.once.Do(func() { close(d.done) }) }
+
 func (d *doneSource) Run(ctx context.Context, emit func(events.Signal), ready func(bool)) error {
+	d.mu.Lock()
+	d.running++
+	d.mu.Unlock()
 	err := d.Source.Run(ctx, emit, ready)
+	d.mu.Lock()
+	d.running--
+	d.mu.Unlock()
 	if ctx.Err() != nil {
-		d.once.Do(func() { close(d.done) })
+		d.finish()
 	}
 	return err
 }
@@ -185,6 +220,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) error {
 	// Run restores the previous limit, so tests do not leak it.
 	prev := debug.SetMemoryLimit(int64(cfg.Relay.MaxMemoryMB) << 20)
 	defer debug.SetMemoryLimit(prev)
+	// The memory limit alone lets garbage pile up until the heap nears the
+	// limit, and the runtime's total counts every page it ever mapped. The
+	// big buffers (the ciphertext rings, the pre-roll rings) hold no
+	// pointers, so collecting early is cheap.
+	prevGC := debug.SetGCPercent(gcPercent)
+	defer debug.SetGCPercent(prevGC)
 	a := &app{cfg: cfg, opts: opts, clk: opts.Clock, kick: make(chan struct{}, 1)}
 	if err := a.start(); err != nil {
 		a.abort()
@@ -274,7 +315,8 @@ func (a *app) start() error {
 			if cm := byID[camera]; cm != nil {
 				select {
 				case cm.force <- struct{}{}:
-				default:
+					slog.Warn("backlog full: finalizing the active clip", "camera", camera)
+				default: // already asked; the recorder has not acted yet
 				}
 			}
 		},
@@ -395,7 +437,7 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 	if err != nil {
 		return fmt.Errorf("camera %q: %w", c.ID, err)
 	}
-	src := &doneSource{done: cm.evDone, Source: &events.PullPoint{
+	src := newDoneSource(ctx, &events.PullPoint{
 		Camera:      c.ID,
 		Host:        c.Host,
 		Port:        c.EventsPort,
@@ -404,7 +446,7 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 		Password:    c.Password,
 		Rules:       rules,
 		Clock:       a.clk,
-	}}
+	}, cm.evDone)
 	cm.handle = camera.Supervise(ctx, camera.SuperviseConfig{
 		ID:             c.ID,
 		RTSPURL:        a.cfg.RTSPURL(c),
@@ -485,10 +527,15 @@ func (a *app) onBreaker(s egress.BreakerState) {
 // on every breaker close, until it has succeeded once. It only runs while
 // the breaker is closed.
 func (a *app) recoverLoop(ctx context.Context, ids []string) {
+	// Recovery is for the leftovers of a previous process. Every attempt
+	// measures candidate ages against the start of this one, so a retry
+	// minutes later never takes this process's own in-flight uploads, which
+	// are younger than the start, for crashed ones.
+	startedAt := a.clk.Now()
 	for {
 		if st, _ := a.breaker.State(); st == egress.Closed {
 			rep, err := recovery.Run(ctx, recovery.Config{
-				Provider: a.prov, Recoverer: a.rec, Cameras: ids, Now: a.clk.Now(),
+				Provider: a.prov, Recoverer: a.rec, Cameras: ids, Now: startedAt,
 			})
 			if ctx.Err() != nil {
 				return
