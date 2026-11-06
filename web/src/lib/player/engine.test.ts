@@ -393,6 +393,178 @@ describe('seek (ui-spec §4.3.2)', () => {
   });
 });
 
+describe('native seek bar scrubbing', () => {
+  /** Mobile profile, played to 50 s: buffered is [35, 80]. */
+  async function playedTo50() {
+    const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
+    const { p, states } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    for (const t of [25, 50]) {
+      env.video.currentTime = t;
+      env.video.fire('timeupdate');
+      await until(() => Math.max(...sb().ranges.map((r) => r[1])) >= t + 30, `buffered to ${t + 30}`);
+    }
+    await tick(50);
+    expect(sb().ranges[0]![0]).toBeGreaterThanOrEqual(35);
+    return { c, p, states };
+  }
+
+  it('a backward scrub outside the buffer is routed through the seek planner', async () => {
+    const { c, p } = await playedTo50();
+    c.reads.length = 0;
+    const aborts = sb().aborts;
+    env.video.currentTime = 10; // the viewer drags the native seek bar
+    env.video.fire('seeking');
+    await until(() => sb().ranges.some(([s, e]) => s <= 10 && e >= 40), '30 s ahead of 10 s buffered');
+    // The first read is the seek_index chunk for 10 s, not a continuation of the old position.
+    expect(c.reads[0]).toBe(10);
+    expect(sb().aborts).toBe(aborts + 1);
+    expect(env.video.currentTime).toBe(10);
+    await tick(50);
+    const n = sb().appends.length;
+    await tick(100);
+    expect(sb().appends).toHaveLength(n); // appends stopped about 30 s ahead of 10 s
+    const holding = sb().ranges.find(([s, e]) => s <= 10 && e > 10)!;
+    expect(holding[1]).toBeLessThanOrEqual(41);
+    expect(c.reads.every((r) => r < 50)).toBe(true); // never fetched towards the end of the clip
+    p.destroy();
+  });
+
+  it('a forward scrub past the buffer fetches the indexed fragment instead of everything in between', async () => {
+    const c = new FakeClient({ open: openResult({ numChunks: 300 }) });
+    const { p } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    c.reads.length = 0;
+    env.video.currentTime = 150;
+    env.video.fire('seeking');
+    await until(() => sb().ranges.some(([s, e]) => s <= 150 && e >= 180), '30 s ahead of 150 s buffered');
+    expect(c.reads[0]).toBe(150);
+    expect(c.reads.every((r) => r >= 150)).toBe(true);
+    p.destroy();
+  });
+
+  it('a scrub inside the buffer does nothing', async () => {
+    const { c, p } = await playedTo50();
+    c.reads.length = 0;
+    const aborts = sb().aborts;
+    env.video.currentTime = 60;
+    env.video.fire('seeking');
+    await tick(50);
+    expect(sb().aborts).toBe(aborts);
+    expect(env.video.currentTime).toBe(60);
+    p.destroy();
+  });
+
+  it('the engine\'s own assignment after the fragment is buffered does not re-enter', async () => {
+    const { c, p } = await playedTo50();
+    await p.seek(10_000);
+    await until(() => sb().ranges.some(([s, e]) => s <= 10 && e >= 40), '30 s ahead of 10 s buffered');
+    await tick(100);
+    c.reads.length = 0;
+    const aborts = sb().aborts;
+    env.video.fire('seeking'); // the browser reports the engine's own currentTime assignment
+    await tick(50);
+    expect(sb().aborts).toBe(aborts);
+    expect(c.reads).toHaveLength(0);
+    p.destroy();
+  });
+
+  it('a scrub past a tampered failure is clamped without looping', async () => {
+    const c = new FakeClient({
+      open: openResult({ numChunks: 100 }),
+      read: (i) => (i === 4 ? new ErrAuth(4) : { plaintext: chunkBytes(i), final: false }),
+    });
+    const { p, states } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => last(states).integrity === 'tampered', 'tampered');
+    sb().ranges = [];
+    c.reads.length = 0;
+    env.video.currentTime = 9;
+    env.video.fire('seeking');
+    await tick(50);
+    expect(env.video.currentTime).toBe(4);
+    env.video.fire('seeking'); // the clamp's own seek
+    await tick(50);
+    expect(env.video.currentTime).toBe(4);
+    expect(c.reads).toHaveLength(0);
+    p.destroy();
+  });
+
+  it('does not restart a fetch seek whose fragment is still arriving (the browser clamps to the buffer end)', async () => {
+    const { c, p } = await playedTo50();
+    await p.seek(10_000);
+    await until(() => sb().ranges.some(([s, e]) => s <= 10 && e >= 40), '30 s ahead of 10 s buffered');
+    await tick(100);
+    // Mid-fragment: the playhead sits where nothing is buffered yet, in the fragment the seek already fetches.
+    sb().ranges = [];
+    c.reads.length = 0;
+    const aborts = sb().aborts;
+    env.video.currentTime = 10.5;
+    env.video.fire('seeking');
+    await tick(50);
+    expect(sb().aborts).toBe(aborts);
+    // Once the playhead has been inside the buffer again, the same time is a fresh scrub.
+    sb().ranges = [[10, 20]];
+    env.video.fire('timeupdate');
+    sb().ranges = [];
+    env.video.fire('seeking');
+    await until(() => sb().aborts === aborts + 1, 'scrub planned');
+    p.destroy();
+  });
+
+  it('a scrub before anything has been appended does not restart the first fetch', async () => {
+    const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
+    c.hold.add(0);
+    const { p } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => c.held.has(0), 'read of chunk 0 in flight');
+    env.video.fire('seeking'); // currentTime 0, nothing buffered yet
+    await tick(50);
+    c.held.get(0)!();
+    await until(() => sb().appends.length === 30, '30 chunks');
+    expect(sb().aborts).toBe(0);
+    p.destroy();
+  });
+});
+
+describe('overlapping seeks', () => {
+  it('a seek inside the buffer supersedes an earlier fetch seek that is still settling', async () => {
+    const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
+    const { p } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    c.hold.add(70);
+    const a = p.seek(70_000); // unbuffered: waits for chunk 70
+    await until(() => c.held.has(70), 'read of chunk 70 in flight');
+    await p.seek(5000); // buffered
+    expect(env.video.currentTime).toBe(5);
+    c.held.get(70)!();
+    await a;
+    await tick(50);
+    expect(env.video.currentTime).toBe(5);
+    p.destroy();
+  });
+
+  it('a later fetch seek supersedes an earlier one', async () => {
+    const c = new FakeClient({ open: openResult({ numChunks: 100 }) });
+    const { p } = make(c, 'mobile');
+    await p.load(CLIP);
+    await until(() => sb().appends.length === 30, '30 chunks');
+    c.hold.add(70);
+    const a = p.seek(70_000);
+    await until(() => c.held.has(70), 'read of chunk 70 in flight');
+    await p.seek(90_000);
+    expect(env.video.currentTime).toBe(90);
+    c.held.get(70)!();
+    await a;
+    await tick(50);
+    expect(env.video.currentTime).toBe(90);
+    p.destroy();
+  });
+});
+
 describe('destroy', () => {
   it('closes the clip, revokes the object URL and stops fetching', async () => {
     const c = new FakeClient({ open: openResult({ numChunks: 100 }) });

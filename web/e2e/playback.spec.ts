@@ -203,6 +203,29 @@ test('a phone profile seeks outside its 30 s buffer by fetching the indexed frag
     await page.getByTestId('player').evaluate((v: HTMLVideoElement) => v.play());
     await expect.poll(() => currentTime(page), { timeout: 8000 }).toBeGreaterThan(back + 1);
     await expect(demo).toHaveAttribute('data-integrity', 'verified');
+
+    // The native seek bar sets currentTime directly (no Seek button): a scrub back to an evicted
+    // time must still be planned and fetched, and playback must resume from there.
+    await page.getByTestId('player').evaluate((v: HTMLVideoElement) => {
+      v.currentTime = 20;
+    });
+    await page.getByTestId('player').evaluate((v: HTMLVideoElement) => {
+      v.currentTime = 3;
+    });
+    await expect
+      .poll(
+        () =>
+          page.getByTestId('player').evaluate((v: HTMLVideoElement) => {
+            for (let i = 0; i < v.buffered.length; i++) if (v.buffered.start(i) <= 3.3 && v.buffered.end(i) > 4) return true;
+            return false;
+          }),
+        { timeout: 3000, intervals: [50] },
+      )
+      .toBe(true);
+    await page.getByTestId('player').evaluate((v: HTMLVideoElement) => v.play());
+    await expect.poll(() => currentTime(page), { timeout: 8000 }).toBeGreaterThan(5);
+    expect(await currentTime(page)).toBeLessThan(20);
+    await expect(demo).toHaveAttribute('data-integrity', 'verified');
   } finally {
     await ctx.close();
   }
