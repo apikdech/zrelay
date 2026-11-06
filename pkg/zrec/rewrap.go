@@ -29,6 +29,9 @@ func unwrapDEK(h Header, hd [32]byte, ring Keyring) (dek [32]byte, err error) {
 // verified; a damaged chunk survives a rotation unchanged. Nothing is
 // written to w unless the header is valid and the DEK unwraps.
 func Rewrap(r io.ReaderAt, size int64, w io.Writer, from Keyring, to Keys, rnd io.Reader) error {
+	if size < 0 {
+		return fmt.Errorf("zrec: negative size %d", size)
+	}
 	if rnd == nil {
 		rnd = rand.Reader
 	}

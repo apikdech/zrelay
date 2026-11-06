@@ -167,3 +167,16 @@ func TestRewrapErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestRewrapRejectsNegativeSize(t *testing.T) {
+	from, to := testKeys(0), testKeys(50)
+	clip, _ := sealClip(t, from, 1000)
+	var out bytes.Buffer
+	err := zrec.Rewrap(bytes.NewReader(clip), -1, &out, zrec.Keyring{from.ID: from}, to, &seqReader{})
+	if err == nil {
+		t.Fatal("negative size accepted")
+	}
+	if out.Len() != 0 {
+		t.Fatalf("wrote %d bytes before failing", out.Len())
+	}
+}

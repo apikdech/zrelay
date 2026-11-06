@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apikdech/zrelay-v2/pkg/sidecar"
 	"github.com/apikdech/zrelay-v2/pkg/zrec"
@@ -147,6 +148,11 @@ func TestZdecryptExitCodes(t *testing.T) {
 			if code != c.want {
 				t.Fatalf("exit = %d, want %d; stderr: %s", code, c.want, stderr)
 			}
+			if c.name == "positive" {
+				if got, want := fileSHA(t, args[len(args)-1]), plaintextSHA(t, "two-chunks"); got != want {
+					t.Fatalf("output sha256 = %s, want %s", got, want)
+				}
+			}
 		})
 	}
 }
@@ -256,8 +262,7 @@ func TestZdecryptSidecarMismatches(t *testing.T) {
 	key := keyRef(t, vectorMaster())
 	for name, edit := range map[string]func(*sidecar.Sidecar){
 		"clip_id":    func(s *sidecar.Sidecar) { s.ClipID[15] ^= 1 },
-		"key_id":     func(s *sidecar.Sidecar) { s.Video.KeyID = "0000000000000000" },
-		"chunk_size": func(s *sidecar.Sidecar) { s.Video.ChunkSize = 131072 },
+		"start_time": func(s *sidecar.Sidecar) { s.StartTime = sidecar.Time{Time: s.StartTime.Add(time.Millisecond)} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			sc := sidecarFor(t, "complete", edit)
@@ -275,6 +280,32 @@ func TestZdecryptSidecarMismatches(t *testing.T) {
 			t.Fatalf("exit = %d, want 1", code)
 		}
 	})
+}
+
+// Contract §6.1: video.key_id and video.chunk_size are hints only; the
+// descriptor is authoritative. A stale hint warns but does not fail (G3 limits
+// exit 6 to camera_id, clip_id and start_unix_ms).
+func TestZdecryptStaleSidecarHintsWarnButDecrypt(t *testing.T) {
+	key := keyRef(t, vectorMaster())
+	for name, edit := range map[string]func(*sidecar.Sidecar){
+		"key_id":     func(s *sidecar.Sidecar) { s.Video.KeyID = "0000000000000000" },
+		"chunk_size": func(s *sidecar.Sidecar) { s.Video.ChunkSize = 131072 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			sc := sidecarFor(t, "complete", edit)
+			out := filepath.Join(t.TempDir(), "o")
+			code, _, stderr := runCLI("--key", key, "--in", vectorPath("pos-two-chunks.zrec"), "--out", out, "--sidecar", sc)
+			if code != 0 {
+				t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr)
+			}
+			if !strings.Contains(stderr, "warning") || !strings.Contains(stderr, "video."+name) {
+				t.Fatalf("stderr lacks a warning naming video.%s: %q", name, stderr)
+			}
+			if got, want := fileSHA(t, out), plaintextSHA(t, "two-chunks"); got != want {
+				t.Fatalf("output sha256 = %s, want %s", got, want)
+			}
+		})
+	}
 }
 
 func TestZdecryptRejectsLiteralKey(t *testing.T) {
@@ -383,6 +414,28 @@ func TestZdecryptRewrap(t *testing.T) {
 	}
 	if !bytes.Equal(orig[hdr.HeaderLen:], got[hdr.HeaderLen:]) {
 		t.Fatal("rewrap changed the chunks")
+	}
+}
+
+// Rewrap changes the header key_id but nothing rewrites the sidecar, so a
+// rewrapped clip must still decrypt with its original sidecar (Contract §3.4, §6.1).
+func TestZdecryptRewrappedClipWithOriginalSidecar(t *testing.T) {
+	oldKey := keyRef(t, vectorMaster())
+	newKey := keyRef(t, zrec.MasterKey{42})
+	dir := t.TempDir()
+	rewrapped := filepath.Join(dir, "new.zrec")
+	sc := sidecarFor(t, "complete", nil) // key_id hint names the OLD key
+	if code, _, stderr := runCLI("rewrap", "--from", oldKey, "--to", newKey,
+		"--in", vectorPath("pos-two-chunks.zrec"), "--out", rewrapped); code != 0 {
+		t.Fatalf("rewrap exit = %d: %s", code, stderr)
+	}
+	out := filepath.Join(dir, "out.mp4")
+	code, _, stderr := runCLI("--key", newKey, "--in", rewrapped, "--sidecar", sc, "--out", out)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr)
+	}
+	if got, want := fileSHA(t, out), plaintextSHA(t, "two-chunks"); got != want {
+		t.Fatalf("output sha256 = %s, want %s", got, want)
 	}
 }
 

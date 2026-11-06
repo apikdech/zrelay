@@ -12,6 +12,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -177,9 +178,13 @@ func decrypt(args []string, stdout, stderr io.Writer) int {
 		return exitCode(err)
 	}
 	if sc != nil {
-		if err := checkSidecar(sc, r.Header()); err != nil {
+		warnings, err := checkSidecar(sc, r.Header())
+		if err != nil {
 			fmt.Fprintf(stderr, "zdecrypt: sidecar does not match the clip header: %v\n", err)
 			return exitMismatch
+		}
+		for _, w := range warnings {
+			fmt.Fprintf(stderr, "zdecrypt: warning: sidecar %s differs from the clip header (hint only; using the header)\n", w)
 		}
 	}
 
@@ -268,9 +273,12 @@ func readSidecar(path string) (*sidecar.Sidecar, error) {
 	return sc, nil
 }
 
-// checkSidecar compares the fields the sidecar copies from the header. The
-// header is authoritative (Contract §4.4); any difference is a mismatch.
-func checkSidecar(sc *sidecar.Sidecar, h zrec.Header) error {
+// checkSidecar compares the fields the sidecar binds to the header. Only
+// camera_id, clip_id and start_unix_ms are binding (Contract G3); any
+// difference is a mismatch. video.key_id and video.chunk_size are hints only
+// and the descriptor is authoritative (Contract §4.4, §6.1), so a stale hint,
+// as on every rewrapped clip, is returned as a warning and does not fail.
+func checkSidecar(sc *sidecar.Sidecar, h zrec.Header) (warnings []string, err error) {
 	var bad []string
 	if sc.Camera.ID != h.CameraID {
 		bad = append(bad, "camera.id")
@@ -281,16 +289,16 @@ func checkSidecar(sc *sidecar.Sidecar, h zrec.Header) error {
 	if sc.StartTime.UnixMilli() != h.StartUnixMs {
 		bad = append(bad, "start_time")
 	}
-	if !strings.EqualFold(sc.Video.KeyID, fmt.Sprintf("%x", h.KeyID)) {
-		bad = append(bad, "video.key_id")
+	if len(bad) > 0 {
+		return nil, fmt.Errorf("differs in %s", strings.Join(bad, ", "))
+	}
+	if !strings.EqualFold(sc.Video.KeyID, hex.EncodeToString(h.KeyID[:])) {
+		warnings = append(warnings, "video.key_id")
 	}
 	if sc.Video.ChunkSize != int64(h.ChunkSize) {
-		bad = append(bad, "video.chunk_size")
+		warnings = append(warnings, "video.chunk_size")
 	}
-	if len(bad) > 0 {
-		return fmt.Errorf("differs in %s", strings.Join(bad, ", "))
-	}
-	return nil
+	return warnings, nil
 }
 
 func rewrap(args []string, stderr io.Writer) int {
