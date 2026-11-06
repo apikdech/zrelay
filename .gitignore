@@ -19,3 +19,4 @@ web/playwright-report/
 # Deployment secrets and the deployed config (deploy/compose.yaml)
 deploy/secrets/
 deploy/zrelay.yaml
+deploy/zview.yaml

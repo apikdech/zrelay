@@ -5,6 +5,7 @@
 **/.env.*
 deploy/secrets
 deploy/zrelay.yaml
+deploy/zview.yaml
 **/node_modules
 web/dist
 *.zrec

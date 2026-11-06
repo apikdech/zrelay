@@ -1,0 +1,27 @@
+# zview-server container image (design §8.3). Build from the repository root:
+#   docker build -f deploy/Dockerfile.zview .
+# Stage 1 builds the SPA (pnpm, Vite), stage 2 builds the static Go binary,
+# and the runtime image is scratch: the binary, the CA bundle and the built
+# SPA at /app (the app_dir of deploy/zview.example.yaml).
+FROM node:26-alpine AS web
+RUN npm install --global pnpm@12
+WORKDIR /web
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/zview-server ./cmd/zview-server
+
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/zview-server /zview-server
+COPY --from=web /web/dist /app
+USER 65534:65534
+EXPOSE 8080
+ENTRYPOINT ["/zview-server","--config=/etc/zview/zview.yaml","--mode","both"]
