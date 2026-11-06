@@ -23,6 +23,9 @@ type breakerRig struct {
 	// breaker opens.
 	probeFn func(n int) error
 
+	// hook, when set, runs inside onChange after the change is recorded.
+	hook atomic.Pointer[func(BreakerState)]
+
 	mu      sync.Mutex
 	changes []BreakerState
 	// jitterMax records the upper bound handed to the jitter function.
@@ -48,6 +51,9 @@ func newRig(t *testing.T, realJitter bool) *breakerRig {
 			r.mu.Lock()
 			r.changes = append(r.changes, s)
 			r.mu.Unlock()
+			if h := r.hook.Load(); h != nil {
+				(*h)(s)
+			}
 		})
 	inner := r.b.jitter
 	r.b.jitter = func(max time.Duration) time.Duration {
@@ -288,5 +294,172 @@ func TestOnChangeCalledPerTransition(t *testing.T) {
 		if r.changes[i] != want[i] {
 			t.Fatalf("changes = %v, want %v", r.changes, want)
 		}
+	}
+}
+
+// TestOnChangeMayCallBackIntoBreaker is the lock-order regression: a callback
+// that re-enters the breaker (State) while another goroutine reports a
+// failure used to deadlock, and a slow callback used to stall every State and
+// Wait caller behind the breaker's lock.
+func TestOnChangeMayCallBackIntoBreaker(t *testing.T) {
+	r := newRig(t, false)
+	inCb := make(chan struct{})
+	proceed := make(chan struct{})
+	reentered := make(chan struct{})
+	hook := func(s BreakerState) {
+		if s != Closed {
+			return
+		}
+		close(inCb)
+		<-proceed
+		r.b.State() // must not block
+		close(reentered)
+	}
+	r.hook.Store(&hook)
+
+	r.b.Failure(true)
+	r.waitFor(t, r.armed)
+	r.clk.Advance(testBase)
+	<-inCb // state is already Closed; the Closed callback is running
+
+	// A slow callback must not stall the breaker's readers or writers.
+	finished := make(chan struct{})
+	go func() {
+		r.b.State()
+		if err := r.b.Wait(context.Background()); err != nil {
+			t.Error(err)
+		}
+		r.b.Success()
+		r.b.Failure(true) // reopens; its callback is queued behind the running one
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("breaker calls blocked behind a running onChange callback")
+	}
+
+	close(proceed)
+	select {
+	case <-reentered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onChange calling State() deadlocked")
+	}
+	r.waitFor(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return len(r.changes) == 4
+	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	want := []BreakerState{Open, HalfOpen, Closed, Open}
+	for i := range want {
+		if r.changes[i] != want[i] {
+			t.Fatalf("changes = %v, want %v (in order)", r.changes, want)
+		}
+	}
+}
+
+// TestSinceMarksOutageStart pins the State() semantics: since is when the
+// breaker left Closed and survives Open/HalfOpen probe cycling, so a consumer
+// (healthz, status/relay.json) can tell how long an outage has lasted.
+func TestSinceMarksOutageStart(t *testing.T) {
+	r := newRig(t, false)
+	r.probeFn = func(n int) error {
+		if n < 3 {
+			return errors.New("down")
+		}
+		return nil
+	}
+	r.b.Failure(true)
+	r.waitFor(t, r.armed)
+	for i, adv := range []time.Duration{testBase, 2 * testBase} {
+		r.clk.Advance(adv)
+		r.waitFor(t, func() bool { return int(r.probes.Load()) == i+1 && r.armed() })
+		s, since := r.b.State()
+		if s != Open || !since.Equal(epoch) {
+			t.Fatalf("after failed probe %d: state=%d since=%v, want Open since %v", i+1, s, since, epoch)
+		}
+	}
+	// HalfOpen keeps the outage start too.
+	block := make(chan struct{})
+	entered := make(chan struct{})
+	r.probeFn = func(int) error { close(entered); <-block; return nil }
+	r.clk.Advance(4 * testBase)
+	<-entered
+	if s, since := r.b.State(); s != HalfOpen || !since.Equal(epoch) {
+		t.Fatalf("HalfOpen: state=%d since=%v, want since %v", s, since, epoch)
+	}
+	r.clk.Advance(time.Minute) // time passes during the probe
+	closeAt := r.clk.Now()
+	close(block)
+	if err := r.b.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s, since := r.b.State(); s != Closed || !since.Equal(closeAt) {
+		t.Fatalf("after recovery: state=%d since=%v, want Closed since %v", s, since, closeAt)
+	}
+}
+
+// TestProbeIsBoundedByTimeout: a probe that hangs (blackholed endpoint) gets
+// its context cancelled after ProbeTimeout, counts as a failed probe and
+// reopens the breaker with the delay doubled.
+func TestProbeIsBoundedByTimeout(t *testing.T) {
+	const probeTimeout = 10 * time.Second
+	clk := clock.NewFake(epoch)
+	var probes atomic.Int32
+	entered := make(chan struct{}, 4)
+	b := NewBreaker(BreakerConfig{FailureThreshold: 5, BaseDelay: testBase, MaxDelay: testMax, ProbeTimeout: probeTimeout}, clk,
+		func(ctx context.Context) error {
+			probes.Add(1)
+			entered <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		}, nil)
+	var maxes []time.Duration
+	var mmu sync.Mutex
+	b.jitter = func(max time.Duration) time.Duration {
+		mmu.Lock()
+		maxes = append(maxes, max)
+		mmu.Unlock()
+		return max
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { b.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	b.Failure(true)
+	for clk.Pending() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	clk.Advance(testBase)
+	<-entered
+	if s, _ := b.State(); s != HalfOpen {
+		t.Fatalf("state during probe = %d, want HalfOpen", s)
+	}
+	clk.Advance(probeTimeout - time.Nanosecond)
+	time.Sleep(20 * time.Millisecond)
+	if s, _ := b.State(); s != HalfOpen {
+		t.Fatalf("state before probe timeout = %d, want HalfOpen", s)
+	}
+	clk.Advance(time.Nanosecond)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mmu.Lock()
+		n := len(maxes)
+		mmu.Unlock()
+		if s, _ := b.State(); s == Open && n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hung probe was not cancelled by ProbeTimeout")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mmu.Lock()
+	defer mmu.Unlock()
+	if maxes[1] != 2*testBase {
+		t.Fatalf("delay bound after timed-out probe = %v, want %v", maxes[1], 2*testBase)
 	}
 }

@@ -26,11 +26,16 @@ const (
 )
 
 // BreakerConfig configures a Breaker. Non-positive fields take the design
-// defaults (failure_threshold 5, base_delay 1 s, max_delay 5 min).
+// defaults (failure_threshold 5, base_delay 1 s, max_delay 5 min) and a 30 s
+// probe timeout.
 type BreakerConfig struct {
 	FailureThreshold int
 	BaseDelay        time.Duration
 	MaxDelay         time.Duration
+	// ProbeTimeout bounds each half-open probe: the context handed to probe
+	// is cancelled after it, and a probe that returns an error then counts as
+	// failed. It is measured on the breaker's clock.
+	ProbeTimeout time.Duration
 }
 
 // Breaker is the circuit breaker for one storage endpoint. It is safe for
@@ -44,19 +49,26 @@ type Breaker struct {
 	// jitter returns a duration in [0, max]; replaced by tests.
 	jitter func(max time.Duration) time.Duration
 
-	cbMu sync.Mutex // serialises onChange calls in transition order
-
 	mu       sync.Mutex
 	state    BreakerState
 	since    time.Time
-	failures int           // consecutive transient failures while Closed
-	bound    time.Duration // current backoff bound (before jitter)
-	changed  chan struct{} // closed and replaced on every transition
+	pending  []BreakerState // transitions whose onChange has not been called yet
+	notifier bool           // a goroutine is draining pending
+	failures int            // consecutive transient failures while Closed
+	bound    time.Duration  // current backoff bound (before jitter)
+	changed  chan struct{}  // closed and replaced on every transition
 }
 
 // NewBreaker returns a Closed breaker. probe is the half-open health check
-// (HeadBucket); onChange, which may be nil, is called once per state
-// transition, in order, outside the breaker's lock.
+// (HeadBucket); it is run with a context cancelled after cfg.ProbeTimeout, so
+// a hung endpoint cannot hold the breaker half-open forever, and it should
+// return promptly once that context is done. onChange, which may be nil, is
+// called once per state transition, in transition order and never
+// concurrently with itself, without holding any breaker lock: it may call back
+// into the breaker (State, Failure, ...) and may be slow without stalling
+// other callers. It runs on the goroutine that caused the transition (or on
+// one already delivering earlier transitions), so it is asynchronous with
+// respect to State and Wait: those may already show a newer state.
 func NewBreaker(cfg BreakerConfig, clk clock.Clock, probe func(ctx context.Context) error, onChange func(BreakerState)) *Breaker {
 	if cfg.FailureThreshold <= 0 {
 		cfg.FailureThreshold = 5
@@ -69,6 +81,9 @@ func NewBreaker(cfg BreakerConfig, clk clock.Clock, probe func(ctx context.Conte
 	}
 	if cfg.MaxDelay < cfg.BaseDelay {
 		cfg.MaxDelay = cfg.BaseDelay
+	}
+	if cfg.ProbeTimeout <= 0 {
+		cfg.ProbeTimeout = 30 * time.Second
 	}
 	return &Breaker{
 		cfg:      cfg,
@@ -90,7 +105,12 @@ func fullJitter(max time.Duration) time.Duration {
 	return time.Duration(rand.Int64N(int64(max) + 1))
 }
 
-// State returns the current state and when it was entered.
+// State returns the current state and a timestamp with these semantics: while
+// Closed, when the breaker closed (or was created); while Open or HalfOpen,
+// when it last left Closed, i.e. the start of the outage. The timestamp is NOT
+// reset by Open/HalfOpen probe cycling, so now minus since is the outage
+// length that /healthz ("open longer than 5 minutes") and status/relay.json
+// (storage.since) need.
 func (b *Breaker) State() (BreakerState, time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -143,25 +163,68 @@ func (b *Breaker) Failure(permanent bool) {
 	}
 	b.failures = 0
 	b.bound = b.cfg.BaseDelay
-	b.transition(Open) // unlocks b.mu
+	b.transitionLocked(Open)
+	b.mu.Unlock()
+	b.notify()
 }
 
-// transition moves to s, then calls onChange and releases waiters. It must be
-// called with b.mu held and releases it.
-func (b *Breaker) transition(s BreakerState) {
-	b.state = s
-	b.since = b.clk.Now()
-	old := b.changed
-	b.changed = make(chan struct{})
-	b.cbMu.Lock()
-	b.mu.Unlock()
-	defer b.cbMu.Unlock()
-	if b.onChange != nil {
-		b.onChange(s)
+// transitionLocked moves to s, queues the onChange notification and wakes
+// waiters. It must be called with b.mu held and never blocks; the caller must
+// call notify after unlocking. Waiters are woken here, at the state change,
+// not after onChange: a Wait that returns has seen the new state, but its
+// callback may not have been delivered yet.
+func (b *Breaker) transitionLocked(s BreakerState) {
+	if s == Closed || b.state == Closed {
+		b.since = b.clk.Now() // entering or leaving Closed; Open<->HalfOpen keeps it
 	}
-	// Wake waiters only after onChange, so a Wait that returns has seen the
-	// Closed notification.
-	close(old)
+	b.state = s
+	if b.onChange != nil {
+		b.pending = append(b.pending, s)
+	}
+	close(b.changed)
+	b.changed = make(chan struct{})
+}
+
+// notify delivers queued onChange notifications in order. At most one goroutine
+// drains the queue at a time; one that finds another draining returns at once,
+// and the drainer delivers its transition. b.mu is never held, and no other
+// lock is taken, while onChange runs.
+func (b *Breaker) notify() {
+	b.mu.Lock()
+	if b.notifier {
+		b.mu.Unlock()
+		return
+	}
+	b.notifier = true
+	for len(b.pending) > 0 {
+		s := b.pending[0]
+		b.pending = b.pending[1:]
+		b.mu.Unlock()
+		b.onChange(s)
+		b.mu.Lock()
+	}
+	b.notifier = false
+	b.mu.Unlock()
+}
+
+// runProbe runs one probe under a context cancelled after ProbeTimeout.
+func (b *Breaker) runProbe(ctx context.Context) error {
+	pctx, cancel := context.WithCancel(ctx)
+	timer := b.clk.NewTimer(b.cfg.ProbeTimeout)
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-timer.C():
+			cancel()
+		case <-stopped:
+		}
+	}()
+	defer func() {
+		timer.Stop()
+		close(stopped)
+		cancel()
+	}()
+	return b.probe(pctx)
 }
 
 // Run drives recovery: whenever the breaker is Open it waits the jittered
@@ -189,19 +252,25 @@ func (b *Breaker) Run(ctx context.Context) {
 		}
 
 		b.mu.Lock()
-		b.transition(HalfOpen)
-		err := b.probe(ctx)
+		b.transitionLocked(HalfOpen)
+		b.mu.Unlock()
+		b.notify()
+
+		err := b.runProbe(ctx)
 		if ctx.Err() != nil {
 			return
 		}
+
 		b.mu.Lock()
 		if err == nil {
 			b.bound = b.cfg.BaseDelay
 			b.failures = 0
-			b.transition(Closed)
+			b.transitionLocked(Closed)
 		} else {
 			b.bound = min(b.bound*2, b.cfg.MaxDelay)
-			b.transition(Open)
+			b.transitionLocked(Open)
 		}
+		b.mu.Unlock()
+		b.notify()
 	}
 }
