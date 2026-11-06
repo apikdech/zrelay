@@ -29,10 +29,10 @@ func TestTimeMarshalMillis(t *testing.T) {
 
 	// Any precision and any offset on unmarshal; the result is UTC.
 	for in, want := range map[string]time.Time{
-		`"2026-09-16T15:00:00Z"`:                time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC),
-		`"2026-09-16T15:00:00.5Z"`:              time.Date(2026, 9, 16, 15, 0, 0, 500e6, time.UTC),
-		`"2026-09-16T15:00:00.123456789Z"`:      time.Date(2026, 9, 16, 15, 0, 0, 123456789, time.UTC),
-		`"2026-09-16T22:00:00.250+07:00"`:       time.Date(2026, 9, 16, 15, 0, 0, 250e6, time.UTC),
+		`"2026-09-16T15:00:00Z"`:           time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC),
+		`"2026-09-16T15:00:00.5Z"`:         time.Date(2026, 9, 16, 15, 0, 0, 500e6, time.UTC),
+		`"2026-09-16T15:00:00.123456789Z"`: time.Date(2026, 9, 16, 15, 0, 0, 123456789, time.UTC),
+		`"2026-09-16T22:00:00.250+07:00"`:  time.Date(2026, 9, 16, 15, 0, 0, 250e6, time.UTC),
 	} {
 		var got Time
 		if err := json.Unmarshal([]byte(in), &got); err != nil {

@@ -89,9 +89,9 @@ func TestLayoutHelpers(t *testing.T) {
 		t.Errorf("NameRE = %s", NameRE)
 	}
 	for _, bad := range []string{
-		"14590000_01M2NBMVS0K8EKRQKGGAJCDT0B.zrec",   // 8 digits
-		"145900000_01M2NBMVS0K8EKRQKGGAJCDT0I.zrec",  // I is not Crockford
-		"145900000_01M2NBMVS0K8EKRQKGGAJCDT0B.mp4",   // extension
+		"14590000_01M2NBMVS0K8EKRQKGGAJCDT0B.zrec",    // 8 digits
+		"145900000_01M2NBMVS0K8EKRQKGGAJCDT0I.zrec",   // I is not Crockford
+		"145900000_01M2NBMVS0K8EKRQKGGAJCDT0B.mp4",    // extension
 		"a/145900000_01M2NBMVS0K8EKRQKGGAJCDT0B.zrec", // path
 	} {
 		if NameRE.MatchString(bad) {
