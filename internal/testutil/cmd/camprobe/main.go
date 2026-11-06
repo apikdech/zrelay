@@ -8,7 +8,12 @@
 //	    --config deploy/zrelay.example.yaml --camera tapo-c220
 //
 // Flags: --config, --camera, --interval (default 5m), --duration (default 0:
-// until interrupted), --env-file. Exit codes: 0 OK, 2 usage or config error.
+// until interrupted), --env-file, --live, --restream. --live also serves the
+// WHEP endpoint (config live: block) and --restream the RTSP restream
+// (config restream: block) from the same supervised camera, still with no
+// recorder or storage (docs/LIVE-CHECKS.md, Task 12); each logs
+// "<live|restream> listening addr=<host:port>". Exit codes: 0 OK, 2 usage or
+// config error.
 package main
 
 import (
@@ -17,6 +22,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,9 +36,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/apikdech/zrelay-v2/internal/bearer"
 	"github.com/apikdech/zrelay-v2/internal/relay/camera"
 	"github.com/apikdech/zrelay-v2/internal/relay/config"
 	"github.com/apikdech/zrelay-v2/internal/relay/events"
+	"github.com/apikdech/zrelay-v2/internal/relay/live"
+	"github.com/apikdech/zrelay-v2/internal/relay/restream"
 	"github.com/apikdech/zrelay-v2/pkg/secretref"
 )
 
@@ -51,6 +61,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	camID := fs.String("camera", "", "camera `id` from the config")
 	interval := fs.Duration("interval", 5*time.Minute, "how often to log")
 	duration := fs.Duration("duration", 0, "stop after this long (0: until interrupted)")
+	withLive := fs.Bool("live", false, "also serve WHEP live view (config live: block must enable it)")
+	withRestream := fs.Bool("restream", false, "also serve the RTSP restream (config restream: block must enable it)")
 	envFile := fs.String("env-file", "", "load KEY=VALUE lines into the environment before resolving ENV: references")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -59,7 +71,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *path == "" || *camID == "" || *interval <= 0 || *duration < 0 || fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: camprobe --config <path> --camera <id> [--interval 5m] [--duration 0] [--env-file <path>]")
+		fmt.Fprintln(stderr, "usage: camprobe --config <path> --camera <id> [--interval 5m] [--duration 0] [--env-file <path>] [--live] [--restream]")
 		return 2
 	}
 	if *envFile != "" {
@@ -76,6 +88,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	i := slices.IndexFunc(cfg.Cameras, func(c config.Camera) bool { return c.ID == *camID })
 	if i < 0 {
 		fmt.Fprintf(stderr, "camprobe: no camera %q in %s\n", *camID, *path)
+		return 2
+	}
+	if *withLive && cfg.Live.MaxViewers <= 0 {
+		fmt.Fprintf(stderr, "camprobe: --live needs live.max_viewers > 0 in %s\n", *path)
+		return 2
+	}
+	if *withRestream && cfg.Restream.Listen == "" {
+		fmt.Fprintf(stderr, "camprobe: --restream needs restream.listen in %s\n", *path)
 		return 2
 	}
 	cam := cfg.Cameras[i]
@@ -107,6 +127,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			log.printf("camera=%s state=%s rtsp=%s events=%s", cam.ID, s.State, s.RTSP, s.Events)
 		},
 	})
+
+	if *withLive || *withRestream {
+		stopServers, err := startServers(cfg, cam.ID, c.Hub, *withLive, *withRestream, log)
+		if err != nil {
+			fmt.Fprintf(stderr, "camprobe: %v\n", err)
+			return 2
+		}
+		defer stopServers()
+	}
 
 	// Count access units through an ordinary recorder subscription.
 	var aus atomic.Uint64
@@ -140,6 +169,59 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 				cam.ID, st.State, st.RTSP, st.Events, rate, runtime.NumGoroutine(), rssKiB())
 		}
 	}
+}
+
+// startServers starts the live (WHEP) and restream servers over hub and logs
+// where each listens. The returned stop function closes both.
+func startServers(cfg *config.Config, id string, hub *camera.Hub, withLive, withRestream bool, log *logger) (func(), error) {
+	hubs := map[string]*camera.Hub{id: hub}
+	var stops []func()
+	stopAll := func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
+	// fail releases whatever already started and returns err.
+	fail := func(err error) (func(), error) {
+		stopAll()
+		return nil, err
+	}
+	if withLive {
+		verifier, err := bearer.New(cfg.Live.APITokenSHA256)
+		if err != nil {
+			return fail(err)
+		}
+		srv, err := live.NewServer(live.Config{
+			Listen: cfg.Live.Listen, AdvertiseIP: cfg.Live.AdvertiseIP, ICEUDPPort: cfg.Live.ICEUDPPort,
+			MaxViewers: cfg.Live.MaxViewers, Verifier: verifier, Hubs: hubs,
+		})
+		if err != nil {
+			return fail(err)
+		}
+		stops = append(stops, func() { _ = srv.Close() })
+		ln, err := net.Listen("tcp", cfg.Live.Listen)
+		if err != nil {
+			return fail(fmt.Errorf("live: %w", err))
+		}
+		httpSrv := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() { _ = httpSrv.Serve(ln) }()
+		stops = append(stops, func() { _ = httpSrv.Close() })
+		log.printf("live listening addr=%s camera=%s", ln.Addr(), id)
+	}
+	if withRestream {
+		srv, err := restream.New(restream.Config{
+			Listen: cfg.Restream.Listen, Username: cfg.Restream.Username, Password: cfg.Restream.Password, Hubs: hubs,
+		})
+		if err != nil {
+			return fail(err)
+		}
+		if err := srv.Start(); err != nil {
+			return fail(fmt.Errorf("restream: %w", err))
+		}
+		stops = append(stops, srv.Close)
+		log.printf("restream listening addr=%s camera=%s", srv.Addr(), id)
+	}
+	return stopAll, nil
 }
 
 // logger writes timestamped lines, one at a time, and stops once closed:

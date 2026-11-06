@@ -20,6 +20,12 @@ const h264Fixture = "../../../../testdata/video/h264-640x360-gop2-10s.h264"
 // probeConfig writes a config for one camera on the local fakes.
 func probeConfig(t *testing.T, rtspURL string, onvifPort int) string {
 	t.Helper()
+	return probeConfigWith(t, rtspURL, onvifPort, "")
+}
+
+// probeConfigWith is probeConfig plus extra top-level YAML (live, restream).
+func probeConfigWith(t *testing.T, rtspURL string, onvifPort int, extra string) string {
+	t.Helper()
 	u, err := url.Parse(rtspURL)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +51,7 @@ cameras:
     credentials: { username: "admin", password: "secret" }
     rtsp: { port: %s, path: "/stream" }
     events: { source: "onvif", port: %d }
-`, filepath.Join(dir, "archive"), u.Port(), onvifPort)
+%s`, filepath.Join(dir, "archive"), u.Port(), onvifPort, extra)
 	p := filepath.Join(dir, "probe.yaml")
 	if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
 		t.Fatal(err)
