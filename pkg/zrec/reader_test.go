@@ -79,6 +79,7 @@ func TestReaderHeaderValidationErrors(t *testing.T) {
 		{"wrap_nonce", flip(hl-60, 0x01), ErrAuthHeader},
 		{"wrapped_dek", flip(hl-1, 0x01), ErrAuthHeader},
 		{"short header", file[:hl-1], ErrTruncated},
+		{"camera_id_len 100", oversizedCameraIDLen(t), ErrFormat},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

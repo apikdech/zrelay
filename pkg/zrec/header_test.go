@@ -36,6 +36,36 @@ func TestParseHeaderShortInputIsTruncated(t *testing.T) {
 	}
 }
 
+// oversizedCameraIDLen returns a header whose camera_id_len (100) exceeds the
+// Contract §4.1 limit of 64 while header_len (205) is consistent with it.
+func oversizedCameraIDLen(t *testing.T) []byte {
+	t.Helper()
+	b := validHeaderBytes(t)
+	b[36] = 100
+	binary.BigEndian.PutUint16(b[6:8], 105+100)
+	return append(b[:37:37], make([]byte, 300)...)
+}
+
+// Contract §4.4: an out-of-range camera_id_len is ErrFormat, whatever the
+// size of the buffer the caller passed in (the readers pass only 169 bytes).
+func TestParseHeaderOversizedCameraIDLenIsFormatForAnyBufferSize(t *testing.T) {
+	b := oversizedCameraIDLen(t)
+	for _, n := range []int{37, 100, MaxHeaderLen, 205, len(b)} {
+		if _, err := ParseHeader(b[:n]); !errors.Is(err, ErrFormat) || errors.Is(err, ErrTruncated) {
+			t.Fatalf("ParseHeader(%d bytes) = %v, want ErrFormat", n, err)
+		}
+	}
+}
+
+func TestParseHeaderZeroCameraIDLenIsFormatWhenShort(t *testing.T) {
+	b := validHeaderBytes(t)
+	b[36] = 0
+	binary.BigEndian.PutUint16(b[6:8], 105)
+	if _, err := ParseHeader(b[:104]); !errors.Is(err, ErrFormat) {
+		t.Fatalf("ParseHeader = %v, want ErrFormat", err)
+	}
+}
+
 func TestParseHeaderFormatErrors(t *testing.T) {
 	n := len("front-door")
 	cases := map[string]func(b []byte){

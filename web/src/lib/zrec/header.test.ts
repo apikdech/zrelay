@@ -65,4 +65,22 @@ describe('parseHeader', () => {
     b[36] = 0;
     expect(() => parseHeader(b)).toThrow(ErrFormat);
   });
+
+  // Contract §4.1/§4.4: camera_id_len outside 1..64 is ErrFormat whatever the
+  // buffer size; the worker fetches only bytes=0-168.
+  it.each([37, 100, 169, 205])('reports camera_id_len 100 as ErrFormat given %i bytes', (len) => {
+    const b = new Uint8Array(300);
+    b.set(clip().subarray(0, 37));
+    b[6] = 0;
+    b[7] = 205; // header_len = 105 + 100, consistent
+    b[36] = 100;
+    expect(() => parseHeader(b.subarray(0, len))).toThrow(ErrFormat);
+  });
+
+  it('reports a zero camera_id_len as ErrFormat even when the input is short', () => {
+    const b = clip().slice(0, 104);
+    b[7] = 105;
+    b[36] = 0;
+    expect(() => parseHeader(b)).toThrow(ErrFormat);
+  });
 });

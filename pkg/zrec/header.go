@@ -83,6 +83,9 @@ func ParseHeader(b []byte) (Header, error) {
 	if int(h.HeaderLen) != descriptorFixedLen+n+keyBlockLen {
 		return h, fmt.Errorf("%w: header_len %d inconsistent with camera_id_len %d", ErrFormat, h.HeaderLen, n)
 	}
+	if n < 1 || n > maxCameraIDLen {
+		return h, fmt.Errorf("%w: camera_id_len %d out of range 1..%d", ErrFormat, n, maxCameraIDLen)
+	}
 	if len(b) < int(h.HeaderLen) {
 		return h, fmt.Errorf("%w: header needs %d bytes, got %d", ErrTruncated, h.HeaderLen, len(b))
 	}
