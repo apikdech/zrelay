@@ -13,6 +13,8 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/pion/rtp"
 )
 
@@ -69,13 +71,9 @@ func runRTSP(ctx context.Context, rawURL string, sink SessionSink) error {
 	if err != nil {
 		return err
 	}
+	video := newVideoPath(a, dec)
 	c.OnPacketRTP(videoMedia, videoFormat, func(pkt *rtp.Packet) {
-		raw, ticks := a.packet(pkt.Timestamp, time.Now())
-		nalus, err := dec.Decode(pkt)
-		if err != nil || len(nalus) == 0 {
-			return // more packets needed, or a damaged unit
-		}
-		a.accessUnit(nalus, raw, ticks)
+		video.packet(pkt, time.Now())
 	})
 
 	if err := setupAudio(c, desc, a); err != nil {
@@ -88,35 +86,144 @@ func runRTSP(ctx context.Context, rawURL string, sink SessionSink) error {
 	return c.Wait()
 }
 
-// setupVideo sets up the H.264 track, or else the H.265 one.
+// videoPath feeds video RTP packets through the depacketizer into the
+// assembler.
+type videoPath struct {
+	a   *assembler
+	dec depacketizer
+}
+
+// newVideoPath wraps dec (an *rtph264.Decoder or *rtph265.Decoder) so each
+// access unit it completes carries the RTP timestamp the decoder used.
+func newVideoPath(a *assembler, dec decoder) *videoPath {
+	v := &videoPath{a: a, dec: markerDepacketizer{dec}}
+	if d, ok := dec.(*rtph264.Decoder); ok {
+		v.dec = &h264Depacketizer{d: d}
+	}
+	return v
+}
+
+// packet handles one video RTP packet that arrived at arrival.
+func (v *videoPath) packet(pkt *rtp.Packet, arrival time.Time) {
+	v.a.packet(pkt.Timestamp, arrival)
+	nalus, ts, err := v.dec.decode(pkt)
+	if err != nil || len(nalus) == 0 {
+		return // more packets needed, or a damaged unit
+	}
+	v.a.accessUnit(nalus, ts, v.a.ticksOf(ts))
+}
+
+// depacketizer returns the access unit, if any, that a packet completes and
+// that access unit's RTP timestamp.
+type depacketizer interface {
+	decode(pkt *rtp.Packet) (nalus [][]byte, ts uint32, err error)
+}
+
+// markerDepacketizer is for decoders that complete an access unit only on a
+// packet with the marker bit, so the unit has that packet's timestamp
+// (rtph265.Decoder in gortsplib v5.6.7).
+type markerDepacketizer struct{ d decoder }
+
+func (m markerDepacketizer) decode(pkt *rtp.Packet) ([][]byte, uint32, error) {
+	nalus, err := m.d.Decode(pkt)
+	return nalus, pkt.Timestamp, err
+}
+
+// h264Depacketizer tracks the frame buffered inside rtph264.Decoder, which
+// does not report the timestamp of the access units it returns. Mirroring
+// Decoder.Decode in gortsplib v5.6.7, a packet that yields complete NAL
+// units either
+//   - has a new timestamp while an earlier frame is buffered (a camera that
+//     omits the marker bit): the buffered frame is returned with its own
+//     timestamp and the new NAL units are buffered, marker or not; or
+//   - is added to the buffer, which is returned with this packet's
+//     timestamp when the marker bit is set.
+//
+// A packet holding only the start or middle of a fragmented NAL unit leaves
+// the buffer as it was.
+type h264Depacketizer struct {
+	d        *rtph264.Decoder
+	buffered bool   // the decoder holds NAL units of an unfinished frame
+	bufTS    uint32 // their RTP timestamp
+}
+
+func (h *h264Depacketizer) decode(pkt *rtp.Packet) ([][]byte, uint32, error) {
+	complete := h264CompletesNALU(pkt.Payload)
+	split := complete && h.buffered && pkt.Timestamp != h.bufTS
+	ts := pkt.Timestamp
+	if split {
+		ts = h.bufTS
+	}
+	nalus, err := h.d.Decode(pkt)
+	switch {
+	case !complete:
+		// Fragment start or middle: the frame buffer is untouched.
+	case err != nil && !errors.Is(err, rtph264.ErrMorePacketsNeeded):
+		// A damaged packet: the decoder rejected it before buffering.
+	case split:
+		h.buffered, h.bufTS = true, pkt.Timestamp
+	case pkt.Marker:
+		// The buffer was returned (or dropped as a trailing SEI unit).
+		h.buffered = false
+	default:
+		h.buffered, h.bufTS = true, pkt.Timestamp
+	}
+	return nalus, ts, err
+}
+
+// h264CompletesNALU reports whether an H.264 RTP payload ends with complete
+// NAL units: a single NAL unit, a STAP-A, or the last fragment of an FU-A.
+func h264CompletesNALU(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	switch h264.NALUType(payload[0] & 0x1f) {
+	case h264.NALUTypeFUA:
+		return len(payload) >= 2 && payload[1]&0x40 != 0
+	case h264.NALUTypeSTAPB, h264.NALUTypeMTAP16, h264.NALUTypeMTAP24, h264.NALUTypeFUB:
+		return false // unsupported by the decoder
+	}
+	return true
+}
+
+// setupVideo sets up the selected video track.
 func setupVideo(c *gortsplib.Client, desc *description.Session, sink SessionSink) (*description.Media, format.Format, *assembler, decoder, error) {
+	medi, forma, err := selectVideo(desc)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	var (
+		dec decoder
+		a   *assembler
+	)
+	switch f := forma.(type) {
+	case *format.H264:
+		dec, err = f.CreateDecoder()
+		a = newAssembler(h264Rules, nil, f.SPS, f.PPS, sink, ntpFunc(c, medi, f))
+	case *format.H265:
+		dec, err = f.CreateDecoder()
+		a = newAssembler(h265Rules, f.VPS, f.SPS, f.PPS, sink, ntpFunc(c, medi, f))
+	}
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if _, err := c.Setup(desc.BaseURL, medi, 0, 0); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return medi, forma, a, dec, nil
+}
+
+// selectVideo picks the H.264 track, or else the H.265 one.
+func selectVideo(desc *description.Session) (*description.Media, format.Format, error) {
 	var h264f *format.H264
 	if medi := desc.FindFormat(&h264f); medi != nil {
-		dec, err := h264f.CreateDecoder()
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-		if _, err := c.Setup(desc.BaseURL, medi, 0, 0); err != nil {
-			return nil, nil, nil, nil, err
-		}
-		sps, pps := h264f.SPS, h264f.PPS
-		a := newAssembler(h264Rules, nil, sps, pps, sink, ntpFunc(c, medi, h264f))
-		return medi, h264f, a, dec, nil
+		return medi, h264f, nil
 	}
 	var h265f *format.H265
 	if medi := desc.FindFormat(&h265f); medi != nil {
-		dec, err := h265f.CreateDecoder()
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-		if _, err := c.Setup(desc.BaseURL, medi, 0, 0); err != nil {
-			return nil, nil, nil, nil, err
-		}
-		vps, sps, pps := h265f.VPS, h265f.SPS, h265f.PPS
-		a := newAssembler(h265Rules, vps, sps, pps, sink, ntpFunc(c, medi, h265f))
-		return medi, h265f, a, dec, nil
+		return medi, h265f, nil
 	}
-	return nil, nil, nil, nil, errNoVideo
+	return nil, nil, errNoVideo
 }
 
 // ntpFunc maps RTP timestamps of a video format to wall time using the RTCP
@@ -130,17 +237,12 @@ func ntpFunc(c *gortsplib.Client, medi *description.Media, forma format.Format) 
 
 // setupAudio sets up G.711 8 kHz mono audio when the camera offers it.
 func setupAudio(c *gortsplib.Client, desc *description.Session, a *assembler) error {
-	var g711 *format.G711
-	medi := desc.FindFormat(&g711)
-	if medi == nil || g711.SampleRate != 8000 || g711.ChannelCount != 1 {
+	medi, g711, codec := selectAudio(desc)
+	if medi == nil {
 		return nil
 	}
 	if _, err := c.Setup(desc.BaseURL, medi, 0, 0); err != nil {
 		return err
-	}
-	codec := "PCMA"
-	if g711.MULaw {
-		codec = "PCMU"
 	}
 	c.OnPacketRTP(medi, g711, func(pkt *rtp.Packet) {
 		a.audio(&AudioPacket{
@@ -153,9 +255,29 @@ func setupAudio(c *gortsplib.Client, desc *description.Session, a *assembler) er
 	return nil
 }
 
-// Redact removes the credentials of rawURL (userinfo, and the password in
-// raw and escaped form) from err's message. It returns nil for nil and err
-// itself when the message holds no credentials.
+// selectAudio picks a G.711 8 kHz mono track and names its codec ("PCMA" or
+// "PCMU"). It returns a nil media when there is none.
+func selectAudio(desc *description.Session) (*description.Media, *format.G711, string) {
+	var g711 *format.G711
+	medi := desc.FindFormat(&g711)
+	if medi == nil || g711.SampleRate != 8000 || g711.ChannelCount != 1 {
+		return nil, nil, ""
+	}
+	if g711.MULaw {
+		return medi, g711, "PCMU"
+	}
+	return medi, g711, "PCMA"
+}
+
+// Redact removes the credentials of rawURL from err's message: the userinfo
+// where it is followed by '@' (as written in rawURL and as net/url prints
+// it), and the password in raw and escaped form. A bare username elsewhere
+// in the message is left alone. It returns nil for nil and err itself when
+// the message holds no credentials.
+//
+// A redacted error still matches its causes with errors.Is, but it does not
+// unwrap: errors.Unwrap and errors.As would hand out the original error,
+// whose message holds the credentials.
 func Redact(err error, rawURL string) error {
 	if err == nil {
 		return nil
@@ -163,24 +285,54 @@ func Redact(err error, rawURL string) error {
 	u, perr := url.Parse(rawURL)
 	if perr != nil {
 		// Credentials cannot be located, so none of the message is kept.
-		return errors.New("camera: RTSP session failed (message withheld: unparseable URL)")
+		return &redactedError{msg: "camera: RTSP session failed (message withheld: unparseable URL)", cause: err}
 	}
 	if u.User == nil {
 		return err
 	}
-	secrets := []string{u.User.String()}
+	type secret struct{ s, with string }
+	secrets := []secret{{u.User.String() + "@", "***@"}}
+	if raw := rawUserinfo(rawURL); raw != "" {
+		secrets = append(secrets, secret{raw + "@", "***@"})
+	}
 	if pw, ok := u.User.Password(); ok && pw != "" {
-		secrets = append(secrets, pw, url.PathEscape(pw), url.QueryEscape(pw))
+		for _, s := range []string{pw, url.PathEscape(pw), url.QueryEscape(pw)} {
+			secrets = append(secrets, secret{s, "***"})
+		}
 	}
 	msg := err.Error()
 	redacted := msg
 	for _, s := range secrets {
-		if s != "" {
-			redacted = strings.ReplaceAll(redacted, s, "***")
-		}
+		redacted = strings.ReplaceAll(redacted, s.s, s.with)
 	}
 	if redacted == msg {
 		return err
 	}
-	return errors.New(redacted)
+	return &redactedError{msg: redacted, cause: err}
 }
+
+// rawUserinfo returns the userinfo of rawURL as written, or "".
+func rawUserinfo(rawURL string) string {
+	_, rest, ok := strings.Cut(rawURL, "://")
+	if !ok {
+		return ""
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	if i := strings.LastIndex(rest, "@"); i >= 0 {
+		return rest[:i]
+	}
+	return ""
+}
+
+// redactedError is an error whose message had credentials removed.
+type redactedError struct {
+	msg   string
+	cause error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+
+// Is matches the causes of the original error without exposing it.
+func (e *redactedError) Is(target error) bool { return errors.Is(e.cause, target) }

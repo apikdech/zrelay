@@ -27,7 +27,8 @@ func (c Codec) Equal(o Codec) bool {
 // codes. PTS and DTS are 90 kHz ticks, unwrapped across RTP timestamp wraps;
 // DTS starts at 0 for the first IDR of the session. ParamGen counts parameter
 // set changes in the session; it matches the latest Codec call. Wall is the
-// UTC wall time of the decode timestamp. Bytes is the total NAL unit size.
+// UTC wall time of the decode timestamp; it strictly increases within a
+// session (see assembler.emit). Bytes is the total NAL unit size.
 type AccessUnit struct {
 	PTS, DTS int64
 	IDR      bool
@@ -186,13 +187,17 @@ type assembler struct {
 	// has arrived.
 	ntp func(rtp uint32) (time.Time, bool)
 
-	codec Codec
-	gen   uint32
+	// codec holds the parameter sets in force. announced is the codec of
+	// the latest Codec call (valid once haveAnnounced), and gen its
+	// generation. A change is announced with the next access unit that is
+	// actually queued or emitted, so a dropped unit cannot lose it.
+	codec         Codec
+	announced     Codec
+	haveAnnounced bool
+	gen           uint32
 
 	unwrap       unwrapper
-	havePrev     bool
-	prevRaw      uint32
-	prevTicks    int64
+	havePacket   bool
 	firstArrival time.Time
 	firstTicks   int64
 
@@ -206,6 +211,10 @@ type assembler struct {
 	decided    bool
 	timeSource TimeSource
 	pending    []pendingAU
+
+	haveWall    bool
+	lastWall    time.Time
+	lastWallDTS int64
 }
 
 func newAssembler(rules codecRules, vps, sps, pps []byte, sink SessionSink, ntp func(uint32) (time.Time, bool)) *assembler {
@@ -232,32 +241,27 @@ func (a *assembler) withParams(c Codec, vps, sps, pps []byte) Codec {
 	return c
 }
 
-// packet records one video RTP packet's timestamp and arrival. It returns
-// the RTP timestamp and unwrapped ticks of the access unit the decoder
-// completes with this packet, if any: the previous timestamp when the
-// timestamp changed, otherwise this one.
-func (a *assembler) packet(ts uint32, arrival time.Time) (auRaw uint32, auTicks int64) {
+// packet records one video RTP packet's timestamp and arrival, in arrival
+// order, for unwrapping and the arrival time source.
+func (a *assembler) packet(ts uint32, arrival time.Time) {
 	ticks := a.unwrap.unwrap(ts)
-	auRaw, auTicks = ts, ticks
-	if !a.havePrev {
-		a.firstArrival, a.firstTicks = arrival, ticks
-	} else if ts != a.prevRaw {
-		auRaw, auTicks = a.prevRaw, a.prevTicks
+	if !a.havePacket {
+		a.havePacket, a.firstArrival, a.firstTicks = true, arrival, ticks
 	}
-	a.havePrev, a.prevRaw, a.prevTicks = true, ts, ticks
-	return auRaw, auTicks
+}
+
+// ticksOf unwraps the RTP timestamp of an access unit relative to the latest
+// packet passed to packet (an access unit may carry an earlier timestamp
+// than the packet that completed it).
+func (a *assembler) ticksOf(ts uint32) int64 {
+	return a.unwrap.value + int64(int32(ts-a.unwrap.last))
 }
 
 // accessUnit handles one decoded access unit with RTP timestamp raw
 // (unwrapped: ticks). nalus must not be retained by the caller.
 func (a *assembler) accessUnit(nalus [][]byte, raw uint32, ticks int64) {
-	var newCodec *Codec
 	if c, changed := a.inBandParams(nalus); changed {
 		a.codec = c
-		if a.started {
-			a.gen++
-			newCodec = &c
-		}
 	}
 
 	idr := a.rules.randomAccess(nalus)
@@ -287,17 +291,14 @@ func (a *assembler) accessUnit(nalus [][]byte, raw uint32, ticks int64) {
 	}
 	a.haveDTS, a.lastDTS = true, dts
 
+	p := pendingAU{rtp: raw, codec: a.announcement()}
 	au := &AccessUnit{PTS: pts, DTS: dts, IDR: idr, NALUs: cloneNALUs(nalus), ParamGen: a.gen}
 	for _, n := range au.NALUs {
 		au.Bytes += len(n)
 	}
-	p := pendingAU{au: au, rtp: raw, codec: newCodec}
+	p.au = au
 
 	if !a.decided {
-		if len(a.pending) == 0 {
-			c := a.codec // the first Codec call announces the codec in force
-			p.codec = &c
-		}
 		a.pending = append(a.pending, p)
 		if _, ok := a.ntp(raw); ok {
 			a.decide(TimeSourceRTCP)
@@ -307,6 +308,23 @@ func (a *assembler) accessUnit(nalus [][]byte, raw uint32, ticks int64) {
 		return
 	}
 	a.emit(p)
+}
+
+// announcement returns the codec to announce with the access unit about to
+// be queued, or nil when the latest Codec call still holds. The first call
+// announces generation 0; each later change bumps the generation. Parameter
+// sets that changed and changed back while units were dropped announce
+// nothing.
+func (a *assembler) announcement() *Codec {
+	if a.haveAnnounced {
+		if a.codec.Equal(a.announced) {
+			return nil
+		}
+		a.gen++
+	}
+	a.announced, a.haveAnnounced = a.codec, true
+	c := a.codec
+	return &c
 }
 
 // decide fixes the session's time source and flushes the held units.
@@ -322,7 +340,19 @@ func (a *assembler) emit(p pendingAU) {
 	if p.codec != nil {
 		a.sink.Codec(*p.codec, a.timeSource)
 	}
-	p.au.Wall = a.wall(p)
+	// Wall never runs slower than the media clock: in rtcp mode a sender
+	// report that moves the NTP mapping back (a camera NTP step or drift
+	// correction) would otherwise make Wall step backwards. Wall then keeps
+	// advancing by the DTS step until the mapping is ahead again; a forward
+	// step is followed at once.
+	wall := a.wall(p)
+	if a.haveWall {
+		if floor := a.lastWall.Add(ticksToDuration(p.au.DTS - a.lastWallDTS)); wall.Before(floor) {
+			wall = floor
+		}
+	}
+	a.haveWall, a.lastWall, a.lastWallDTS = true, wall, p.au.DTS
+	p.au.Wall = wall
 	a.sink.Video(p.au)
 }
 

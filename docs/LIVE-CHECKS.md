@@ -47,3 +47,39 @@ microphone is on. Step 4 fails with a message containing `***` or no credentials
   there points at `unwrapper` in `au.go` and `TestAccessUnitsMonotonicAcrossRTPWrap`.
 
 **Status:** not run
+
+## Task 6 (review fixes) — Access units and the RTSP session
+
+**Automated in this task:** Fixes after review, all under `make vet test`:
+`TestVideoPathStampsAccessUnits` packetizes both fixtures with gortsplib's `rtph264`/`rtph265`
+encoders (payload limits 1 MiB, 4000 and 1450 bytes, so every AU fits in one RTP packet, some
+do, or none do; plus H.264 with the marker bit cleared) and feeds them through the same
+depacketize-and-assemble path as `RunRTSP`; every AU arrives with PTS = DTS = index × 6000 and
+the arrival-mode Wall. Before the fix the single-packet case delivered 121 of 150 AUs and the
+4000-byte case 90 of 150. `TestCodecAnnouncedWhenChangingAUIsDropped` (a parameter-set change on
+a dropped AU is still announced by `Codec` before the first AU of the new `ParamGen`),
+`TestWallClockRTCPNeverStepsBack` (Wall never steps back when the sender-report mapping does),
+`TestRedactUsernameOnly`, `TestRedactKeepsErrorsIs`, `TestRunRTSPInvalidURL`, `TestSelectVideo`
+(errNoVideo) and `TestSelectAudio` (PCMU) pass. None of this ran against a camera.
+
+**Manual steps:**
+1. On a host on the camera's network, from the repository root: `read -s ZRELAY_LIVE_RTSP_URL`,
+   type `rtsp://<user>:<password>@<tapo-ip>:554/stream2` (the sub-stream, whose small P-frames
+   fit in one RTP packet), then `export ZRELAY_LIVE_RTSP_URL`.
+2. Point the camera at a static scene (a wall), so P-frames are small.
+3. Run: `ZRELAY_LIVE_RTSP_SECONDS=120 go test -race -count=1 -run TestLiveCameraSession -v ./internal/relay/camera/`
+4. Repeat step 3 with `stream1`.
+5. `unset ZRELAY_LIVE_RTSP_URL`.
+
+**Expected result:** for both streams the AU count is within 2 % of fps × 120 (no GOPs lost to
+resynchronisation), exactly one `Codec` line, and the logged wall drift vs media stays within
+±1 s.
+
+**If the result differs, update:**
+- AU count well below fps × 120 with single-packet AUs: `h264Depacketizer` /
+  `markerDepacketizer` in `internal/relay/camera/rtsp.go` (the gortsplib decoder's timestamp
+  behaviour may differ from the v5.6.7 model they mirror) and `TestVideoPathStampsAccessUnits`.
+- Wall drifting ahead of the camera clock after an NTP step on the camera: the Wall floor in
+  `assembler.emit` (`internal/relay/camera/au.go`) and `TestWallClockRTCPNeverStepsBack`.
+
+**Status:** not run

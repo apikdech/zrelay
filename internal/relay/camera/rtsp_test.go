@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -469,5 +471,52 @@ func TestNoKeyframeNoVideo(t *testing.T) {
 		if !bytes.Equal(au.NALUs[len(au.NALUs)-1], all[30+i].NALUs[len(all[30+i].NALUs)-1]) {
 			t.Fatalf("AU %d is not fixture AU %d", i, 30+i)
 		}
+	}
+}
+
+func TestRedactUsernameOnly(t *testing.T) {
+	t.Parallel()
+	const raw = "rtsp://a@cam.local:554/stream1"
+	err := camera.Redact(errors.New("dial rtsp://a@cam.local:554/stream1: a camera said no"), raw)
+	const want = "dial rtsp://***@cam.local:554/stream1: a camera said no"
+	if err.Error() != want {
+		t.Fatalf("Redact = %q, want %q", err, want)
+	}
+}
+
+func TestRedactKeepsErrorsIs(t *testing.T) {
+	t.Parallel()
+	const raw = "rtsp://u:s3cret@cam.local/x"
+	cause := fmt.Errorf("read rtsp://u:s3cret@cam.local/x: %w", io.ErrUnexpectedEOF)
+	got := camera.Redact(cause, raw)
+	if msg := got.Error(); strings.Contains(msg, "s3cret") || msg != "read rtsp://***@cam.local/x: unexpected EOF" {
+		t.Fatalf("Redact = %q", msg)
+	}
+	if !errors.Is(got, io.ErrUnexpectedEOF) {
+		t.Fatal("errors.Is lost the cause")
+	}
+	// The unredacted cause is deliberately not reachable.
+	if errors.Unwrap(got) != nil {
+		t.Fatal("Redact exposes the unredacted cause through Unwrap")
+	}
+}
+
+func TestRunRTSPInvalidURL(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ url, want string }{
+		{"http://u:s3cret@127.0.0.1:1/x", "camera: invalid RTSP URL"},
+		{"rtsp://u:s3cret@[::1/x", "camera: RTSP session failed (message withheld: unparseable URL)"},
+	} {
+		err := camera.RunRTSP(context.Background(), tc.url, newRecSink())
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("RunRTSP(%q) = %v, want %q", tc.url, err, tc.want)
+		}
+		if err != nil && strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("RunRTSP(%q) error leaks credentials: %q", tc.url, err)
+		}
+	}
+	got := camera.Redact(errors.New("dial rtsp://u:s3cret@[::1/x"), "rtsp://u:s3cret@[::1/x")
+	if msg := got.Error(); strings.Contains(msg, "s3cret") || !strings.Contains(msg, "message withheld") {
+		t.Fatalf("Redact with an unparseable URL = %q", msg)
 	}
 }
