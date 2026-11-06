@@ -534,10 +534,10 @@ func finalName(name string) string {
 
 // ListIncomplete implements storage.Recoverer: every ".<name>.part" file whose
 // final key matches prefix by whole path element and whose mtime is at least
-// olderThan ago. On a filesystem a staging sidecar written by PutSmall
-// (".<name>.json.part", Contract §7.3 step 0) is indistinguishable from a
-// crashed stream and is listed too; the caller triages by final key
-// (Contract §7.4).
+// olderThan ago. Final keys ending in ".json" are skipped: only ".zrec" video is
+// streamed (Contract §7.3 step 1), and ".<name>.json.part" is the staging
+// sidecar written by PutSmall (step 0), which s3 never lists either. Recovery
+// promotes staging sidecars by its own rules (Contract §7.4).
 func (d *Driver) ListIncomplete(ctx context.Context, prefix string, olderThan time.Duration) ([]storage.Incomplete, error) {
 	if err := cleanPrefix(prefix); err != nil {
 		return nil, err
@@ -550,7 +550,7 @@ func (d *Driver) ListIncomplete(ctx context.Context, prefix string, olderThan ti
 	add := func(stagingKey string, fi fs.FileInfo) {
 		dir, name := splitKey(stagingKey)
 		x := finalName(name)
-		if x == "" || fi.ModTime().After(cutoff) {
+		if x == "" || strings.HasSuffix(x, ".json") || fi.ModTime().After(cutoff) {
 			return
 		}
 		out = append(out, storage.Incomplete{

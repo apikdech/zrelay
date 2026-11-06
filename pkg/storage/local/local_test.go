@@ -288,6 +288,7 @@ func TestLocalRecoverCommitRejectsMismatchedStaging(t *testing.T) {
 		{Key: "clips/..", StagingKey: "clips/...part"},   // degenerate staging name
 		{Key: "clips/.", StagingKey: "clips/...part"},
 		{Key: "clips/x", StagingKey: "clips/x"}, // not a staging name at all
+		{Key: "../x", StagingKey: "../.x.part"}, // escapes the root
 	} {
 		if _, err := d.RecoverCommit(ctx, inc); !errors.Is(err, storage.ErrInvalidKey) {
 			t.Errorf("RecoverCommit(%+v) error = %v, want ErrInvalidKey", inc, err)
