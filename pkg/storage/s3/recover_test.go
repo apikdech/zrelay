@@ -16,8 +16,9 @@ import (
 	"github.com/apikdech/zrelay-v2/pkg/storage/s3"
 )
 
-// fakeRecoverS3 adds paginated ListMultipartUploads and ListParts to fakeS3,
-// with a per-upload Initiated time, and serves everything else through it.
+// fakeRecoverS3 adds paginated ListMultipartUploads (with MinIO's prefix
+// semantics) and ListParts to fakeS3, with a per-upload Initiated time, and
+// serves everything else through it.
 type fakeRecoverS3 struct {
 	*fakeS3
 	URL        string
@@ -66,7 +67,9 @@ func (f *fakeRecoverS3) listUploads(w http.ResponseWriter, prefix, keyMarker, id
 	type up struct{ key, id string }
 	var all []up
 	for id, u := range f.uploads {
-		if strings.HasPrefix(u.key, prefix) && (u.key > keyMarker || u.key == keyMarker && id > idMarker) {
+		// As MinIO does: a non-empty prefix matches only the exact object
+		// name, never a byte prefix of it.
+		if (prefix == "" || u.key == prefix) && (u.key > keyMarker || u.key == keyMarker && id > idMarker) {
 			all = append(all, up{u.key, id})
 		}
 	}

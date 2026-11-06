@@ -83,3 +83,55 @@ resynchronisation), exactly one `Codec` line, and the logged wall drift vs media
   `assembler.emit` (`internal/relay/camera/au.go`) and `TestWallClockRTCPNeverStepsBack`.
 
 **Status:** not run
+
+## Task 19 — `s3` recoverer
+
+**Automated in this task:** `pkg/storage/s3/recover.go` (`ListIncomplete`, `RecoverCommit`,
+`AbortIncomplete`). Against MinIO in Docker (`storagetest.MinIOImage`, `make integration`):
+`TestS3Recoverer` (the `storagetest.RunRecoverer` suite, plus a crash after 2 full 5 MiB parts and a
+1 MiB+123 partial buffer recovering exactly the first 10 MiB), `TestRecoverZeroPartsAborts`,
+`TestListIncompleteRespectsAge` (`olderThan` 0 vs 1h) and `TestAbortIncompleteRemovesUpload` all
+pass. Unit tests against an in-process fake (`make test`) cover paginated ListMultipartUploads and
+ListParts, element-wise prefix and root filtering, the Initiated age filter with server clock skew,
+gapped part numbers, a lost CompleteMultipartUpload response followed by a retried `RecoverCommit`,
+a gone upload, zero parts and malformed candidates. A probe against the pinned MinIO showed that
+MinIO's ListMultipartUploads honours only an empty prefix or an exact object name (a directory
+prefix such as `<root>/clips/cam/` lists nothing), so the driver lists the bucket's uploads with no
+prefix and filters client-side. The Synology MinIO was not reachable.
+
+**Manual steps:**
+1. On a host on the tailnet, set the relay's S3 credentials without echoing them:
+   `read -s AWS_ACCESS_KEY_ID; read -s AWS_SECRET_ACCESS_KEY; export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY`,
+   and set `EP=https://<synology-minio-host>:<port>`, `B=<bucket>`, `R=<root>` (the values from
+   `zrelay.yaml`).
+2. Start an upload with the relay credentials:
+   `docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY amazon/aws-cli:2.22.0 --endpoint-url "$EP" --region us-east-1 s3api create-multipart-upload --bucket "$B" --key "$R/clips/livecheck/2026/11/06/000000000_01JC0000000000000000000000.zrec"`
+   and note the `UploadId`.
+3. List with no prefix (what the driver sends):
+   `docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY amazon/aws-cli:2.22.0 --endpoint-url "$EP" --region us-east-1 s3api list-multipart-uploads --bucket "$B"`
+4. List with a directory prefix, to record the server's prefix behaviour:
+   the same command with `--prefix "$R/clips/livecheck/"`.
+5. List the (empty) parts:
+   `... s3api list-parts --bucket "$B" --key "$R/clips/livecheck/2026/11/06/000000000_01JC0000000000000000000000.zrec" --upload-id <UploadId>`
+6. Abort it:
+   `... s3api abort-multipart-upload --bucket "$B" --key "$R/clips/livecheck/2026/11/06/000000000_01JC0000000000000000000000.zrec" --upload-id <UploadId>`,
+   then repeat step 3. Finally `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY`.
+
+**Expected result:** steps 2, 3, 5 and 6 succeed under the relay policy (design §6.5); step 3 lists
+the upload with an `Initiated` time in UTC within a few seconds of the host clock; step 5 returns
+no parts; after step 6, step 3 no longer lists it. Step 4 may list nothing (MinIO's exact-name
+prefix behaviour); that is expected and does not matter to the driver.
+
+**If the result differs, update:**
+- Step 3 denied (AccessDenied) while step 4 is allowed: the relay MinIO policy restricts
+  `s3:ListBucketMultipartUploads` by an `s3:prefix` condition. Grant it on the bucket without a
+  prefix condition in the runbook policy (design §6.5), or, if the server matches byte prefixes,
+  send `Prefix: <root>/` in `ListIncomplete` (`pkg/storage/s3/recover.go`) and change the fake's
+  prefix rule in `fakeRecoverS3.listUploads` (`pkg/storage/s3/recover_test.go`) to match.
+- `Initiated` far from the host clock: the age filter in `ListIncomplete` trusts the server clock
+  against `time.Now()`; fix NTP on the NAS, or widen the 2-minute candidate age in the caller
+  (Contract §7.4, design §6.5).
+- Step 5 or 6 denied: add `s3:ListMultipartUploadParts` / `s3:AbortMultipartUpload` to the relay
+  policy (design §6.5).
+
+**Status:** not run
