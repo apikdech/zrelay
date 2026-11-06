@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Status } from '../../worker/schemas';
+  import { zoneChoices } from '../timeline/zonePref';
   import StatusDot from './StatusDot.svelte';
 
   interface Props {
@@ -11,14 +12,22 @@
     /** '' means all triggers. */
     trigger: string;
     status: Status | null;
+    /** The viewer's own zone, offered as the default choice. */
+    browserZone: string;
+    /** The forced display zone; null follows the viewer's own. */
+    forcedZone: string | null;
     nowMs?: number;
     onCamera: (id: string) => void;
     onDay: (day: string) => void;
     onTrigger: (type: string) => void;
+    /** A zone name, or null to follow the viewer's own zone. */
+    onZone: (zone: string | null) => void;
     onLock: () => void;
   }
 
-  let { cameras, camera, day, trigger, status, nowMs, onCamera, onDay, onTrigger, onLock }: Props = $props();
+  let { cameras, camera, day, trigger, status, browserZone, forcedZone, nowMs, onCamera, onDay, onTrigger, onZone, onLock }: Props = $props();
+
+  const zones = $derived(zoneChoices(forcedZone));
 
   // On a phone the controls fold into a menu.
   let menuOpen = $state(false);
@@ -72,6 +81,15 @@
       <select class={field} value={trigger} onchange={(e) => onTrigger(e.currentTarget.value)}>
         {#each TRIGGERS as [value, label] (value)}
           <option {value}>{label}</option>
+        {/each}
+      </select>
+    </label>
+    <label class="flex items-center gap-2 text-sm">
+      <span class="text-neutral-400">Time zone</span>
+      <select class={field} value={forcedZone ?? ''} onchange={(e) => onZone(e.currentTarget.value || null)}>
+        <option value="">My time ({browserZone})</option>
+        {#each zones as z (z)}
+          <option value={z}>{z}</option>
         {/each}
       </select>
     </label>

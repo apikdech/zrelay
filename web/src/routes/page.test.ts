@@ -8,6 +8,12 @@ import { drawTimeline } from '../lib/timeline/render';
 import { localDayRange } from '../lib/timeline/timezone';
 import Page from './+page.svelte';
 
+// The viewer is in Berlin: any other zone must be chosen by hand.
+vi.mock('../lib/timeline/timezone', async (orig) => ({
+  ...(await orig<typeof import('../lib/timeline/timezone')>()),
+  browserZone: () => 'Europe/Berlin',
+}));
+
 // Draw synchronously and record the layout, so the zoom the shortcuts reach
 // can be read off the last frame. (untrack: the real scheduler draws outside effects.)
 vi.mock('../lib/timeline/render', async (orig) => ({
@@ -36,7 +42,10 @@ beforeEach(() => {
   HTMLMediaElement.prototype.play = () => Promise.resolve();
   HTMLMediaElement.prototype.pause = () => {};
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 function status(ageMs: number) {
   return {
@@ -433,5 +442,70 @@ describe('shortcuts and transport', () => {
       keys('j');
       expect(selected()).toBe(ids.a);
     });
+  });
+});
+
+describe('forced display zone', () => {
+  // 20:00 UTC: 21:00 on the 6th in Berlin, but already 03:00 on the 7th at home in Jakarta.
+  const EVENING = Date.UTC(2026, 10, 6, 20, 0, 0);
+  const mountAbroad = (c: DashClient) => render(Page, { client: c, factory: fakePlayerFactory, nowMs: EVENING, profile: 'desktop' });
+  const firstRange = (c: DashClient) => getsFor(c, '/api/v1/clips')[0]!.query;
+  const lastRange = (c: DashClient) => getsFor(c, '/api/v1/clips').at(-1)!.query;
+  const dayRange = (day: string, zone: string) => {
+    const [from, to] = localDayRange(day, zone);
+    return { from: new Date(from).toISOString(), to: new Date(to).toISOString() };
+  };
+
+  it("follows the viewer's own zone until one is forced", async () => {
+    const c = client();
+    mountAbroad(c);
+    await listRows();
+    expect(firstRange(c)).toMatchObject(dayRange('2026-11-06', 'Europe/Berlin'));
+    expect(screen.getByLabelText('Time zone')).toHaveValue('');
+  });
+
+  it("lets a relative abroad see the house's day in Asia/Jakarta", async () => {
+    const c = client();
+    mountAbroad(c);
+    await listRows();
+    await fireEvent.change(screen.getByLabelText('Time zone'), { target: { value: 'Asia/Jakarta' } });
+    // "Today" is now Jakarta's today (the 7th) and the range is that Jakarta day.
+    await waitFor(() => expect(lastRange(c)).toMatchObject(dayRange('2026-11-07', 'Asia/Jakarta')));
+    expect(screen.getByLabelText('Date')).toHaveValue('2026-11-07');
+    // The evening of the 6th at home reads 19:00 for a 12:00Z clip, not 13:00 as in Berlin.
+    await fireEvent.change(screen.getByLabelText('Date'), { target: { value: '2026-11-06' } });
+    await waitFor(() => expect(lastRange(c)).toMatchObject(dayRange('2026-11-06', 'Asia/Jakarta')));
+    const rows = await listRows();
+    expect(rows[0]).toHaveTextContent('19:00:00');
+  });
+
+  it('remembers the choice for the next visit', async () => {
+    const { unmount } = mountAbroad(client());
+    await listRows();
+    await fireEvent.change(screen.getByLabelText('Time zone'), { target: { value: 'Asia/Jakarta' } });
+    unmount();
+    const c = client();
+    mountAbroad(c);
+    await listRows();
+    expect(firstRange(c)).toMatchObject(dayRange('2026-11-07', 'Asia/Jakarta'));
+    expect(screen.getByLabelText('Time zone')).toHaveValue('Asia/Jakarta');
+  });
+
+  it("goes back to the viewer's zone when the choice is cleared", async () => {
+    localStorage.setItem('zview.zone', 'Asia/Jakarta');
+    const c = client();
+    mountAbroad(c);
+    await listRows();
+    await fireEvent.change(screen.getByLabelText('Time zone'), { target: { value: '' } });
+    await waitFor(() => expect(lastRange(c)).toMatchObject(dayRange('2026-11-06', 'Europe/Berlin')));
+    expect(localStorage.getItem('zview.zone')).toBeNull();
+  });
+
+  it('ignores a remembered zone that is not valid', async () => {
+    localStorage.setItem('zview.zone', 'Mars/Olympus');
+    const c = client();
+    mountAbroad(c);
+    await listRows();
+    expect(firstRange(c)).toMatchObject(dayRange('2026-11-06', 'Europe/Berlin'));
   });
 });

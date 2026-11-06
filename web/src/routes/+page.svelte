@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import EventList, { type EventRow } from '../lib/components/EventList.svelte';
   import Header from '../lib/components/Header.svelte';
   import Player, { type Target } from '../lib/components/Player.svelte';
@@ -10,6 +10,7 @@
   import Timeline from '../lib/timeline/Timeline.svelte';
   import type { Coverage } from '../lib/timeline/model';
   import { browserZone } from '../lib/timeline/timezone';
+  import { loadZonePref, saveZonePref } from '../lib/timeline/zonePref';
   import { getWorkerClient, type WorkerClient } from '../lib/workerClient';
   import type { ExportEnv } from '../lib/export';
   import type { Camera, Sidecar, Status } from '../worker/schemas';
@@ -17,7 +18,7 @@
   interface Props {
     /** The crypto/data worker; it holds K_api and does every authenticated request. */
     client?: Pick<WorkerClient, 'call'>;
-    /** Display zone; defaults to the viewer's own. */
+    /** Display zone to start in; otherwise the viewer's remembered choice, else their own zone. */
     zone?: string;
     /** Fixed "now" for tests; otherwise the wall clock, refreshed every 30 s. */
     nowMs?: number;
@@ -26,7 +27,12 @@
     exportEnv?: ExportEnv;
   }
 
-  let { client = getWorkerClient(), zone = browserZone(), nowMs, profile, factory, exportEnv }: Props = $props();
+  let { client = getWorkerClient(), zone: initialZone, nowMs, profile, factory, exportEnv }: Props = $props();
+
+  // The forced display zone (e.g. Asia/Jakarta for relatives abroad); null follows the viewer's own.
+  let forcedZone = $state<string | null>(untrack(() => initialZone ?? loadZonePref()));
+  const ownZone = browserZone();
+  const zone = $derived(forcedZone ?? ownZone);
 
   let wall = $state(Date.now());
   const now = $derived(nowMs ?? wall);
@@ -41,8 +47,7 @@
 
   let camera = $state('');
   let trigger = $state('');
-  // svelte-ignore state_referenced_locally
-  let day = $state(localDayOf(nowMs ?? Date.now(), zone));
+  let day = $state(untrack(() => localDayOf(nowMs ?? Date.now(), zone)));
 
   let selectedId = $state<string | null>(null);
   let cue = $state<Target | null>(null);
@@ -107,6 +112,13 @@
         if (gen === loadGen) loading = false;
       });
   });
+
+  /** Pick the display zone; the view moves to "today" there, which can be another date. */
+  function setZone(z: string | null): void {
+    forcedZone = z;
+    saveZonePref(z);
+    day = localDayOf(now, z ?? ownZone);
+  }
 
   // ---- derived views -----------------------------------------------------------
 
@@ -200,10 +212,13 @@
     {day}
     {trigger}
     {status}
+    browserZone={ownZone}
+    {forcedZone}
     nowMs={now}
     onCamera={(id) => (camera = id)}
     onDay={(d) => (day = d)}
     onTrigger={(t) => (trigger = t)}
+    onZone={setZone}
     onLock={lock}
   />
 

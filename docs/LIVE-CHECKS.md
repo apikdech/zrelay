@@ -789,3 +789,14 @@ This section supersedes the chaos results of "Task 29" (270.0 MiB peak, "breaker
 **Expected result:** zero CSP violations in the console in normal use; manifest installable; service worker activates without errors; Lighthouse best-practices has no failing CSP or HTTPS audit; the onboarding guide matches what the phones show. Record the Lighthouse scores here.
 **If the result differs, update:** a CSP violation means a directive in `contentSecurityPolicy` in `internal/zview/app.go` plus `csp_test.go` (`wantCSP`) and `app_test.go`, and ui-spec §2.4; prefer fixing the SPA over widening the policy. An installability failure: `web/static/manifest.webmanifest`, `web/scripts/gen-icons.py`, `web/index.html`. Wrong onboarding wording: `docs/family-onboarding.md` and the labels in `web/src/routes/onboarding/Onboarding.svelte`.
 **Status:** not run
+
+## Task 39 review fix — forced display zone
+**Automated in this task:** the Timeline header has a "Time zone" control (`web/src/lib/components/Header.svelte`): "My time (<browser zone>)" or any IANA zone. The choice is remembered per viewer in `localStorage` (`zview.zone`, guarded by try/catch, an invalid stored name is ignored; `web/src/lib/timeline/zonePref.ts`) and drives the page's `zone`, so the day range, ruler, event list clock and export filename follow it, and the view jumps to "today" in the new zone. Tests first (red, then green): `lib/timeline/zonePref.test.ts` and the `forced display zone` block in `routes/page.test.ts` (a Berlin viewer forces Asia/Jakarta and `loadDay` asks for the Jakarta day in UTC, rows read 19:00 for a 12:00Z clip, the choice survives a remount and clearing returns to the viewer's zone). `make vet test`, `make web` and `make web-e2e` passed.
+**Manual steps:**
+1. Open `https://<zview-host>/` on a device whose time zone is not Asia/Jakarta (set the OS or browser zone to, say, Europe/Berlin), import the key and open the Timeline in the evening Jakarta time.
+2. Note the Date field and the ruler, then pick "Asia/Jakarta" in the Time zone control.
+3. Select a clip, press Export and read the file name in the dialog.
+4. Reload the page, then choose "My time" again.
+**Expected result:** after step 2 the Date becomes today in Jakarta, the 00:00-24:00 ruler, the event list times and the export file name (`<camera_id>_<YYYYMMDD-HHMMSS>.mp4`) read in WIB (UTC+7); the choice is still set after the reload; "My time" returns everything to the device zone.
+**If the result differs, update:** `Header.svelte`, `zonePref.ts` with `zonePref.test.ts`, and `setZone` in `web/src/routes/+page.svelte` with `routes/page.test.ts`; ui-spec §5 if the intended behaviour changes.
+**Status:** not run
