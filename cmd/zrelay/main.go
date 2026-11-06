@@ -5,13 +5,19 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"slices"
+	"syscall"
+	"time"
 
 	"github.com/apikdech/zrelay-v2/internal/relay/config"
+	"github.com/apikdech/zrelay-v2/internal/relay/events"
 	"github.com/apikdech/zrelay-v2/pkg/secretref"
 )
 
@@ -19,6 +25,9 @@ const usage = `usage: zrelay [--env-file <path>] <command> [flags]
 
 commands:
   config check --config <path>   validate the config and print the memory budget
+  onvif discover --config <path> --camera <id> [--listen 60s]
+                                 list the camera's ONVIF event topics, stream its
+                                 notifications and suggest rules
 `
 
 const (
@@ -45,6 +54,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch {
 	case len(rest) >= 2 && rest[0] == "config" && rest[1] == "check":
 		return configCheck(rest[2:], stdout, stderr)
+	case len(rest) >= 2 && rest[0] == "onvif" && rest[1] == "discover":
+		return onvifDiscover(rest[2:], stdout, stderr)
 	default:
 		fmt.Fprint(stderr, usage)
 		return exitInvalid
@@ -77,6 +88,63 @@ func configCheck(args []string, stdout, stderr io.Writer) int {
 	r.WriteTable(stdout)
 	if !r.OK {
 		fmt.Fprintf(stderr, "zrelay: config check: memory budget exceeds 80%% of max_memory_mb (total %d bytes > limit %d bytes)\n", r.Total, r.Limit)
+		return exitFailed
+	}
+	return exitOK
+}
+
+// defaultListen is how long "onvif discover" listens without --listen
+// (relay-spec §6).
+const defaultListen = 60 * time.Second
+
+// onvifDiscover implements "zrelay onvif discover" (relay-spec §4.4, §6):
+// print the camera's event topics, stream its notifications for --listen
+// and suggest rules. Stop early with Ctrl-C.
+func onvifDiscover(args []string, stdout, stderr io.Writer) int {
+	fs := newFlagSet("zrelay onvif discover", stderr)
+	path := fs.String("config", "", "config file `path`")
+	camID := fs.String("camera", "", "camera `id` from the config")
+	listen := fs.Duration("listen", defaultListen, "how long to stream notifications")
+	envFile := fs.String("env-file", "", "load KEY=VALUE lines into the environment before resolving ENV: references")
+	if code, ok := parse(fs, args); !ok {
+		return code
+	}
+	if *path == "" || *camID == "" || *listen <= 0 || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: zrelay onvif discover --config <path> --camera <id> [--listen 60s]")
+		return exitInvalid
+	}
+	if code, ok := loadEnvFile(*envFile, stderr); !ok {
+		return code
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		fmt.Fprintf(stderr, "zrelay: onvif discover: %v\n", err)
+		return exitInvalid
+	}
+	i := slices.IndexFunc(cfg.Cameras, func(c config.Camera) bool { return c.ID == *camID })
+	if i < 0 {
+		fmt.Fprintf(stderr, "zrelay: onvif discover: no camera %q in %s\n", *camID, *path)
+		return exitInvalid
+	}
+	cam := cfg.Cameras[i]
+	rules, err := events.RulesFor(cam.Brand, cam.Rules)
+	if err != nil {
+		fmt.Fprintf(stderr, "zrelay: onvif discover: camera %q: %v\n", cam.ID, err)
+		return exitInvalid
+	}
+	pp := &events.PullPoint{
+		Camera:      cam.ID,
+		Host:        cam.Host,
+		Port:        cam.EventsPort,
+		ServicePath: cam.Events.ServicePath,
+		Username:    cam.Username,
+		Password:    cam.Password,
+		Rules:       rules,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := events.Discover(ctx, pp, *listen, stdout); err != nil {
+		fmt.Fprintf(stderr, "zrelay: onvif discover: %v\n", err)
 		return exitFailed
 	}
 	return exitOK

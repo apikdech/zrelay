@@ -67,29 +67,16 @@ type PullPoint struct {
 	Clock clock.Clock
 	// Metrics may be nil.
 	Metrics PullMetrics
+
+	// tap, if set, sees every notification before the rules do (Discover).
+	tap func(notification)
 }
 
 // Run subscribes, pulls and renews until ctx is done. It calls ready(true)
 // once a subscription is up and ready(false) when it ends, after forcing
 // every kind inactive. Failed subscriptions are retried with backoff.
 func (p *PullPoint) Run(ctx context.Context, emit func(Signal), ready func(bool)) error {
-	s := &session{
-		p:       p,
-		clk:     p.Clock,
-		metrics: p.Metrics,
-		client: &http.Client{
-			Timeout:   requestTimeout,
-			Transport: &http.Transport{DisableKeepAlives: true},
-			// Requests carry a login token, which a redirect would send elsewhere.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
-	}
-	if s.clk == nil {
-		s.clk = clock.Real
-	}
-	if s.metrics == nil {
-		s.metrics = nopMetrics{}
-	}
+	s := newSession(p)
 	delay := minRetry
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
@@ -113,6 +100,28 @@ func (p *PullPoint) Run(ctx context.Context, emit func(Signal), ready func(bool)
 		}
 		delay = min(delay*2, maxRetry)
 	}
+}
+
+// newSession returns the state of a Run of p, with defaults filled in.
+func newSession(p *PullPoint) *session {
+	s := &session{
+		p:       p,
+		clk:     p.Clock,
+		metrics: p.Metrics,
+		client: &http.Client{
+			Timeout:   requestTimeout,
+			Transport: &http.Transport{DisableKeepAlives: true},
+			// Requests carry a login token, which a redirect would send elsewhere.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+	if s.clk == nil {
+		s.clk = clock.Real
+	}
+	if s.metrics == nil {
+		s.metrics = nopMetrics{}
+	}
+	return s
 }
 
 // session is the state of one Run.
@@ -235,6 +244,9 @@ func (s *session) pull(ctx context.Context, addr string, emit func(Signal)) erro
 	}
 	now := s.clk.Now()
 	for _, m := range msgs {
+		if s.p.tap != nil {
+			s.p.tap(m)
+		}
 		matches := Match(s.p.Rules, m.Topic, m.Items)
 		if len(matches) == 0 {
 			s.metrics.Unmatched(m.Topic)

@@ -255,3 +255,74 @@ staging sidecar.
   policy (design §6.5).
 
 **Status:** not run
+
+## Task 9 — Supervisor, camera states, `onvif discover`, and phase-1 live check
+
+**Automated in this task:** `camera.Supervise` runs against `testutil.StartRTSPServer` and
+`testutil.StartFakeONVIF` (ephemeral 127.0.0.1 ports; the fake gained `EventTopic` and a
+`GetEventProperties` reply). With `-race`: `TestSupervisorStates` (connecting, priming, ready;
+`Disconnect()` gives degraded, then connecting, priming, ready again), `TestBackoffFullJitterBounded`
+(delays within [0, min(60 s, 1 s·2^n)], reset after 5 min), `TestEventsDownKeepsVideoAndMarksDegraded`
+(every `CreatePullPointSubscription` faults: `degraded`, `Events=="down"`, a Hub viewer still gets
+video), `TestOneCameraFailureIsolated`, `TestTriggerTimeoutExpires`, and `TestDiscoverPrintsTopicsAndSuggestsRules`,
+`TestDiscoverFlagsTopicsNoRuleCovers`, `TestDiscoverSurvivesMissingEventProperties`, `TestOnvifDiscover`
+(CLI, against the fake). The test-only probe `internal/testutil/cmd/camprobe` (supervisor only; logs
+state, AU rate, goroutines and RSS every `--interval`, default 5 min; not shipped) was smoke-run for
+2 minutes against the test RTSP server and the fake ONVIF camera:
+`ZRELAY_CAMPROBE_SMOKE=2m go test -count=1 -timeout 10m -run LogsStates -v ./internal/testutil/cmd/camprobe/`.
+Result: `state=ready` from second 2 on, `au_per_s=15.0` on every line, `goroutines=20` on every line,
+RSS 21.6 MiB at 10 s, 23.5 MiB at 2 min (growth levelled off at about 23.4 MiB). This proves the
+probe and supervisor run; it says nothing about the real C220, and 2 minutes cannot show a leak.
+
+**Manual steps:** (host on the camera's network; repository root)
+1. Make a config that resolves on this host. `deploy/zrelay.example.yaml` points its `FILE:` secrets
+   at `/run/secrets`, which does not exist here:
+   `D=$(mktemp -d) && printf 'zk1-example-master-key\n' > $D/zrelay_master && printf 's3-secret\n' > $D/s3_secret_key && printf 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n' > $D/api_token_sha256 && sed "s#FILE:/run/secrets/#FILE:$D/#" deploy/zrelay.example.yaml > $D/zrelay.yaml`
+2. Write `.env` (never commit it) with the real `CAMERA_IP`, `CAMERA_USERNAME` and `CAMERA_PASSWORD`,
+   plus placeholder values the example config also resolves: `S3_ENDPOINT=https://nas.example.ts.net:9000`,
+   `S3_ACCESS_KEY=x`, `TAILSCALE_IP=100.64.0.7`, `RESTREAM_USER=x`, `RESTREAM_PASS=x`.
+3. Check the config: `go run ./cmd/zrelay --env-file .env config check --config $D/zrelay.yaml`.
+4. Discover, walking in front of the camera (person), then standing still, then (if possible) a pet or a
+   vehicle in view, and one smart event such as baby cry or tamper:
+   `mkdir -p docs/runbook-notes && go run ./cmd/zrelay --env-file .env onvif discover --config $D/zrelay.yaml --camera tapo-c220 --listen 120s | tee docs/runbook-notes/c220-onvif.md`
+5. Record in `docs/runbook-notes/c220-onvif.md`, under the pasted output: the camera model and firmware
+   version, every advertised topic and data item, every topic and item actually observed (with the values
+   seen), whether `IsPeople`, `IsPet` and `IsVehicle` ever appeared, and the Summary lines (pull
+   retries, resubscribes, clock skew). Read the file once and remove anything that looks like a
+   credential before committing it.
+6. Probe for one hour, with the camera idle or in normal use, and no other zrelay running against it:
+   `go run ./internal/testutil/cmd/camprobe --env-file .env --config $D/zrelay.yaml --camera tapo-c220 --interval 5m --duration 1h | tee docs/runbook-notes/c220-camprobe.log`
+   (add `--interval 30s` first for a quick look). Then `rm -rf $D`.
+
+**Expected result:**
+- Step 4: the `GetEventProperties` section lists `RuleEngine/CellMotionDetector/Motion` with `IsMotion`
+  and `RuleEngine/TPSmartEventDetector/TPSmartEvent` with the smart items; the notifications section shows
+  `IsMotion=true` while you walk, `IsPeople=true` for the person; "resubscribes" is 0 over the 120 s
+  (Renew every 60 s worked); "pull retries" is non-zero (Tapo drops idle pulls); clock skew is small. The
+  "Coverage" section says every observed topic is covered by the built-in Tapo rules, or names the ones that
+  are not.
+- Step 6: 12 stats lines, `state=ready rtsp=up events=up` on all of them (a brief `degraded` between lines
+  is acceptable only if it recovers), `au_per_s` close to the camera's frame rate, `goroutines` constant
+  (within ±2) from the first line to the last, and `rss_kib` flat: after the first 15 minutes it grows by
+  less than about 5 MiB over the remaining 45 and shows no steady upward trend.
+
+**If the result differs, update:**
+- `IsVehicle` or `IsPet` never appear, or other items do (for example a differently named person item):
+  `TapoRules()` in `internal/relay/events/rules.go` (confirm or delete the `IsVehicle` row and the
+  catch-all), `TestTapoRules` in `internal/relay/events/rules_test.go` with one case per topic and item the
+  camera actually emitted, and the built-in rules table in design §4.3
+  (`docs/superpowers/specs/2026-11-06-zrelay-v2-design.md`) and the example comment in
+  `deploy/zrelay.example.yaml`.
+- Unexpected extra topics: add rules from the "Suggested rules" output to `TapoRules()` and design §4.3.
+- "resubscribes" above 0, or a Renew fault in the logs: `renewEvery`/`renewBody` in
+  `internal/relay/events/onvif.go`, design §4.3 and relay-spec §4.4 (Renew-as-health), and
+  `TestRenewEvery60s`.
+- `GetEventProperties failed` on the real camera: `getEventPropertiesBody`/`printProperties` in
+  `internal/relay/events/discover.go` and the fake's `eventProperties` in `internal/testutil/fakeonvif.go`.
+- Goroutines or RSS keep growing in step 6: look first at the Hub subscriber queues
+  (`internal/relay/camera/hub.go`), the assembler (`au.go`), `RunRTSP` teardown (`rtsp.go`) and the
+  supervisor loops (`supervisor.go`); add a regression test before fixing.
+- `state` never reaches `ready`, or flaps: the priming/ready rules in `compute` (`supervisor.go`),
+  design §4.2 and `TestSupervisorStates`.
+
+**Status:** not run

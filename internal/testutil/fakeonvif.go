@@ -73,6 +73,12 @@ type FakeONVIF struct {
 	subSeq     int
 	cameraTime time.Time
 	pad        int
+	topics     []fakeTopic
+}
+
+type fakeTopic struct {
+	path  string
+	items []string
 }
 
 type fakeMessage struct {
@@ -165,6 +171,15 @@ func (f *FakeONVIF) PadNextPull(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pad = n
+}
+
+// EventTopic registers a topic that GetEventProperties lists, with the names
+// of its boolean data items. path has no namespace prefix and at least two
+// segments, for example "RuleEngine/CellMotionDetector/Motion". By default the topic set is empty.
+func (f *FakeONVIF) EventTopic(path string, items ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.topics = append(f.topics, fakeTopic{path: path, items: items})
 }
 
 // Requests returns every request received so far, in arrival order.
@@ -275,6 +290,8 @@ func (f *FakeONVIF) serve(w http.ResponseWriter, r *http.Request) {
 		_ = xml.EscapeText(&b, []byte(addr))
 		writeEnvelope(w, fmt.Sprintf(`<tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference><wsa5:Address>%s</wsa5:Address></tev:SubscriptionReference><wsnt:CurrentTime>%s</wsnt:CurrentTime><wsnt:TerminationTime>%s</wsnt:TerminationTime></tev:CreatePullPointSubscriptionResponse>`,
 			b.String(), camNow.Format(time.RFC3339), camNow.Add(120*time.Second).Format(time.RFC3339)))
+	case "GetEventProperties":
+		writeEnvelope(w, f.eventProperties())
 	case "PullMessages":
 		writeEnvelope(w, f.pullReply(camNow))
 	case "Renew":
@@ -285,6 +302,47 @@ func (f *FakeONVIF) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeFault(w, http.StatusBadRequest, "ter:ActionNotSupported", "unsupported")
 	}
+}
+
+// eventProperties renders the topic set as a Tapo camera does: the first
+// path segment carries the tns1 prefix, the last one wstop:topic="true" and a
+// MessageDescription.
+func (f *FakeONVIF) eventProperties() string {
+	f.mu.Lock()
+	topics := append([]fakeTopic(nil), f.topics...)
+	f.mu.Unlock()
+
+	var b strings.Builder
+	b.WriteString(`<tev:GetEventPropertiesResponse><tev:TopicNamespaceLocation>http://www.onvif.org/onvif/ver10/topics/topicns.xml</tev:TopicNamespaceLocation><wsnt:FixedTopicSet>true</wsnt:FixedTopicSet><wstop:TopicSet xmlns:wstop="http://docs.oasis-open.org/wsn/t-1" xmlns:tns1="http://www.onvif.org/ver10/topics">`)
+	for _, tp := range topics {
+		segs := strings.Split(tp.path, "/")
+		if len(segs) < 2 {
+			continue // needs a namespaced root and a topic element
+		}
+		for i, seg := range segs {
+			switch {
+			case i == 0:
+				fmt.Fprintf(&b, "<tns1:%s>", seg)
+			case i == len(segs)-1:
+				fmt.Fprintf(&b, `<%s wstop:topic="true"><tt:MessageDescription IsProperty="true"><tt:Source><tt:SimpleItemDescription Name="VideoSourceConfigurationToken" Type="tt:ReferenceToken"/></tt:Source><tt:Data>`, seg)
+				for _, it := range tp.items {
+					fmt.Fprintf(&b, `<tt:SimpleItemDescription Name="%s" Type="xs:boolean"/>`, escape(it))
+				}
+				b.WriteString(`</tt:Data></tt:MessageDescription>`)
+			default:
+				fmt.Fprintf(&b, "<%s>", seg)
+			}
+		}
+		for i := len(segs) - 1; i >= 0; i-- {
+			if i == 0 {
+				fmt.Fprintf(&b, "</tns1:%s>", segs[i])
+			} else {
+				fmt.Fprintf(&b, "</%s>", segs[i])
+			}
+		}
+	}
+	b.WriteString(`</wstop:TopicSet></tev:GetEventPropertiesResponse>`)
+	return b.String()
 }
 
 func (f *FakeONVIF) pullReply(camNow time.Time) string {
