@@ -1,0 +1,20 @@
+version: 2
+allow_literal_secrets: true
+relay:
+  id: "test"
+  max_memory_mb: 768
+  egress_backlog_mb: 64
+encryption:
+  master_key: "zk1-literal-for-tests"
+  chunk_size_kib: 32768
+storage:
+  driver: "local"
+  root: "zrelay"
+  local:
+    base_dir: "/x/archive"
+cameras:
+  - id: "cam-1"
+    brand: "tapo"
+    host: "192.0.2.10"
+    credentials: { username: "u", password: "p" }
+    rtsp: { port: 554, path: "/stream1" }

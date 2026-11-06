@@ -1,0 +1,32 @@
+# Minimal valid config on the s3 driver. Every reject/*.yaml case is
+# this file or valid_local.yaml with exactly one defect.
+version: 2
+allow_literal_secrets: true
+relay:
+  id: "test"
+  max_memory_mb: 768
+  egress_backlog_mb: 64
+encryption:
+  master_key: "zk1-literal-for-tests"
+storage:
+  driver: "s3"
+  root: "zrelay"
+  s3:
+    endpoint: "https://nas.example.ts.net:9000"
+    region: "us-east-1"
+    bucket: "cctv"
+    access_key: "AK"
+    secret_key: "SK"
+    part_size_mib: 8
+  breaker:
+    failure_threshold: 5
+    base_delay: "1s"
+    max_delay: "5m"
+live:
+  max_viewers: 0
+cameras:
+  - id: "cam-1"
+    brand: "tapo"
+    host: "192.0.2.10"
+    credentials: { username: "u", password: "p" }
+    rtsp: { port: 554, path: "/stream1" }
