@@ -367,3 +367,33 @@ func TestWriteErrorsPropagate(t *testing.T) {
 		t.Fatalf("WriteGOP error = %v, want write error", err)
 	}
 }
+
+// Parameter sets live in avcC/hvcC; in-band copies are not repeated in the
+// samples, so output is identical with or without them.
+func TestInBandParameterSetsAreDropped(t *testing.T) {
+	for _, tc := range []struct{ path, kind string }{{h264Fixture, "h264"}, {h265Fixture, "h265"}} {
+		_, plain, _ := muxAll(t, tc.path, tc.kind)
+
+		c, gops := fixture(t, tc.path, tc.kind)
+		for _, g := range gops {
+			ps := [][]byte{c.SPS, c.PPS}
+			if tc.kind == "h265" {
+				ps = [][]byte{c.VPS, c.SPS, c.PPS}
+			}
+			g.AUs[0].NALUs = append(append([][]byte{}, ps...), g.AUs[0].NALUs...)
+		}
+		var buf bytes.Buffer
+		m, err := mux.New(&buf, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, g := range gops {
+			if err := m.WriteGOP(g); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !bytes.Equal(buf.Bytes(), plain.Bytes()) {
+			t.Errorf("%s: output differs when parameter sets are in-band", tc.kind)
+		}
+	}
+}
