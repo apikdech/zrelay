@@ -32,25 +32,45 @@ type fakeWriter struct {
 	gops    []*ring.GOP
 	final   *clip.FinalInfo
 	aborted []clip.EndReason
+	// failAt, when > 0, makes the failAt-th WriteGOP call and every later
+	// one fail; a failed GOP is not recorded in gops.
+	failAt int
+	calls  int
 }
 
-func (w *fakeWriter) WriteGOP(g *ring.GOP) error { w.gops = append(w.gops, g); return nil }
+func (w *fakeWriter) WriteGOP(g *ring.GOP) error {
+	w.calls++
+	if w.failAt > 0 && w.calls >= w.failAt {
+		return errBacklog
+	}
+	w.gops = append(w.gops, g)
+	return nil
+}
 func (w *fakeWriter) Finalize(f clip.FinalInfo) error {
 	w.final = &f
 	return nil
 }
 func (w *fakeWriter) Abort(r clip.EndReason) { w.aborted = append(w.aborted, r) }
 
+var errBacklog = errors.New("backlog full")
+
 type fakeOutput struct {
-	writers []*fakeWriter
-	err     error
+	writers  []*fakeWriter
+	attempts int // Open calls, failed ones included
+	// openErr, when set, is asked for the error of the n-th (1-based) Open call.
+	openErr func(n int) error
+	// failWriteAt is given to every writer opened (see fakeWriter.failAt).
+	failWriteAt int
 }
 
 func (o *fakeOutput) Open(info clip.OpenInfo) (clip.ClipWriter, error) {
-	if o.err != nil {
-		return nil, o.err
+	o.attempts++
+	if o.openErr != nil {
+		if err := o.openErr(o.attempts); err != nil {
+			return nil, err
+		}
 	}
-	w := &fakeWriter{info: info}
+	w := &fakeWriter{info: info, failAt: o.failWriteAt}
 	o.writers = append(o.writers, w)
 	return w, nil
 }
@@ -64,7 +84,6 @@ type rig struct {
 	sinceIDR int
 	started  bool
 	gen      uint32
-	errs     []error
 }
 
 func newRig(t *testing.T) *rig { return newRigMax(t, postRoll, 10*time.Minute) }
@@ -78,7 +97,6 @@ func newRigMax(t *testing.T, post, maxClip time.Duration) *rig {
 		PostRoll: post,
 		MaxClip:  maxClip,
 		Rand:     rand.Reader,
-		OnError:  func(err error) { r.errs = append(r.errs, err) },
 	}, r.clk, r.ring, r.out)
 	return r
 }
@@ -373,119 +391,387 @@ func TestCodecChangeWithoutTriggerGoesIdle(t *testing.T) {
 	}
 }
 
-func TestLostWithFragmentsFinalizesStreamLost(t *testing.T) {
+// checkEnding verifies the invariants every finalized clip must satisfy: End
+// follows the last frame written and DurationMs is End-Start.
+func checkEnding(t *testing.T, w *fakeWriter, f clip.FinalInfo) {
+	t.Helper()
+	if want := f.End.Sub(w.info.Start).Milliseconds(); f.DurationMs != want {
+		t.Errorf("DurationMs = %d, want End-Start = %d", f.DurationMs, want)
+	}
+	if len(w.gops) == 0 {
+		t.Fatal("finalized a clip with no GOP written")
+	}
+	g := w.gops[len(w.gops)-1]
+	if lastAU := g.AUs[len(g.AUs)-1]; !f.End.After(lastAU.Wall) {
+		t.Errorf("End %v is not after the last written frame %v", f.End, lastAU.Wall)
+	}
+}
+
+func TestClipEndings(t *testing.T) {
+	tests := []struct {
+		name      string
+		maxClip   time.Duration // 0: the default
+		run       func(r *rig)
+		reason    clip.EndReason // of the first clip
+		wantState string
+		wantOpens int
+	}{
+		{
+			name: "post roll elapsed",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.feed(4 * time.Second)
+				r.m.OnTriggered(false)
+				r.feed(postRoll + step)
+				r.m.Tick()
+			},
+			reason: clip.ReasonPostRollElapsed, wantState: "Idle", wantOpens: 1,
+		},
+		{
+			name: "max duration split", maxClip: 20 * time.Second,
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.feed(30 * time.Second)
+			},
+			reason: clip.ReasonMaxDuration, wantState: "Recording", wantOpens: 3,
+		},
+		{
+			name: "codec change",
+			run: func(r *rig) {
+				r.m.OnCodec(camera.Codec{Kind: "h264", SPS: []byte{1}}, camera.TimeSourceRTCP)
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.feed(5 * time.Second)
+				r.m.OnCodec(camera.Codec{Kind: "h264", SPS: []byte{2}}, camera.TimeSourceRTCP)
+			},
+			reason: clip.ReasonCodecChange, wantState: "Idle", wantOpens: 1,
+		},
+		{
+			name: "stream lost with whole GOPs",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.feed(7 * time.Second)
+				r.m.OnLost()
+			},
+			reason: clip.ReasonStreamLost, wantState: "Idle", wantOpens: 1,
+		},
+		{
+			// relay-spec 4.5: "Finalize with frames so far (stream_lost)": the
+			// open GOP's frames did arrive and are kept.
+			name: "stream lost with only a partial GOP",
+			run: func(r *rig) {
+				r.m.OnTriggered(true)
+				r.feed(time.Second)
+				r.m.OnLost()
+			},
+			reason: clip.ReasonStreamLost, wantState: "Idle", wantOpens: 1,
+		},
+		{
+			name: "backlog overflow forced",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.feed(3 * time.Second)
+				r.m.ForceFinalize(clip.ReasonBacklogOverflow)
+			},
+			reason: clip.ReasonBacklogOverflow, wantState: "Suppressed", wantOpens: 1,
+		},
+		{
+			name: "shutdown",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.feed(3 * time.Second)
+				r.m.Shutdown()
+			},
+			reason: clip.ReasonShutdown, wantState: "Closed", wantOpens: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			maxClip := tc.maxClip
+			if maxClip == 0 {
+				maxClip = 10 * time.Minute
+			}
+			r := newRigMax(t, postRoll, maxClip)
+			tc.run(r)
+			w := r.out.writers[0]
+			f := mustReason(t, w, tc.reason)
+			checkEnding(t, w, f)
+			if got := r.m.State(); got != tc.wantState {
+				t.Errorf("State() = %q, want %q", got, tc.wantState)
+			}
+			if r.opens() != tc.wantOpens {
+				t.Errorf("opens = %d, want %d", r.opens(), tc.wantOpens)
+			}
+		})
+	}
+}
+
+func TestStreamLostKeepsEveryReceivedFrame(t *testing.T) {
 	r := newRig(t)
 	r.feed(20 * time.Second)
 	r.m.OnTriggered(true)
-	r.feed(7 * time.Second)
+	r.feed(7 * time.Second) // ends mid-GOP
+	lastFed := r.clk.Now().Add(-step)
 	r.m.OnLost()
-	mustReason(t, r.last(), clip.ReasonStreamLost)
-	if r.m.State() != "Idle" {
-		t.Errorf("State() = %q, want Idle", r.m.State())
+	w := r.last()
+	g := w.gops[len(w.gops)-1]
+	if got := g.AUs[len(g.AUs)-1].Wall; !got.Equal(lastFed) {
+		t.Errorf("last written frame at %v, want the last received frame %v", got, lastFed)
 	}
 	if len(r.ring.Retained()) != 0 {
 		t.Error("ring was not reset on loss")
 	}
 }
 
-func TestLostWithoutFragmentAborts(t *testing.T) {
-	r := newRig(t)
-	r.m.OnTriggered(true)
-	r.feed(time.Second) // opens on the first IDR; its GOP is still open
-	r.m.OnLost()
-	w := r.last()
-	if w.final != nil {
-		t.Fatal("clip with no fragment was finalized")
+func TestSuppressedAndClosedStates(t *testing.T) {
+	tests := []struct {
+		name      string
+		run       func(r *rig)
+		wantState string
+		wantOpens int
+		check     func(t *testing.T, r *rig)
+	}{
+		{
+			name: "triggers are ignored while suppressed",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.m.ForceFinalize(clip.ReasonBacklogOverflow)
+				r.m.OnTriggered(false)
+				r.m.OnTriggered(true)
+				r.feed(5 * time.Second)
+			},
+			wantState: "Suppressed", wantOpens: 1,
+		},
+		{
+			name: "unsuppress with the trigger held opens a new series",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.m.ForceFinalize(clip.ReasonBacklogOverflow)
+				r.feed(5 * time.Second)
+				r.m.Unsuppress()
+			},
+			wantState: "Recording", wantOpens: 2,
+			check: func(t *testing.T, r *rig) {
+				if r.last().info.SeriesID == r.out.writers[0].info.SeriesID {
+					t.Error("clip after suppression continued the old series")
+				}
+			},
+		},
+		{
+			name: "unsuppress without a trigger goes idle",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.m.ForceFinalize(clip.ReasonBacklogOverflow)
+				r.m.OnTriggered(false)
+				r.m.Unsuppress()
+			},
+			wantState: "Idle", wantOpens: 1,
+		},
+		{
+			name: "force finalize while idle suppresses",
+			run: func(r *rig) {
+				r.feed(5 * time.Second)
+				r.m.ForceFinalize(clip.ReasonBacklogOverflow)
+				r.m.OnTriggered(true)
+			},
+			wantState: "Suppressed", wantOpens: 0,
+		},
+		{
+			name: "shutdown ignores later input",
+			run: func(r *rig) {
+				r.feed(20 * time.Second)
+				r.m.OnTriggered(true)
+				r.feed(3 * time.Second)
+				r.m.Shutdown()
+				r.feed(5 * time.Second)
+				r.m.OnTriggered(false)
+				r.m.OnTriggered(true)
+				r.m.Tick()
+				r.m.Unsuppress()
+			},
+			wantState: "Closed", wantOpens: 1,
+		},
+		{
+			name: "shutdown while idle is harmless",
+			run: func(r *rig) {
+				r.feed(5 * time.Second)
+				r.m.Shutdown()
+			},
+			wantState: "Closed", wantOpens: 0,
+		},
 	}
-	if !slices.Equal(w.aborted, []clip.EndReason{clip.ReasonStreamLost}) {
-		t.Fatalf("aborted = %v, want [stream_lost]", w.aborted)
-	}
-	if r.m.State() != "Idle" {
-		t.Errorf("State() = %q, want Idle", r.m.State())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			tc.run(r)
+			if got := r.m.State(); got != tc.wantState {
+				t.Errorf("State() = %q, want %q", got, tc.wantState)
+			}
+			if r.opens() != tc.wantOpens {
+				t.Errorf("opens = %d, want %d", r.opens(), tc.wantOpens)
+			}
+			if tc.check != nil {
+				tc.check(t, r)
+			}
+		})
 	}
 }
 
-func TestForceFinalizeSuppressesUntilUnsuppress(t *testing.T) {
+func TestOpenErrorStaysIdleAndRetriesAtNextIDR(t *testing.T) {
 	r := newRig(t)
-	r.feed(20 * time.Second)
+	r.feed(20*time.Second + 5*step) // mid-GOP: the next IDR is 25 frames away
+	r.out.openErr = func(n int) error {
+		if n == 1 {
+			return errBacklog
+		}
+		return nil
+	}
 	r.m.OnTriggered(true)
-	r.feed(3 * time.Second)
-
-	r.m.ForceFinalize(clip.ReasonBacklogOverflow)
-	mustReason(t, r.last(), clip.ReasonBacklogOverflow)
-	if r.m.State() != "Suppressed" {
-		t.Fatalf("State() = %q, want Suppressed", r.m.State())
+	if r.m.State() != "Idle" || r.opens() != 0 || r.out.attempts != 1 {
+		t.Fatalf("state=%s opens=%d attempts=%d, want Idle, 0 and 1", r.m.State(), r.opens(), r.out.attempts)
 	}
-
-	r.m.OnTriggered(false)
-	r.m.OnTriggered(true)
-	r.feed(5 * time.Second)
-	if r.opens() != 1 {
-		t.Fatalf("opens = %d while suppressed, want 1", r.opens())
+	// Non-IDR frames do not retry: a failing Open must not be hammered at 15 fps.
+	r.feed(time.Second)
+	if r.out.attempts != 1 || r.m.State() != "Idle" {
+		t.Fatalf("attempts = %d state=%s after non-IDR frames, want no retry", r.out.attempts, r.m.State())
 	}
-
-	r.m.Unsuppress()
-	if r.m.State() != "Recording" || r.opens() != 2 {
-		t.Fatalf("after Unsuppress with trigger held: state=%s opens=%d, want Recording and 2", r.m.State(), r.opens())
-	}
-	if r.last().info.SeriesID == r.out.writers[0].info.SeriesID {
-		t.Error("clip after suppression continued the old series")
+	r.feed(2 * time.Second) // crosses the next IDR
+	if r.out.attempts != 2 || r.opens() != 1 || r.m.State() != "Recording" {
+		t.Fatalf("attempts=%d opens=%d state=%s, want the IDR retry to succeed", r.out.attempts, r.opens(), r.m.State())
 	}
 }
 
-func TestUnsuppressWithoutTriggerGoesIdle(t *testing.T) {
+func TestSustainedOpenFailureRetriesOncePerGOP(t *testing.T) {
 	r := newRig(t)
 	r.feed(20 * time.Second)
+	r.out.openErr = func(int) error { return errBacklog }
 	r.m.OnTriggered(true)
-	r.m.ForceFinalize(clip.ReasonBacklogOverflow)
-	r.m.OnTriggered(false)
-	r.m.Unsuppress()
+	r.feed(20 * time.Second)
+	// One attempt for the trigger plus one per IDR (10 GOPs), not one per frame.
+	if r.out.attempts > 12 {
+		t.Fatalf("attempts = %d over 20 s, want about one per GOP", r.out.attempts)
+	}
 	if r.m.State() != "Idle" {
 		t.Fatalf("State() = %q, want Idle", r.m.State())
 	}
 }
 
-func TestShutdownFinalizesActiveClip(t *testing.T) {
-	r := newRig(t)
+func TestFailedSplitOpenContinuesWithoutOverlap(t *testing.T) {
+	r := newRigMax(t, postRoll, 20*time.Second)
 	r.feed(20 * time.Second)
+	r.out.openErr = func(n int) error {
+		if n == 2 { // the continuation at the split
+			return errBacklog
+		}
+		return nil
+	}
+	r.m.OnTriggered(true)
+	r.feed(30 * time.Second)
+
+	if r.opens() < 2 {
+		t.Fatalf("opens = %d, want the continuation to open after the failed attempt", r.opens())
+	}
+	first, second := r.out.writers[0], r.out.writers[1]
+	f := mustReason(t, first, clip.ReasonMaxDuration)
+	if second.info.SeriesID != first.info.SeriesID || second.info.SegmentIndex != 1 || second.info.PreRollMs != 0 {
+		t.Errorf("continuation = series %v idx %d preroll %d, want same series, 1 and 0",
+			second.info.SeriesID, second.info.SegmentIndex, second.info.PreRollMs)
+	}
+	if second.info.Start.Before(f.End) {
+		t.Errorf("continuation starts %v, before the previous segment ended %v", second.info.Start, f.End)
+	}
+	if r.m.State() != "Recording" {
+		t.Errorf("State() = %q, want Recording", r.m.State())
+	}
+}
+
+func TestFailedSplitOpenDuringPostRollDoesNotLeakContinuation(t *testing.T) {
+	r := newRigMax(t, 30*time.Second, 20*time.Second)
+	r.feed(20 * time.Second)
+	r.out.openErr = func(n int) error {
+		if n == 2 {
+			return errBacklog
+		}
+		return nil
+	}
+	r.m.OnTriggered(true)
+	r.m.OnTriggered(false) // post-roll while the split fails
+	r.feed(10 * time.Second)
+	if r.m.State() != "Idle" {
+		t.Fatalf("State() = %q, want Idle after the failed split", r.m.State())
+	}
 	r.m.OnTriggered(true)
 	r.feed(3 * time.Second)
-	r.m.Shutdown()
-	f := mustReason(t, r.last(), clip.ReasonShutdown)
-	// Frames of the open GOP are flushed so nothing recorded is lost.
-	lastGOP := r.last().gops[len(r.last().gops)-1]
-	if lastGOP.AUs[len(lastGOP.AUs)-1].Wall.After(f.End) {
-		t.Error("frames written after End")
-	}
-	r.feed(5 * time.Second)
-	r.m.OnTriggered(false)
-	r.m.OnTriggered(true)
-	if r.opens() != 1 {
-		t.Errorf("opens = %d after shutdown, want inputs ignored", r.opens())
+	last := r.last()
+	if last.info.SegmentIndex != 0 || last.info.SeriesID == r.out.writers[0].info.SeriesID {
+		t.Errorf("later clip = series %v idx %d, want a new series at index 0", last.info.SeriesID, last.info.SegmentIndex)
 	}
 }
 
-func TestShutdownWhenIdleIsHarmless(t *testing.T) {
-	r := newRig(t)
-	r.feed(5 * time.Second)
-	r.m.Shutdown()
-	if r.opens() != 0 {
-		t.Fatal("opened a clip")
+// TestWriteGOPErrorEndsClipAndSuppresses drives a WriteGOP error during the
+// initial ring flush and on a live GOP. A clip with no fragment written is
+// aborted; one with fragments is finalized as backlog_overflow (relay-spec
+// 4.5), and either way the machine is Suppressed and later input is harmless.
+func TestWriteGOPErrorEndsClipAndSuppresses(t *testing.T) {
+	tests := []struct {
+		name string
+		// failFlushAt makes the n-th WriteGOP of the initial flush fail (0: none).
+		failFlushAt int
+		// failLive makes the second live GOP to close fail.
+		failLive  bool
+		finalized bool
+	}{
+		{name: "first GOP of the initial flush", failFlushAt: 1, finalized: false},
+		{name: "later GOP of the initial flush", failFlushAt: 3, finalized: true},
+		{name: "live GOP after the flush", failLive: true, finalized: true},
 	}
-}
-
-func TestOpenErrorStaysIdleAndReports(t *testing.T) {
-	r := newRig(t)
-	r.feed(20 * time.Second)
-	r.out.err = errors.New("backlog full")
-	r.m.OnTriggered(true)
-	if r.m.State() != "Idle" || len(r.errs) != 1 {
-		t.Fatalf("state=%s errs=%v, want Idle and one reported error", r.m.State(), r.errs)
-	}
-	r.out.err = nil
-	r.feed(3 * time.Second) // retried at the next IDR
-	if r.opens() != 1 || r.m.State() != "Recording" {
-		t.Fatalf("opens=%d state=%s, want retry to succeed", r.opens(), r.m.State())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			r.feed(20 * time.Second)
+			r.out.failWriteAt = tc.failFlushAt
+			r.m.OnTriggered(true)
+			w := r.last()
+			if tc.failLive {
+				w.failAt = w.calls + 2
+				r.feed(10 * time.Second)
+			}
+			if got := r.m.State(); got != "Suppressed" {
+				t.Fatalf("State() = %q after WriteGOP error, want Suppressed", got)
+			}
+			if tc.finalized {
+				f := mustReason(t, w, clip.ReasonBacklogOverflow)
+				if len(w.aborted) != 0 {
+					t.Fatalf("aborted = %v, want a finalized clip", w.aborted)
+				}
+				checkEnding(t, w, f) // only fragments actually written count
+			} else if w.final != nil || !slices.Equal(w.aborted, []clip.EndReason{clip.ReasonBacklogOverflow}) {
+				t.Fatalf("final=%v aborted=%v, want Abort(backlog_overflow) when nothing was written", w.final, w.aborted)
+			}
+			// Further input is harmless and the machine stays suppressed.
+			r.m.OnTriggered(false)
+			r.feed(postRoll + step)
+			r.m.Tick()
+			if r.m.State() != "Suppressed" {
+				t.Fatalf("State() = %q after post-roll, want Suppressed", r.m.State())
+			}
+			r.m.ForceFinalize(clip.ReasonBacklogOverflow)
+			if r.m.State() != "Suppressed" {
+				t.Fatalf("State() = %q after ForceFinalize, want Suppressed", r.m.State())
+			}
+			r.m.Shutdown() // must not dereference a missing clip
+			if r.opens() != 1 {
+				t.Errorf("opens = %d, want 1", r.opens())
+			}
+		})
 	}
 }
 

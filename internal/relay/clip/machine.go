@@ -5,7 +5,6 @@ package clip
 
 import (
 	"crypto/rand"
-	"fmt"
 	"io"
 	"sync/atomic"
 	"time"
@@ -54,8 +53,9 @@ type FinalInfo struct {
 
 // ClipWriter receives one clip. WriteGOP gets whole, closed GOPs in order
 // (the final one may be cut short by the end of the clip). The Machine never
-// calls it after Finalize or Abort. Abort discards the clip: nothing was
-// ever written to it.
+// calls it after Finalize or Abort. Abort discards a clip that has no
+// fragment (nothing was ever written to it); a clip with fragments always
+// ends with Finalize, also when a WriteGOP error forces backlog_overflow.
 type ClipWriter interface {
 	WriteGOP(g *ring.GOP) error
 	Finalize(f FinalInfo) error
@@ -76,9 +76,6 @@ type Config struct {
 	PostRoll, MaxClip time.Duration
 	// Rand is the entropy for ULIDs; nil means crypto/rand.
 	Rand io.Reader
-	// OnError, when set, is told about errors the machine absorbs: a failed
-	// Open (retried at the next IDR) or a failed WriteGOP/Finalize.
-	OnError func(error)
 }
 
 // States reported by State.
@@ -158,12 +155,6 @@ func (m *Machine) setState(s int32) { m.state.Store(s) }
 
 func (m *Machine) active() bool { return m.cur != nil }
 
-func (m *Machine) report(err error) {
-	if m.cfg.OnError != nil {
-		m.cfg.OnError(fmt.Errorf("clip %s: %w", m.cfg.Camera, err))
-	}
-}
-
 // OnCodec records the session's codec and time source. A codec that differs
 // from the previous one ends the active clip with codec_change.
 func (m *Machine) OnCodec(c camera.Codec, ts camera.TimeSource) {
@@ -198,20 +189,22 @@ func (m *Machine) OnVideo(au *camera.AccessUnit) {
 		m.clipAU(au)
 		return
 	}
-	if m.state.Load() == stateIdle {
+	// A failed Open is retried at the next IDR, not on every frame.
+	if au.IDR && m.state.Load() == stateIdle {
 		m.tryOpen()
 	}
 }
 
 // OnLost reports that the RTSP session was lost. The active clip ends with
-// stream_lost, or is aborted when no fragment was written. The unfinished
-// GOP is dropped: its tail never arrived.
+// stream_lost after writing the frames received so far, including those of
+// the open GOP (relay-spec 4.5). Only a clip that holds no frame at all is
+// aborted.
 func (m *Machine) OnLost() {
 	if m.closed() {
 		return
 	}
 	if m.active() {
-		m.finish(ReasonStreamLost, false, stateIdle)
+		m.finish(ReasonStreamLost, true, stateIdle)
 	}
 	m.ring.Reset()
 	m.cont = nil
@@ -254,9 +247,14 @@ func (m *Machine) OnTriggered(active bool) {
 
 // Tick ends a clip whose post-roll has elapsed. Call it regularly.
 func (m *Machine) Tick() {
-	if m.state.Load() == statePostRoll && !m.clk.Now().Before(m.deadline) {
-		m.finish(ReasonPostRollElapsed, true, stateIdle)
+	if m.state.Load() != statePostRoll || m.clk.Now().Before(m.deadline) {
+		return
 	}
+	if !m.active() {
+		m.setState(stateIdle)
+		return
+	}
+	m.finish(ReasonPostRollElapsed, true, stateIdle)
 }
 
 // ForceFinalize ends the active clip with reason and suppresses new clips
@@ -327,27 +325,40 @@ func (m *Machine) tryOpen() {
 		newest := lastGOP.AUs[len(lastGOP.AUs)-1].Wall
 		preRollMs = newest.Sub(gops[0].Start).Milliseconds()
 	}
-	if m.begin(gops, series, index, preRollMs) {
+	switch m.begin(gops, series, index, preRollMs) {
+	case beginOpened:
 		m.cont = nil
 		m.setState(stateRecording)
+	case beginAborted:
+		m.cont = nil // Suppressed was set; a new clip starts a new series
+	case beginFailed:
+		// Stay Idle; the next IDR retries.
 	}
 }
 
+// beginResult says how begin ended.
+type beginResult int
+
+const (
+	beginOpened  beginResult = iota // the segment is open and recording
+	beginFailed                     // no segment was opened (ULID or Open error)
+	beginAborted                    // opened, then ended by a write error: Suppressed
+)
+
 // begin opens a segment starting at the first of gops and writes every GOP
 // but the last, which is still open and becomes pend. A zero series makes a
-// new one. It reports false, with the error reported, when it could not.
-func (m *Machine) begin(gops []*ring.GOP, series ulid.ULID, index int, preRollMs int64) bool {
+// new one. Errors are absorbed: the caller sees them as beginFailed (nothing
+// opened) or beginAborted (the segment ended on a write error).
+func (m *Machine) begin(gops []*ring.GOP, series ulid.ULID, index int, preRollMs int64) beginResult {
 	start := gops[0].Start.UTC()
 	id, err := ulid.New(ulid.Timestamp(start), m.rnd)
 	if err != nil {
-		m.report(err)
-		return false
+		return beginFailed
 	}
 	if series == (ulid.ULID{}) {
 		series, err = ulid.New(ulid.Timestamp(start), m.rnd)
 		if err != nil {
-			m.report(err)
-			return false
+			return beginFailed
 		}
 	}
 	info := OpenInfo{
@@ -357,18 +368,17 @@ func (m *Machine) begin(gops []*ring.GOP, series ulid.ULID, index int, preRollMs
 	}
 	w, err := m.out.Open(info)
 	if err != nil {
-		m.report(err)
-		return false
+		return beginFailed
 	}
 	m.cur = &segment{w: w, info: info}
 	last := len(gops) - 1
 	for i, g := range gops[:last] {
 		if !m.writeGOP(g, gops[i+1].Start) {
-			return true // the segment was aborted; Suppressed is set
+			return beginAborted
 		}
 	}
 	m.cur.pend = append([]*camera.AccessUnit(nil), gops[last].AUs...)
-	return true
+	return beginOpened
 }
 
 // clipAU adds au to the active clip.
@@ -401,10 +411,18 @@ func (m *Machine) split(au *camera.AccessUnit) {
 		AUs: []*camera.AccessUnit{au}, Start: au.Wall, StartDTS: au.DTS,
 		Bytes: int64(au.Bytes), ParamGen: au.ParamGen,
 	}
-	if !m.begin([]*ring.GOP{g}, series, next, 0) {
-		m.cont = &continuation{series: series, next: next}
-		m.setState(stateIdle)
+	if m.begin([]*ring.GOP{g}, series, next, 0) != beginFailed {
+		return
 	}
+	// Open failed. Retry at the next IDR, from GOPs that start at or after
+	// this segment's end only: the older ring GOPs are already in the
+	// previous segment.
+	if m.triggered {
+		m.cont = &continuation{series: series, next: next}
+	}
+	m.ring.Reset()
+	m.ring.Push(au)
+	m.setState(stateIdle)
 }
 
 // flushPend writes the pending GOP to the clip, ending at end. It reports
@@ -424,16 +442,14 @@ func (m *Machine) flushPend(end time.Time) bool {
 	return m.writeGOP(g, end)
 }
 
-// writeGOP writes g; end is where it ends. On error the clip is aborted and
-// the machine is suppressed, as the writer's backlog cannot take it.
+// writeGOP writes g; end is where it ends. On error the writer's backlog
+// cannot take the clip: it ends with backlog_overflow and the machine is
+// suppressed (relay-spec 4.5). The fragments already written are kept; a
+// clip with none is aborted.
 func (m *Machine) writeGOP(g *ring.GOP, end time.Time) bool {
 	seg := m.cur
 	if err := seg.w.WriteGOP(g); err != nil {
-		m.report(err)
-		seg.w.Abort(ReasonBacklogOverflow)
-		m.trig.endClip()
-		m.cur = nil
-		m.setState(stateSuppressed)
+		m.finish(ReasonBacklogOverflow, false, stateSuppressed)
 		return false
 	}
 	seg.fragments++
@@ -446,6 +462,9 @@ func (m *Machine) writeGOP(g *ring.GOP, end time.Time) bool {
 // reports false when a write failed (the machine is then Suppressed).
 func (m *Machine) finish(reason EndReason, flush bool, next int32) bool {
 	seg := m.cur
+	if seg == nil {
+		return false
+	}
 	if flush && len(seg.pend) > 0 {
 		end := seg.pend[len(seg.pend)-1].Wall.Add(m.frameDur)
 		if !m.flushPend(end) {
@@ -461,15 +480,14 @@ func (m *Machine) finish(reason EndReason, flush bool, next int32) bool {
 		return true
 	}
 	durMs := max(seg.fragEnd.Sub(seg.info.Start).Milliseconds(), 0)
-	err := seg.w.Finalize(FinalInfo{
+	// A Finalize error is the writer's to handle (it owns the backlog and
+	// the retries); the clip is over either way.
+	_ = seg.w.Finalize(FinalInfo{
 		End:        seg.fragEnd,
 		DurationMs: durMs,
 		Reason:     reason,
 		Triggers:   m.trig.snapshot(seg.info.Start, durMs),
 	})
-	if err != nil {
-		m.report(err)
-	}
 	m.trig.endClip()
 	return true
 }
