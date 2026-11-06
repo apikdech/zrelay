@@ -84,6 +84,9 @@ type Sub struct {
 // When a delivery would block, the Hub clears the subscriber's queue,
 // increments Lagged, delivers one EventLost followed by the current codec,
 // and skips video until the next IDR. Audio resumes at once for viewers.
+// Consumers must therefore expect an EventCodec right after an EventLost
+// even when the codec has not changed. A full queue met by Lost is cleared
+// the same way but does not count as lag.
 func (h *Hub) Subscribe(class Class, queue int) *Sub {
 	s := &Sub{hub: h, class: class, ch: make(chan Event, max(queue, minQueue)), waitIDR: true}
 	h.mu.Lock()
@@ -197,7 +200,12 @@ func (h *Hub) deliver(s *Sub, ev Event) {
 			drained = true
 		}
 	}
-	s.lagged.Add(1)
+	if ev.Kind != EventLost {
+		// A session loss (Lost) on a full queue is not lag: the subscriber
+		// gets the same single EventLost, but Lagged, which feeds
+		// zrelay_recorder_lag_total, counts only slow consumers.
+		s.lagged.Add(1)
+	}
 	s.waitIDR = true
 	s.ch <- Event{Kind: EventLost}
 	if h.hasCodec {

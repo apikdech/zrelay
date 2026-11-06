@@ -333,3 +333,42 @@ func TestHubConcurrentSubscribeClose(t *testing.T) {
 }
 
 var _ camera.SessionSink = (*camera.Hub)(nil)
+
+// Camera names the Hub, for per-camera metrics such as
+// zrelay_recorder_lag_total{camera}.
+func TestHubCamera(t *testing.T) {
+	t.Parallel()
+	if got := camera.NewHub("front").Camera(); got != "front" {
+		t.Fatalf("Camera() = %q, want %q", got, "front")
+	}
+}
+
+// A session loss that finds a subscriber's queue full is not a lag: the
+// subscriber gets exactly one EventLost (its stale queue cleared), and
+// Lagged, which feeds zrelay_recorder_lag_total, is unchanged.
+func TestLostOnFullQueueIsNotLag(t *testing.T) {
+	t.Parallel()
+	h := camera.NewHub("front")
+	s := h.Subscribe(camera.ClassRecorder, 2)
+	defer s.Close()
+
+	h.Codec(hubCodec, camera.TimeSourceRTCP)
+	h.Video(au(0, true)) // queue now full: codec, IDR
+	h.Lost()
+
+	evs := pending(s)
+	if len(evs) != 1 || evs[0].Kind != camera.EventLost {
+		t.Fatalf("events after Lost = %+v, want exactly one EventLost", evs)
+	}
+	if got := s.Lagged(); got != 0 {
+		t.Fatalf("Lagged = %d, want 0 (a session loss is not recorder lag)", got)
+	}
+	// Video still resumes at the next IDR.
+	h.Codec(hubCodec, camera.TimeSourceRTCP)
+	h.Video(au(3000, false))
+	h.Video(au(6000, true))
+	evs = pending(s)
+	if len(evs) != 2 || evs[0].Kind != camera.EventCodec || evs[1].Kind != camera.EventVideo || !evs[1].AU.IDR {
+		t.Fatalf("events after reconnect = %+v, want codec then IDR", evs)
+	}
+}
