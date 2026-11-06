@@ -13,6 +13,7 @@ import {
   feedsRange,
   planResume,
   planSeek,
+  playheadSettled,
   type Range,
 } from './buffer';
 
@@ -262,5 +263,25 @@ describe('planResume slack', () => {
   it('a range that ends well short of the next fragment start is still inside the previous fragment', () => {
     // 3.769 s is 0.231 s before the fragment at 4 s: the fragment at 2 s was cut, not completed.
     expect(planResume({ tMs: 1000, seekIndex: idx, chunkSize: CS, buffered: [[0, 3.769]] })).toEqual({ chunk: 1, intraOffset: 0 });
+  });
+});
+
+describe('playheadSettled (has the playhead reached the seek target\'s range?)', () => {
+  it('is true inside the buffered range holding the target, from just before the target on', () => {
+    expect(playheadSettled([[18, 40]], 20_000, 20)).toBe(true);
+    expect(playheadSettled([[18, 40]], 20_000, 25.5)).toBe(true);
+    expect(playheadSettled([[18, 40]], 20_000, 19.8)).toBe(true);
+  });
+  it('is false for a time outside that range, such as the end of the clip', () => {
+    expect(playheadSettled([[18, 40]], 20_000, 40)).toBe(false);
+    expect(playheadSettled([[18, 40]], 20_000, 120)).toBe(false);
+    expect(playheadSettled([[18, 40]], 20_000, 3)).toBe(false);
+  });
+  it('is false when the target is not buffered', () => {
+    expect(playheadSettled([[2, 2.8]], 3000, 2.5)).toBe(false);
+    expect(playheadSettled([], 3000, 3)).toBe(false);
+  });
+  it('ignores another range that holds the time', () => {
+    expect(playheadSettled([[2, 10], [60, 90]], 3000, 70)).toBe(false);
   });
 });

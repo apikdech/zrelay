@@ -64,6 +64,16 @@ function holding(ranges: readonly Range[], t: number): Range | undefined {
 /** True when `t` is inside a buffered range. */
 export const isBuffered = (ranges: readonly Range[], t: number): boolean => holding(ranges, t) !== undefined;
 
+/**
+ * True when the playhead `t` (s) has reached the seek target: the buffered range that holds the target also
+ * holds `t`, from just before the target on. A `t` outside it (the end of the clip, say) is a browser
+ * settling somewhere else, not the seek arriving.
+ */
+export function playheadSettled(ranges: readonly Range[], targetMs: number, t: number): boolean {
+  const r = holding(ranges, targetMs / 1000);
+  return r !== undefined && t >= targetMs / 1000 - START_SLACK && t < r[1];
+}
+
 /** Seconds buffered from `t` to the end of its range; 0 when `t` is not buffered. */
 export function bufferedAhead(ranges: readonly Range[], t: number): number {
   const r = holding(ranges, t);

@@ -6,7 +6,7 @@ import type { ClipOpenResult, ClipReadResult, Request, Verification } from '../.
 import { ErrAuth, ErrAuthHeader, ErrFormat, ErrTrailingData, ErrTruncated, ErrUnknownKey } from '../zrec/errors';
 import type { WorkerClient } from '../workerClient';
 import { findNextClip } from './advance';
-import { BLOB_LRU, BLOB_MAX, WINDOWS, alignToFragments, failureTimeMs, feedsRange, isBuffered, needsMore, planEviction, planResume, planSeek, type Profile } from './buffer';
+import { BLOB_LRU, BLOB_MAX, WINDOWS, alignToFragments, failureTimeMs, feedsRange, isBuffered, needsMore, planEviction, planResume, planSeek, playheadSettled, type Profile } from './buffer';
 import { BlobLru, blobFromParts } from './blob';
 import { mseCtor, mseSupports, openSink, type MseKind, type Sink } from './mse';
 import { initialState } from './status';
@@ -64,10 +64,14 @@ class PlayerImpl implements Player {
   #sink: Sink | null = null;
   #waiters: (() => void)[] = [];
   /**
-   * While a seek settles, the media time it is moving to (s). `video.currentTime` only
-   * follows once the target fragment is buffered, so window decisions read this instead.
+   * While a seek settles, the media time it is moving to (s). `video.currentTime` only follows once the target
+   * fragment is buffered, and the browser may then report some other time before it has settled on the target
+   * (WebKit does, after a seek in an ended stream), so window decisions read this instead until the playhead
+   * reports a time inside the target's range.
    */
   #seekHead: number | null = null;
+  /** The media time (ms) the engine assigned to currentTime for the seek that is settling, or null before that. */
+  #assignedMs: number | null = null;
   /** Bumped by every seek(): a settling seek whose token is no longer current must not move the playhead. */
   #seekTok = 0;
   /** True once the current clip has had its first fragment appended (before that, the fill is the initial fetch). */
@@ -90,6 +94,7 @@ class PlayerImpl implements Player {
   readonly #onEnded = () => void this.#advance();
   readonly #onTime = () => {
     if (this.#fetching && this.#sink && isBuffered(this.#sink.buffered(), this.video.currentTime)) this.#fetching = null;
+    this.#confirmSeek();
     this.#signal();
   };
   readonly #onSeeking = () => {
@@ -106,6 +111,7 @@ class PlayerImpl implements Player {
     this.#blobs = new BlobLru<BlobEntry>(BLOB_LRU[profile]);
     video.addEventListener('timeupdate', this.#onTime);
     video.addEventListener('seeking', this.#onSeeking);
+    video.addEventListener('seeked', this.#onTime);
     video.addEventListener('ended', this.#onEnded);
   }
 
@@ -114,6 +120,22 @@ class PlayerImpl implements Player {
   /** The playhead for buffer-window decisions: the seek target while one is settling. */
   #head(): number {
     return this.#seekHead ?? this.video.currentTime;
+  }
+
+  /** The seek that was settling is over: window decisions follow the browser's playhead again. */
+  #endSeek(): void {
+    this.#seekHead = null;
+    this.#assignedMs = null;
+  }
+
+  /**
+   * The engine has assigned currentTime for a fetch seek; the seek is over once a `seeked` or `timeupdate`
+   * reports a time inside the target's range. Any other time, without a `seeking` event, is not a scrub.
+   */
+  #confirmSeek(): void {
+    const t = this.#assignedMs;
+    if (t === null || this.#seekHead === null || !this.#sink) return;
+    if (playheadSettled(this.#sink.buffered(), t, this.video.currentTime)) this.#endSeek();
   }
 
   #set(patch: Partial<PlayerState>): void {
@@ -267,13 +289,23 @@ class PlayerImpl implements Player {
   /**
    * Appends chunks from `from` (the first one from `intra` bytes in) for as long
    * as the buffer wants more, until the final chunk or a newer generation.
+   *
+   * `seek`: this fill carries a fetch seek. It fetches regardless of the buffer window (the playhead has not
+   * moved yet, so the window, and ManagedMediaSource's streaming flag, still describe the old position) until
+   * `done` says the target is buffered, which can take several chunks when a fragment spans them; then it
+   * calls `resolve` and carries on as usual. `resolve` also runs when the fill ends first.
    */
-  async #fill(g: number, open: ClipOpenResult, sink: Sink, from: number, intra: number, onFirst?: () => void): Promise<void> {
+  async #fill(
+    g: number,
+    open: ClipOpenResult,
+    sink: Sink,
+    from: number,
+    intra: number,
+    seek?: { done: (appendedTo: number) => boolean; resolve: () => void },
+  ): Promise<void> {
     const pending = new Map<number, Promise<ClipReadResult>>();
     let c = from;
-    // A seek always fetches its first chunk: the playhead has not moved yet, so the buffer window
-    // (and ManagedMediaSource's streaming flag) still describe the old position.
-    let force = onFirst !== undefined;
+    let force = seek !== undefined;
     const size = open.header.chunkSize;
     this.#fillAt = { gen: g, offset: from * size + intra };
     try {
@@ -282,7 +314,6 @@ class PlayerImpl implements Player {
           await this.#demand();
           continue;
         }
-        force = false;
         const cur = pending.get(c) ?? this.#read(c);
         pending.delete(c);
         if (c + 1 < open.numChunks && !pending.has(c + 1)) pending.set(c + 1, this.#read(c + 1));
@@ -291,8 +322,10 @@ class PlayerImpl implements Player {
         await this.#append(g, sink, new Uint8Array(res.plaintext, c === from ? intra : 0));
         if (g !== this.#gen) return;
         this.#appended = true;
-        onFirst?.();
-        onFirst = undefined;
+        if (force && seek!.done((c + 1) * size)) {
+          force = false;
+          seek!.resolve();
+        }
         if (res.final) {
           await sink.endOfStream();
           return;
@@ -308,7 +341,7 @@ class PlayerImpl implements Player {
       await sink.endOfStream().catch(() => undefined);
     } finally {
       if (this.#fillAt?.gen === g) this.#fillAt = null;
-      onFirst?.();
+      seek?.resolve();
     }
   }
 
@@ -419,6 +452,11 @@ class PlayerImpl implements Player {
     const sink = this.#sink;
     let target = Math.max(0, tMs);
     const st = this.#state;
+    if (native && this.#assignedMs !== null && Math.abs(tMs - this.#assignedMs) < 1) {
+      // The `seeking` that the engine's own assignment raised: the seek it belongs to is still the latest.
+      this.#signal();
+      return;
+    }
     if (st.integrity === 'tampered' && st.failedAtMs !== null) {
       // Never play (or fetch) past the last verified frame. At the failure point itself the browser's own
       // assignment lands here: nothing to fetch, nothing to clamp.
@@ -426,7 +464,7 @@ class PlayerImpl implements Player {
       if (target >= (native ? limit - 1 : limit)) {
         this.#seekTok++;
         if (!native || target > limit + 1) {
-          this.#seekHead = null;
+          this.#endSeek();
           this.video.currentTime = Math.min(target, limit) / 1000;
         }
         return;
@@ -435,7 +473,7 @@ class PlayerImpl implements Player {
     if (!open || !sink) {
       if (!native) {
         this.#seekTok++;
-        this.#seekHead = null;
+        this.#endSeek();
         this.video.currentTime = target / 1000;
       }
       return;
@@ -445,8 +483,9 @@ class PlayerImpl implements Player {
     const plan = planSeek({ tMs: target, seekIndex: open.seekIndex, chunkSize: open.header.chunkSize, buffered: sink.buffered() });
     if (plan.kind !== 'fetch') {
       ++this.#seekTok;
-      const settling = plan.kind === 'buffered' && this.#seekHead !== null;
-      this.#seekHead = null;
+      // Settling: the earlier fetch seek has not handed the playhead over yet (its fill is still bringing the target in).
+      const settling = plan.kind === 'buffered' && this.#seekHead !== null && this.#assignedMs === null;
+      this.#endSeek();
       if (plan.kind === 'buffered') this.#fetching = null;
       if (!native) this.video.currentTime = target / 1000;
       this.#signal();
@@ -471,7 +510,7 @@ class PlayerImpl implements Player {
     // the seek's fragment is complete: that is not a new scrub. While the seek is still settling the engine
     // has not assigned currentTime yet, so any event is the viewer's, and the latest target wins.
     const f = this.#fetching;
-    if (native && f && f.gen === this.#gen && f.fragmentMs === plan.fragmentMs && this.#seekHead === null) return;
+    if (native && f && f.gen === this.#gen && f.fragmentMs === plan.fragmentMs && (this.#seekHead === null || this.#assignedMs !== null)) return;
 
     const tok = ++this.#seekTok;
     // ui-spec §4.3.2 step 2: drop the old fetches (their results are ignored), reset the parser, fetch the fragment.
@@ -480,6 +519,7 @@ class PlayerImpl implements Player {
     this.#signal();
     target = Math.max(target, plan.fragmentMs);
     this.#seekHead = target / 1000;
+    this.#assignedMs = null;
     await sink.abort();
     if (g !== this.#gen) return;
     // Anything far ahead of the new position would otherwise leave a hole behind the sequential fill.
@@ -487,14 +527,22 @@ class PlayerImpl implements Player {
     // The fill below still runs, because this seek already stopped the previous one.)
     await this.#evictAhead(g, open, sink, this.#head());
     if (g !== this.#gen) return;
+    // The fragment may span several chunks: wait until the target itself is buffered (or its fragment has been
+    // appended in full), with the fill running on meanwhile.
+    const nextFragment = open.seekIndex.find(([t]) => t > plan.fragmentMs);
+    const fragmentEnd = nextFragment ? nextFragment[1] : Infinity;
     await new Promise<void>((resolve) => {
-      void this.#fill(g, open, sink, plan.chunk, plan.intraOffset, resolve);
+      void this.#fill(g, open, sink, plan.chunk, plan.intraOffset, {
+        done: (appendedTo) => isBuffered(sink.buffered(), target / 1000) || appendedTo >= fragmentEnd,
+        resolve,
+      });
     });
-    // Move the playhead only once its fragment is buffered. Setting it earlier makes
-    // WebKit settle on the nearest buffered time instead of waiting for the data.
+    // Move the playhead only once its fragment is buffered. Setting it earlier makes WebKit settle on the nearest
+    // buffered time instead of waiting for the data, and report some other time (the end of the clip) afterwards.
+    // The window keeps following the target (`#seekHead`) until the playhead reports a time inside its range.
     if (g === this.#gen && tok === this.#seekTok) {
+      this.#assignedMs = target;
       this.video.currentTime = target / 1000;
-      this.#seekHead = null;
     }
   }
 
@@ -568,7 +616,7 @@ class PlayerImpl implements Player {
   /** Stops everything belonging to the current clip. */
   #teardown(): void {
     this.#gen++;
-    this.#seekHead = null;
+    this.#endSeek();
     this.#appended = false;
     this.#fetching = null;
     this.#fillAt = null;
@@ -588,6 +636,7 @@ class PlayerImpl implements Player {
     this.#blobs.clear();
     this.video.removeEventListener('timeupdate', this.#onTime);
     this.video.removeEventListener('seeking', this.#onSeeking);
+    this.video.removeEventListener('seeked', this.#onTime);
     this.video.removeEventListener('ended', this.#onEnded);
     this.#listeners.clear();
   }
