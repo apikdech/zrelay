@@ -1,0 +1,17 @@
+# Secrets: never commit env files or key material.
+.env
+.env.*
+
+# Go build and test output
+/bin/
+*.test
+/coverage.out
+
+# Web
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+
+# OS
+.DS_Store
