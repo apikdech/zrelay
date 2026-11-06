@@ -1,0 +1,55 @@
+# zrelay deployment (design §8.3). Start it with deploy/deploy.sh.
+#
+# Zero-disk is enforced here: read_only root filesystem, no volumes and no
+# tmpfs. The config and the Docker secrets are mounted read-only files.
+#
+# Files next to this compose file (never committed):
+#   .env                     ENV: references (S3_ENDPOINT, S3_ACCESS_KEY,
+#                            RESTREAM_USER, RESTREAM_PASS, CAMERA_*)
+#   zrelay.yaml              the config, from zrelay.example.yaml
+#   secrets/zrelay_master    the zk1- master key
+#   secrets/s3_secret_key    the relay's MinIO secret key
+#   secrets/api_token_sha256 hex(SHA-256(K_api))
+#
+# Inside the container, zrelay.yaml must set relay.http_listen to
+# "0.0.0.0:9464" for the loopback-only publish below to reach /metrics;
+# the host side stays bound to 127.0.0.1. live.listen (9465) is not
+# published: zview-server reaches it over the compose network (Task 28).
+name: zrelay
+
+services:
+  zrelay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.zrelay
+    image: zrelay:local
+    restart: unless-stopped
+    read_only: true
+    env_file: .env
+    environment:
+      TAILSCALE_IP: ${TAILSCALE_IP:?TAILSCALE_IP is unset; run deploy/deploy.sh}
+    configs:
+      - source: zrelay_config
+        target: /etc/zrelay/zrelay.yaml
+    secrets:
+      - zrelay_master
+      - s3_secret_key
+      - api_token_sha256
+    ports:
+      - "${TAILSCALE_IP}:8554:8554/tcp"   # RTSP restream
+      - "${TAILSCALE_IP}:8189:8189/udp"   # WebRTC ICE
+      - "127.0.0.1:9464:9464/tcp"         # /healthz /metrics, loopback only
+    ulimits:
+      core: 0
+
+configs:
+  zrelay_config:
+    file: ./zrelay.yaml
+
+secrets:
+  zrelay_master:
+    file: ./secrets/zrelay_master
+  s3_secret_key:
+    file: ./secrets/s3_secret_key
+  api_token_sha256:
+    file: ./secrets/api_token_sha256

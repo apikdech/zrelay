@@ -83,3 +83,61 @@ resynchronisation), exactly one `Codec` line, and the logged wall drift vs media
   `assembler.emit` (`internal/relay/camera/au.go`) and `TestWallClockRTCPNeverStepsBack`.
 
 **Status:** not run
+
+## Task 4 — Memory budget + `zrelay config check` + container images
+
+**Automated in this task:** `config.Budget` / `BudgetReport.WriteTable` (design §8.1 formula,
+`fps_est = 15`, `LivePerViewerBytes = 2 MiB`, runtime 32 MiB, limit 80% of `max_memory_mb`) and the
+`cmd/zrelay` dispatcher (`config check --config`, global and per-subcommand `--env-file`; exit 0 OK,
+1 budget over 80%, 2 usage error or invalid config) are covered by `TestBudgetWorkedExample`
+(Total 679 131 231 bytes: over at 768, OK at 1024), `TestConfigCheckExitCodes` and the env-file,
+secret-leak and usage tests; all pass under `make vet test`. `docker build -f deploy/Dockerfile.zrelay .`
+succeeded (scratch image, about 5 MB, `User 65534:65534`, entrypoint
+`["/zrelay","run","--config=/etc/zrelay/zrelay.yaml"]`). With the example config and dummy
+secrets mounted read-only, `docker run --rm --read-only --env-file <dummy.env> -v
+<example>:/etc/zrelay/zrelay.yaml:ro -v <dummy-secrets>:/run/secrets:ro --entrypoint /zrelay
+<img> config check --config /etc/zrelay/zrelay.yaml` printed the table (TOTAL 620 241 378 bytes,
+591.5 MiB, limit 614.4 MiB, OK) and exited 0. `docker compose -f deploy/compose.yaml config` was
+rendered against dummy inputs (read_only, no volumes or tmpfs, secrets at `/run/secrets`, ports
+`${TAILSCALE_IP}:8554/tcp`, `${TAILSCALE_IP}:8189/udp`, `127.0.0.1:9464`, `ulimits core 0`).
+`zrelay run` does not exist yet (a later task), so `deploy.sh` could not start a running daemon,
+and nothing was run on the Mac mini or against Tailscale.
+
+**Manual steps:**
+1. On the Mac mini, from the repository root: `cp deploy/zrelay.example.yaml deploy/zrelay.yaml`
+   and set `relay.http_listen: "0.0.0.0:9464"` in `deploy/zrelay.yaml` (inside the container; the
+   host publish stays `127.0.0.1:9464`).
+2. Create `deploy/.env` with `S3_ENDPOINT`, `S3_ACCESS_KEY`, `RESTREAM_USER`, `RESTREAM_PASS`,
+   `CAMERA_IP`, `CAMERA_USERNAME`, `CAMERA_PASSWORD`, and `mkdir -m 700 deploy/secrets` holding
+   `zrelay_master`, `s3_secret_key` and `api_token_sha256`, each `chmod 600`.
+3. `export TAILSCALE_IP=$(tailscale ip -4 | head -n 1)`, then
+   `docker compose -f deploy/compose.yaml build` and
+   `docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint /zrelay zrelay config check --config /etc/zrelay/zrelay.yaml; echo "exit $?"`
+4. Once `zrelay run` exists: `unset TAILSCALE_IP; ./deploy/deploy.sh`, then
+   `docker inspect zrelay-zrelay-1 --format '{{.HostConfig.ReadonlyRootfs}} {{json .Mounts}} {{json .HostConfig.PortBindings}}'`
+   and `curl -s http://127.0.0.1:9464/healthz`; from another tailnet host
+   `nc -vz <tailscale-ip> 9464` and `nc -vz <tailscale-ip> 8554`.
+
+**Expected result:** step 3 prints the budget table with one `camera tapo-c220` row, `TOTAL`
+591.5 MiB and `budget OK`, then `exit 0`, with no `WARN secret file mode` lines and no
+"permission denied" on `/run/secrets/*` (the files are read as uid 65534). Step 4: `deploy.sh`
+picks up the Tailscale IP by itself; `ReadonlyRootfs` is `true`; `Mounts` lists only the config and
+the three secrets (bind, read-only) with no volume or tmpfs; ports bind 8554/tcp and 8189/udp on the
+Tailscale IP and 9464 on `127.0.0.1` only; `/healthz` answers locally; 9464 is refused from the
+other host while 8554 connects.
+
+**If the result differs, update:**
+- Secrets unreadable by uid 65534 under OrbStack (permission denied with `chmod 600`): the
+  `secrets:` block in `deploy/compose.yaml` (bind-mounted secrets keep the host owner and mode;
+  use the long syntax with `uid`/`gid`/`mode` if OrbStack honours it, or document the needed mode
+  in `deploy/runbook.md`) and design §8.3.
+- `config check` over budget with the real camera settings: the camera's `max_bitrate_kbps` /
+  `max_gop_seconds` or `relay.max_memory_mb` in `deploy/zrelay.yaml`; if the queue term is the
+  cause, that is the Task 11 revision of `budgetFPSEstimate` / the queue formula in
+  `internal/relay/config/budget.go`, design §8.1 and `TestBudgetWorkedExample`.
+- `/metrics` unreachable through `127.0.0.1:9464`: the `http_listen` note at the top of
+  `deploy/compose.yaml` and the runbook.
+- `tailscale` not on `PATH` on macOS: `deploy/deploy.sh` (use
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4`).
+
+**Status:** not run
