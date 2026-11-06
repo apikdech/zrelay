@@ -19,9 +19,10 @@ const (
 	runtimeBytes = 32 << 20
 )
 
-// LivePerViewerBytes is the live term per viewer (pion buffers). It is an
-// estimate; Phase 2 measures real usage and updates it.
-var LivePerViewerBytes int64 = 2 << 20
+// LivePerViewerBytes is the live term per viewer (pion buffers). Measured
+// by live.BenchmarkViewerMemory at about 2.2 MiB of heap and stacks per
+// WHEP viewer (400 KiB/s H.264, default NACK and RTCP interceptors), rounded up.
+var LivePerViewerBytes int64 = 3 << 20
 
 // CameraBudget is one camera's share of the memory budget, in bytes.
 type CameraBudget struct {

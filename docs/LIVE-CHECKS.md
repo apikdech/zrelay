@@ -366,5 +366,54 @@ a literal` and does not echo the value, the second says the `KEYCHAIN:` scheme i
 level, `HalfBlocks`, quiet zone) and `TestKeyGenerateQRUsesUppercaseForm` if the phone cannot scan
 it; `zrec.Derive` / `zrec.FormatKeyID` and Contract §3 if the app derives a different fingerprint or
 token hash.
+## Task 11 — Live view (WHEP)
+
+**Automated in this task:** `internal/relay/live` is tested end to end with an in-process pion
+client on loopback (ephemeral ports only): `TestWHEPOfferAnswerDeliversVideo` (H.264 RTP within
+3 s, first decoded slice is an IDR), `TestWHEPAudioNegotiatedWhenPresent` (PCMA track),
+`TestWHEPNoAudioTrackWhenCameraHasNone`, `TestWHEPAuth` (401, no pion session created),
+`TestWHEPMaxViewers` (503), `TestWHEPDeleteEndsSession`, `TestWHEPUnknownCamera404`,
+`TestWHEPWrongContentType415`, `TestWHEPBodyLimit413`, `TestWHEPBadOffer400`,
+`TestViewerLagResyncsAtIDR`, `TestSessionClosedWhenPeerCloses` (clean path: peer closes DTLS, slot freed),
+`TestSessionClosedWhenPeerGoesSilent` (client socket closed without a DTLS close; ICE timeouts shortened
+through the `iceDisconnected`/`iceFailed` variables), `TestICETimeoutsClosePeerWithin30Seconds`
+(defaults sum to 30 s), `TestServerCloseAtEachNegotiationStep` (Close forced deterministically through a test hook at the
+"created", "attached" and "negotiated" points of a POST: 503, pion session closed, slot freed;
+mutation-checked against the attach guard and both 503 branches) and
+`TestServerCloseDuringNegotiationStress` (Close racing in-flight POSTs, under `-race`), `TestWHEPDisabledWithZeroMaxViewers` (503), `TestWHEPRejectsH265With501`,
+`TestPeerThatNeverConnectsIsClosedAfterTimeout` (fake clock), `TestNewServerValidation`/`Defaults`,
+`TestServerCloseEndsSessions`. `BenchmarkViewerMemory` (four viewer processes at 400 KiB/s) measured
+about 2.2 MiB of heap and stacks per added viewer (2.27 to 2.36 MB across three runs), so
+`config.LivePerViewerBytes` is now 3 MiB and design §8.1 says so. Not covered: a real browser, a
+real camera, and ICE across the tailnet. The 30 s silent-peer timeout is tested only with shortened
+ICE timeouts; the production values (5 s disconnected + 25 s failed) are not waited out.
+
+**Manual steps:**
+1. On the Mac mini, with zrelay running against the Tapo C220, `live.advertise_ip` set to the
+   Tailscale IP and `live.ice_udp_port: 8189` published on that IP only, serve
+   `internal/relay/live/testdata/whep.html` from the same origin as `/live/*` (for example through
+   the zview-server `--mode both` proxy, or any reverse proxy that forwards `/live/` to
+   `http://zrelay:9465`).
+2. Compute the bearer token, unpadded base64url of `K_api` (`pkg/zrec.BearerToken`; use the CLI
+   command the key task provides) and paste it into the page's token box. Do not log it.
+3. On a phone on the tailnet (Safari iOS, then Chrome Android) open the page, enter the camera id,
+   press Start.
+4. Open more tabs up to `live.max_viewers: 4`, then one more, and confirm the extra one fails
+   with 503.
+5. Press Stop and confirm the session ends; instead switch the phone off Wi-Fi and confirm the
+   session is freed within about 30 s.
+6. If the camera has a microphone enabled, unmute the `<video>` and listen.
+7. Watch `docker stats zrelay` with four viewers for 10 minutes.
+
+**Expected result:** video starts within about one GOP (up to 2 to 4 s) on every browser, with no
+green frames at the start; audio plays when the camera sends G.711; the fifth viewer gets 503; a
+stopped or vanished viewer frees its slot; memory per viewer stays near 3 MiB.
+
+**If the result differs, update:** a browser that fails to negotiate H.264: `h264Profiles` in
+`internal/relay/live/server.go`; garbled first frames: SPS/PPS prepending in `viewer.annexB`
+(`session.go`); no audio: `audioWatcher` in `server.go`, `negotiate` in `whep.go`, and whether the
+camera sends PCMA or PCMU; ICE fails across Tailscale: `SetICEAddressRewriteRules` in `newAPI`
+and the published port in `deploy/compose.yaml`; memory off: `config.LivePerViewerBytes`, design
+§8.1 and `TestBudgetWorkedExample`.
 
 **Status:** not run

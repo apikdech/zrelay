@@ -68,7 +68,7 @@ func TestBudgetWorkedExample(t *testing.T) {
 		active = int64(11_285_760) // 2×1048576 + 800000 + 8×1048576
 		queues = int64(13_653_333) // (256 + 64×4) × 400000 / 15
 		camera = ring + active + queues
-		live   = 4 * 2 * mib
+		live   = 4 * 3 * mib // LivePerViewerBytes, measured by live.BenchmarkViewerMemory
 		back   = 512 * mib
 		rt     = 32 * mib
 		total  = 3*camera + live + back + rt
@@ -93,8 +93,8 @@ func TestBudgetWorkedExample(t *testing.T) {
 	if r.RuntimeBytes != rt {
 		t.Errorf("RuntimeBytes = %d, want %d", r.RuntimeBytes, rt)
 	}
-	if r.Total != total || total != 679_131_231 {
-		t.Errorf("Total = %d, want %d (679131231)", r.Total, total)
+	if r.Total != total || total != 683_325_535 {
+		t.Errorf("Total = %d, want %d (683325535)", r.Total, total)
 	}
 	if want := 768 * mib * 8 / 10; r.Limit != want {
 		t.Errorf("Limit = %d, want %d", r.Limit, want)
@@ -137,7 +137,7 @@ func TestBudgetWriteTable(t *testing.T) {
 	var buf bytes.Buffer
 	Budget(workedExample(768)).WriteTable(&buf)
 	out := buf.String()
-	for _, want := range []string{"cam-1", "cam-2", "cam-3", "live", "backlog", "runtime", "TOTAL", "limit", "679131231", "OVER"} {
+	for _, want := range []string{"cam-1", "cam-2", "cam-3", "live", "backlog", "runtime", "TOTAL", "limit", "683325535", "OVER"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q:\n%s", want, out)
 		}
