@@ -50,18 +50,11 @@ func OpenReader(r io.ReaderAt, size int64, ring Keyring, opt ReaderOptions) (*Re
 	if err != nil {
 		return nil, err
 	}
-	keys, ok := ring[h.KeyID]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownKey, FormatKeyID(h.KeyID))
-	}
-
 	zr := &Reader{r: r, size: size, h: h, s: int64(h.ChunkSize) + 16, opt: opt}
 	zr.hd = sha256.Sum256(h.Descriptor())
-	wrapAAD := append(zr.hd[:], h.KeyID[:]...)
-	var dek [32]byte
-	_, err = newGCM(keys.Wrap[:]).Open(dek[:0], h.WrapNonce[:], h.WrappedDEK[:], wrapAAD)
+	dek, err := unwrapDEK(h, zr.hd, ring)
 	if err != nil {
-		return nil, ErrAuthHeader
+		return nil, err
 	}
 	zr.aead = newGCM(dek[:])
 	clear(dek[:])
