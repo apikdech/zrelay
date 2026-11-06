@@ -3,6 +3,7 @@
 package local
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -234,5 +235,74 @@ func TestLocalIncompleteIgnoresDegenerateNames(t *testing.T) {
 	}
 	if len(incs) != 0 {
 		t.Errorf("ListIncomplete = %+v, want none", incs)
+	}
+}
+
+// crashLocal creates key, writes data and abandons the writer as kill -9 would.
+func crashLocal(t *testing.T, d *Driver, key string, data []byte) {
+	t.Helper()
+	w, err := d.Create(t.Context(), key)
+	if err != nil {
+		t.Fatalf("Create(%q): %v", key, err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.(*objectWriter).f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocalIncompletePrefixNamesFinalKey(t *testing.T) {
+	d := newDriver(t)
+	const key = "clips/cam/2026/11/06/145959123_01JC0000000000000000000000.zrec"
+	const staging = "clips/cam/2026/11/06/.145959123_01JC0000000000000000000000.zrec.part"
+	crashLocal(t, d, key, []byte("abc"))
+
+	incs, err := d.ListIncomplete(t.Context(), key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incs) != 1 {
+		t.Fatalf("ListIncomplete(%q) = %+v, want exactly one", key, incs)
+	}
+	if incs[0].Key != key || incs[0].StagingKey != staging || incs[0].Size != 3 {
+		t.Errorf("Incomplete = %+v, want Key %q StagingKey %q Size 3", incs[0], key, staging)
+	}
+}
+
+func TestLocalRecoverCommitRejectsMismatchedStaging(t *testing.T) {
+	d := newDriver(t)
+	ctx := t.Context()
+	const a = "clips/cam/2026/11/06/145959123_01JC0000000000000000000000.zrec"
+	const aStaging = "clips/cam/2026/11/06/.145959123_01JC0000000000000000000000.zrec.part"
+	const b = "clips/cam/2026/11/06/150000000_01JC0000000000000000000001.zrec"
+	crashLocal(t, d, a, []byte("abc"))
+	if err := d.PutSmall(ctx, "clips/...part", []byte("x"), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, inc := range []storage.Incomplete{
+		{Key: b, StagingKey: aStaging},                   // stages a, not b
+		{Key: "status/relay.json", StagingKey: aStaging}, // any file onto any key
+		{Key: "clips/..", StagingKey: "clips/...part"},   // degenerate staging name
+		{Key: "clips/.", StagingKey: "clips/...part"},
+		{Key: "clips/x", StagingKey: "clips/x"}, // not a staging name at all
+	} {
+		if _, err := d.RecoverCommit(ctx, inc); !errors.Is(err, storage.ErrInvalidKey) {
+			t.Errorf("RecoverCommit(%+v) error = %v, want ErrInvalidKey", inc, err)
+		}
+	}
+
+	// Nothing was renamed: both staged files are intact and no target exists.
+	for _, k := range []string{aStaging, "clips/...part"} {
+		if _, err := d.Stat(ctx, k); err != nil {
+			t.Errorf("Stat(%q) after rejected RecoverCommit: %v", k, err)
+		}
+	}
+	for _, k := range []string{a, b, "status/relay.json"} {
+		if _, err := d.Stat(ctx, k); !errors.Is(err, storage.ErrNotFound) {
+			t.Errorf("Stat(%q) error = %v, want ErrNotFound", k, err)
+		}
 	}
 }

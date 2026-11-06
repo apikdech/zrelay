@@ -33,6 +33,7 @@ func RunRecoverer(
 		{"OlderListedAndRecovered", testOlderListedAndRecovered},
 		{"PrefixByWholeElement", testIncompletePrefixByWholeElement},
 		{"NothingToRecover", testNothingToRecover},
+		{"StagingSidecarNotListed", testStagingSidecarNotListed},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -115,10 +116,13 @@ func testOlderListedAndRecovered(t *testing.T, p storage.Provider, r storage.Rec
 		t.Errorf("Stat before RecoverCommit error = %v, want ErrNotFound", err)
 	}
 
-	info, err := r.RecoverCommit(t.Context(), inc)
-	if errors.Is(err, storage.ErrNothingToRecover) && d == 0 {
-		t.Skip("driver reported no durable bytes before the crash")
+	// 11 MiB+123 completes at least one part on part-based drivers, so a
+	// driver that reports nothing durable here is broken, not exempt.
+	if d <= 0 {
+		t.Fatalf("DurableOffset before the crash = %d after writing %d bytes, want > 0", d, len(data))
 	}
+
+	info, err := r.RecoverCommit(t.Context(), inc)
 	if err != nil {
 		t.Fatalf("RecoverCommit: %v", err)
 	}
@@ -176,5 +180,37 @@ func testNothingToRecover(t *testing.T, p storage.Provider, r storage.Recoverer,
 	}
 	if _, ok := findIncomplete(t, r, "clips/cam", 0, recoverKey); ok {
 		t.Error("ListIncomplete still lists an empty upload after RecoverCommit")
+	}
+}
+
+// testStagingSidecarNotListed pins the cross-driver rule for staging sidecars
+// (Contract §7.3 step 0): ".<name>.json.part" is an ordinary object written by
+// PutSmall, not a crashed stream. s3 never lists it (it is not a multipart
+// upload), so no driver may: recovery promotes staging sidecars by its own
+// rules (Contract §7.4), never through RecoverCommit.
+func testStagingSidecarNotListed(t *testing.T, p storage.Provider, r storage.Recoverer, crash func(*testing.T, storage.ObjectWriter)) {
+	const dir = "clips/cam/2026/11/06/"
+	const sidecar = dir + "120000000_01JC0000000000000000000009.json"
+	const staging = dir + ".120000000_01JC0000000000000000000009.json.part"
+	put(t, p, staging, []byte(`{"clip_id":"01JC0000000000000000000009"}`))
+	put(t, p, "status/.relay.json.part", []byte(`{}`))
+	crashedWrite(t, p, recoverKey, pattern(1000, 11), crash)
+
+	// The crashed stream proves the listing has aged past the threshold.
+	waitIncomplete(t, r, "", recoverKey)
+	incs, err := r.ListIncomplete(t.Context(), "", time.Millisecond)
+	if err != nil {
+		t.Fatalf("ListIncomplete: %v", err)
+	}
+	for _, inc := range incs {
+		if inc.Key != recoverKey {
+			t.Errorf("ListIncomplete listed %+v, want only the crashed stream %q", inc, recoverKey)
+		}
+	}
+	if _, ok := findIncomplete(t, r, sidecar, 0, sidecar); ok {
+		t.Errorf("ListIncomplete(%q) listed the staging sidecar", sidecar)
+	}
+	if got := readAll(t, p, staging); string(got) != `{"clip_id":"01JC0000000000000000000009"}` {
+		t.Errorf("staging sidecar changed: %q", got)
 	}
 }
