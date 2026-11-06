@@ -427,3 +427,49 @@ func TestAbortIncompleteIsIdempotent(t *testing.T) {
 		t.Errorf("second AbortIncomplete error = %v, want nil", err)
 	}
 }
+
+func TestListStagingFiltersDotNamedSidecars(t *testing.T) {
+	const pre = "cctv/clips/front/2026/11/06/"
+	f := newFakeRecoverS3(t)
+	f.set(pre+".120000000_01JC0000000000000000000019.json.part", []byte("{}"))
+	f.set(pre+".130000000_01JC000000000000000000001A.json.part", []byte("{}"))
+	f.set(pre+"140000000_01JC000000000000000000001B.json", []byte("{}"))      // final sidecar
+	f.set(pre+"150000000_01JC000000000000000000001C.json.part", []byte("{}")) // not a dot-name
+	f.set(pre+".160000000_01JC000000000000000000001D.tmp", []byte("x"))
+	f.set("cctv/clips/front-door/2026/11/06/.120000000_01JC000000000000000000001E.json.part", []byte("{}"))
+	f.set("other/clips/front/2026/11/06/.120000000_01JC000000000000000000001F.json.part", []byte("{}")) // outside the root
+	d := stubDriver(t, f.URL, "cctv")
+
+	keys := func(prefix string) []string {
+		t.Helper()
+		infos, err := d.ListStaging(t.Context(), prefix)
+		if err != nil {
+			t.Fatalf("ListStaging(%q): %v", prefix, err)
+		}
+		var ks []string
+		for _, in := range infos {
+			if in.Size != 2 || in.ModTime.Location() != time.UTC || in.ModTime.IsZero() {
+				t.Errorf("ListStaging(%q) entry %+v: want Size 2 and a UTC ModTime", prefix, in)
+			}
+			ks = append(ks, in.Key)
+		}
+		slices.Sort(ks)
+		return ks
+	}
+	mine := []string{
+		"clips/front/2026/11/06/.120000000_01JC0000000000000000000019.json.part",
+		"clips/front/2026/11/06/.130000000_01JC000000000000000000001A.json.part",
+	}
+	if got := keys("clips/front"); !slices.Equal(got, mine) {
+		t.Errorf("ListStaging(clips/front) = %q, want %q", got, mine)
+	}
+	if got := keys(""); len(got) != 3 {
+		t.Errorf("ListStaging(\"\") = %q, want the 3 staging sidecars under the root", got)
+	}
+	if got := keys("clips/fro"); len(got) != 0 {
+		t.Errorf("ListStaging(clips/fro) = %q, want none (whole path elements)", got)
+	}
+	if _, err := d.ListStaging(t.Context(), "../x"); !errors.Is(err, storage.ErrInvalidKey) {
+		t.Errorf("ListStaging(../x) error = %v, want ErrInvalidKey", err)
+	}
+}
