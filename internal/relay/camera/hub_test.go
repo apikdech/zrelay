@@ -239,17 +239,17 @@ func TestRecorderGetsNoAudio(t *testing.T) {
 func TestLateSubscriberGetsCurrentCodec(t *testing.T) {
 	t.Parallel()
 	h := camera.NewHub("front")
-	if _, _, ok := h.Codec(); ok {
-		t.Fatal("Codec ok before any codec")
+	if _, _, ok := h.CurrentCodec(); ok {
+		t.Fatal("CurrentCodec ok before any codec")
 	}
 	h.Codec(camera.Codec{Kind: "h264", SPS: []byte{1}, PPS: []byte{2}}, camera.TimeSourceArrival)
 	h.Codec(hubCodec, camera.TimeSourceRTCP)
 	h.Video(au(0, true))
 	h.Video(au(3000, false))
 
-	c, ts, ok := h.Codec()
+	c, ts, ok := h.CurrentCodec()
 	if !ok || !c.Equal(hubCodec) || ts != camera.TimeSourceRTCP {
-		t.Fatalf("Codec() = %+v %q %v, want %+v rtcp true", c, ts, ok, hubCodec)
+		t.Fatalf("CurrentCodec() = %+v %q %v, want %+v rtcp true", c, ts, ok, hubCodec)
 	}
 
 	s := h.Subscribe(camera.ClassViewer, 16)
@@ -266,8 +266,8 @@ func TestLateSubscriberGetsCurrentCodec(t *testing.T) {
 	}
 
 	h.Lost()
-	if _, _, ok := h.Codec(); ok {
-		t.Fatal("Codec ok after Lost; the session that set it is gone")
+	if _, _, ok := h.CurrentCodec(); ok {
+		t.Fatal("CurrentCodec ok after Lost; the session that set it is gone")
 	}
 }
 
