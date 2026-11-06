@@ -1,0 +1,71 @@
+{
+  "schema": "zrec.sidecar/2",
+  "status": "complete",
+  "clip_id": "01M2NBMVS0K8EKRQKGGAJCDT0B",
+  "series_id": "01M2NBMVS0K8EKRQKGGAJCDT0B",
+  "segment_index": 0,
+  "camera": {
+    "id": "front-door",
+    "name": "Front Door",
+    "brand": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tags": [
+      "exterior",
+      "entrance"
+    ]
+  },
+  "start_time": "2026-09-16T14:59:00.000Z",
+  "end_time": "2026-09-16T14:59:42.500Z",
+  "duration_ms": 42500,
+  "pre_roll_ms": 15800,
+  "end_reason": "post_roll_elapsed",
+  "triggers": [
+    {
+      "type": "motion",
+      "first_at_ms": 15800,
+      "last_at_ms": 32400,
+      "raw_topics": [
+        "tns1:RuleEngine/CellMotionDetector/Motion"
+      ]
+    },
+    {
+      "type": "person",
+      "first_at_ms": 16900,
+      "last_at_ms": 29100,
+      "raw_topics": [
+        "tns1:RuleEngine/PeopleDetector/People"
+      ]
+    }
+  ],
+  "video": {
+    "object": "145900000_01M2NBMVS0K8EKRQKGGAJCDT0B.zrec",
+    "format_version": 1,
+    "key_id": "a1b2c3d4e5f60718",
+    "chunk_size": 1048576,
+    "size_bytes": 16777371,
+    "plaintext_size_bytes": 16777000,
+    "container": "fmp4",
+    "codec": "avc1.640032",
+    "width": 2560,
+    "height": 1440,
+    "init_segment_bytes": 1187,
+    "seek_index": [
+      [
+        0,
+        1187
+      ],
+      [
+        2000,
+        791344
+      ],
+      [
+        4000,
+        1580212
+      ]
+    ]
+  },
+  "recorder": {
+    "relay_id": "home-mini",
+    "version": "2.0.0",
+    "time_source": "rtcp"
+  }
+}
