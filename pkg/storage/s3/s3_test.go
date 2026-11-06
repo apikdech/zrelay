@@ -223,6 +223,8 @@ func TestNewValidatesConfig(t *testing.T) {
 		"NoSecretKey":      func(c *s3.Config) { c.SecretKey = "" },
 		"PartSizeTooSmall": func(c *s3.Config) { c.PartSize = 5*mib - 1 },
 		"BadRoot":          func(c *s3.Config) { c.Root = "../x" },
+		"EndpointUserinfo": func(c *s3.Config) { c.Endpoint = "http://user:secret-pw@127.0.0.1:1" },
+		"EndpointNoScheme": func(c *s3.Config) { c.Endpoint = "127.0.0.1:9000" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := good

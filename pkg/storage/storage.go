@@ -24,6 +24,20 @@ var (
 	ErrNothingToRecover = errors.New("storage: nothing to recover")
 )
 
+// ErrorClass is how egress treats a failed storage request (design §6.3).
+type ErrorClass int
+
+const (
+	// Transient errors (network errors, 5xx, 429, RequestTimeout, SlowDown)
+	// are retried and count toward opening the circuit breaker.
+	Transient ErrorClass = iota
+	// Permanent errors (403, NoSuchBucket, InvalidAccessKeyId,
+	// SignatureDoesNotMatch, other 4xx) open the breaker at once.
+	Permanent
+	// NotFound reports a missing object (or upload).
+	NotFound
+)
+
 type ObjectInfo struct {
 	Key     string
 	Size    int64
