@@ -5,6 +5,8 @@ import (
 	"io"
 	"text/tabwriter"
 	"time"
+
+	"github.com/apikdech/zrelay-v2/pkg/zrec"
 )
 
 const mib = int64(1) << 20
@@ -80,6 +82,17 @@ func Budget(c *Config) BudgetReport {
 	}
 	r.OK = r.Total <= r.Limit
 	return r
+}
+
+// KeyFingerprint parses the resolved master key of c and returns its
+// key_id as shown by "config check" (a1b2-c3d4-e5f6-0718). Errors never
+// carry the key text.
+func KeyFingerprint(c *Config) (string, error) {
+	m, err := zrec.ParseMasterKey(c.Encryption.MasterKeyText)
+	if err != nil {
+		return "", err
+	}
+	return zrec.FormatKeyID(zrec.Derive(m).ID), nil
 }
 
 // WriteTable prints the budget as a table of bytes and MiB, ending with
