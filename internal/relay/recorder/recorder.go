@@ -357,8 +357,18 @@ func (d DirectSink) dropStaging(ctx context.Context, c *PendingClip) {
 type RunOption func(*runOptions)
 
 type runOptions struct {
-	force  <-chan struct{}
-	resume func() bool
+	force      <-chan struct{}
+	resume     func() bool
+	suppressed func(bool)
+}
+
+// WithSuppressionHook reports every time the clip machine enters (true) or
+// leaves (false) the Suppressed state, from the recorder goroutine. A
+// suppressed camera ignores triggers, so coverage must not list that time as
+// monitored. The state is sampled after every input the loop handles, which
+// is how a write error inside OnVideo is seen too.
+func WithSuppressionHook(f func(suppressed bool)) RunOption {
+	return func(o *runOptions) { o.suppressed = f }
 }
 
 // WithBacklogPolicy lets the egress backlog policy (relay-spec §4.8), which
@@ -407,7 +417,14 @@ func Run(ctx context.Context, sub *camera.Sub, tracker *events.Tracker, m *clip.
 
 	ticker := time.NewTicker(tickEvery)
 	defer ticker.Stop()
+	wasSuppressed := false
 	for {
+		if ro.suppressed != nil {
+			if now := m.State() == "Suppressed"; now != wasSuppressed {
+				wasSuppressed = now
+				ro.suppressed(now)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return

@@ -533,7 +533,8 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 	rctx, cm.recCancel = context.WithCancel(context.Background())
 	go func() {
 		defer close(cm.recDone)
-		recorder.Run(rctx, sub, cm.handle.Tracker, cm.machine, recorder.WithBacklogPolicy(cm.force, resume))
+		recorder.Run(rctx, sub, cm.handle.Tracker, cm.machine, recorder.WithBacklogPolicy(cm.force, resume),
+			recorder.WithSuppressionHook(func(suppressed bool) { cm.cov.SetSuppressed(suppressed, a.clk.Now()) }))
 	}()
 	return nil
 }
