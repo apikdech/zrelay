@@ -18,13 +18,15 @@ import (
 // PullPoint cadence and limits (design §4.3).
 const (
 	defaultServicePath = "/onvif/service"
-	pullEvery          = time.Second
-	renewEvery         = 60 * time.Second
-	subscribeFor       = 120 * time.Second
-	clockSyncEvery     = 30 * time.Minute
-	requestTimeout     = 5 * time.Second
-	minRetry           = 5 * time.Second
-	maxRetry           = 60 * time.Second
+	// deviceServicePath is where endpoint discovery asks (design §4.3).
+	deviceServicePath = "/onvif/device_service"
+	pullEvery         = time.Second
+	renewEvery        = 60 * time.Second
+	subscribeFor      = 120 * time.Second
+	clockSyncEvery    = 30 * time.Minute
+	requestTimeout    = 5 * time.Second
+	minRetry          = 5 * time.Second
+	maxRetry          = 60 * time.Second
 )
 
 var (
@@ -36,6 +38,9 @@ var (
 		nsWSN, int(subscribeFor.Seconds()))
 	unsubscribeBody = fmt.Sprintf(`<Unsubscribe xmlns="%s"/>`, nsWSN)
 	systemTimeBody  = fmt.Sprintf(`<GetSystemDateAndTime xmlns="%s"/>`, nsDevice)
+
+	capabilitiesBody = fmt.Sprintf(`<GetCapabilities xmlns="%s"><Category>Events</Category></GetCapabilities>`, nsDevice)
+	servicesBody     = fmt.Sprintf(`<GetServices xmlns="%s"><IncludeCapability>false</IncludeCapability></GetServices>`, nsDevice)
 )
 
 // PullMetrics receives the PullPoint client's counters (relay-spec §4.12).
@@ -60,6 +65,8 @@ type PullPoint struct {
 	Host string
 	Port int
 	// ServicePath is the event service path, "/onvif/service" when empty.
+	// Only when it is empty and the default fails is the path discovered
+	// with GetCapabilities or GetServices (design §4.3).
 	ServicePath        string
 	Username, Password string
 	Rules              []Rule
@@ -84,9 +91,13 @@ func (p *PullPoint) Run(ctx context.Context, emit func(Signal), ready func(bool)
 		}
 		addr, err := s.subscribe(ctx)
 		if err == nil {
-			delay = minRetry
 			ready(true)
+			s.healthy = false
 			err = s.follow(ctx, addr, emit)
+			if s.healthy {
+				// It worked for a while: a new failure starts the backoff over.
+				delay = minRetry
+			}
 			s.unsubscribe(addr)
 			s.resetKinds(emit)
 			ready(false)
@@ -131,13 +142,41 @@ type session struct {
 	metrics PullMetrics
 	client  *http.Client
 	offset  time.Duration // camera clock minus host clock
+	// healthy is set once the current subscription has proven itself: a
+	// PullMessages reply came back whole or a Renew succeeded. Creating a
+	// subscription alone proves nothing (a camera can accept it and reject
+	// every pull), so only a healthy one resets the resubscribe backoff.
+	healthy bool
+	// eventPath and devicePath are the paths found by endpoint discovery,
+	// kept for the session. Empty means the configured or default path.
+	eventPath, devicePath string
 }
 
-func (s *session) serviceURL() string {
-	path := s.p.ServicePath
-	if path == "" {
-		path = defaultServicePath
+// servicePath is the event service path in use.
+func (s *session) servicePath() string {
+	switch {
+	case s.eventPath != "":
+		return s.eventPath
+	case s.p.ServicePath != "":
+		return s.p.ServicePath
 	}
+	return defaultServicePath
+}
+
+// serviceURL is the event service endpoint.
+func (s *session) serviceURL() string { return s.onHost(s.servicePath()) }
+
+// deviceURL is the endpoint of GetSystemDateAndTime: the device service once
+// discovery has found it, else the event service endpoint, as on Tapo.
+func (s *session) deviceURL() string {
+	if s.devicePath != "" {
+		return s.onHost(s.devicePath)
+	}
+	return s.serviceURL()
+}
+
+// onHost is path on the configured host and port.
+func (s *session) onHost(path string) string {
 	return "http://" + net.JoinHostPort(s.p.Host, strconv.Itoa(s.p.Port)) + path
 }
 
@@ -148,7 +187,7 @@ func (s *session) token() *token {
 // syncClock refreshes the camera clock offset. On failure the previous
 // offset stays.
 func (s *session) syncClock(ctx context.Context) {
-	raw, err := soapCall(ctx, s.client, s.serviceURL(), systemTimeBody, nil)
+	raw, err := soapCall(ctx, s.client, s.deviceURL(), systemTimeBody, nil)
 	var cam time.Time
 	if err == nil {
 		cam, err = parseSystemTime(raw)
@@ -164,6 +203,10 @@ func (s *session) syncClock(ctx context.Context) {
 func (s *session) subscribe(ctx context.Context) (string, error) {
 	s.syncClock(ctx)
 	raw, err := soapCall(ctx, s.client, s.serviceURL(), createBody, s.token())
+	if s.shouldDiscover(err) && s.discover(ctx) {
+		s.syncClock(ctx)
+		raw, err = soapCall(ctx, s.client, s.serviceURL(), createBody, s.token())
+	}
 	if err != nil {
 		return "", fmt.Errorf("CreatePullPointSubscription: %w", err)
 	}
@@ -172,6 +215,49 @@ func (s *session) subscribe(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("CreatePullPointSubscription: %w", err)
 	}
 	return s.onCamera(addr)
+}
+
+// shouldDiscover reports whether err, from the event service, calls for
+// endpoint discovery: no path is configured, none was discovered yet, and the
+// camera answered with a non-200 status or a SOAP fault. A transport error
+// says nothing about the path.
+func (s *session) shouldDiscover(err error) bool {
+	if err == nil || s.p.ServicePath != "" || s.eventPath != "" {
+		return false
+	}
+	var st *statusError
+	var f *faultError
+	return errors.As(err, &st) || errors.As(err, &f)
+}
+
+// discover asks the device service where the event service is, with
+// GetCapabilities and then GetServices, and reports whether that is a path
+// other than the one in use. The XAddr gives only a path: the host and port
+// stay the configured ones, as the requests carry credentials.
+func (s *session) discover(ctx context.Context) bool {
+	dev := s.onHost(deviceServicePath)
+	var path string
+	raw, err := soapCall(ctx, s.client, dev, capabilitiesBody, s.token())
+	if err == nil {
+		path, err = parseCapabilitiesEvents(raw)
+	}
+	if err != nil {
+		slog.Debug("onvif GetCapabilities failed", "camera", s.p.Camera, "err", err)
+		raw, err = soapCall(ctx, s.client, dev, servicesBody, s.token())
+		if err == nil {
+			path, err = parseServicesEvents(raw)
+		}
+	}
+	if err != nil {
+		slog.Warn("onvif event endpoint discovery failed", "camera", s.p.Camera, "err", err)
+		return false
+	}
+	if path == s.servicePath() {
+		return false
+	}
+	slog.Info("onvif event service discovered", "camera", s.p.Camera, "path", path)
+	s.eventPath, s.devicePath = path, deviceServicePath
+	return true
 }
 
 // onCamera keeps a subscription address's port and path but not its host:
@@ -212,6 +298,7 @@ func (s *session) follow(ctx context.Context, addr string, emit func(Signal)) er
 			if _, err := soapCall(ctx, s.client, addr, renewBody, s.token()); err != nil {
 				return fmt.Errorf("renew: %w", err)
 			}
+			s.healthy = true
 			renew.Reset(renewEvery)
 		case <-sync.C():
 			s.syncClock(ctx)
@@ -242,6 +329,7 @@ func (s *session) pull(ctx context.Context, addr string, emit func(Signal)) erro
 	if err != nil {
 		return err
 	}
+	s.healthy = true
 	now := s.clk.Now()
 	for _, m := range msgs {
 		if s.p.tap != nil {

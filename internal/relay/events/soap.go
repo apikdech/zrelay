@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -149,6 +150,48 @@ func parseSubscription(raw []byte) (string, error) {
 		return a, nil
 	}
 	return "", errors.New("no subscription address in reply")
+}
+
+// parseCapabilitiesEvents returns the request path of the events XAddr of a
+// GetCapabilities reply.
+func parseCapabilitiesEvents(raw []byte) (string, error) {
+	var env struct {
+		XAddr string `xml:"Body>GetCapabilitiesResponse>Capabilities>Events>XAddr"`
+	}
+	if err := xml.Unmarshal(raw, &env); err != nil {
+		return "", err
+	}
+	return xaddrPath(env.XAddr)
+}
+
+// parseServicesEvents returns the request path of the events service XAddr
+// of a GetServices reply.
+func parseServicesEvents(raw []byte) (string, error) {
+	var env struct {
+		Services []struct {
+			Namespace string `xml:"Namespace"`
+			XAddr     string `xml:"XAddr"`
+		} `xml:"Body>GetServicesResponse>Service"`
+	}
+	if err := xml.Unmarshal(raw, &env); err != nil {
+		return "", err
+	}
+	for _, sv := range env.Services {
+		if strings.TrimSpace(sv.Namespace) == nsEvents {
+			return xaddrPath(sv.XAddr)
+		}
+	}
+	return "", errors.New("no events service in reply")
+}
+
+// xaddrPath returns the path and query of a service address. The host is
+// dropped on purpose: the camera's own idea of its address is not trusted.
+func xaddrPath(xaddr string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(xaddr))
+	if err != nil || u.Path == "" || !strings.HasPrefix(u.Path, "/") {
+		return "", fmt.Errorf("bad events address %q", xaddr)
+	}
+	return u.RequestURI(), nil
 }
 
 // parseSystemTime returns the camera UTC time of a GetSystemDateAndTime
