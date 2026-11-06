@@ -148,7 +148,7 @@ func (f *fixture) addClip(o clipOpt) *sidecar.Sidecar {
 		f.t.Fatal(err)
 	}
 	if !o.NoVideo {
-		f.writeVideo(keys.Video, nameID, start, o.Camera)
+		f.writeVideo(keys.Video, id, start, o.Camera)
 	}
 	return sc
 }

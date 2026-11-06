@@ -1,0 +1,30 @@
+# zview-server configuration (design §8.2). Secrets are ENV: or FILE: references.
+version: 2
+
+server:
+  listen: "0.0.0.0:8080"              # behind tailscale serve
+  api_token_sha256: ["FILE:/run/secrets/api_token_sha256"]   # one or two hex SHA-256(K_api) hashes
+  app_dir: "/app"                     # built SPA, baked into the image
+
+storage:
+  driver: "s3"                        # s3 | local (tests)
+  root: "zrelay"
+  s3:
+    endpoint: "ENV:S3_ENDPOINT"
+    region: "us-east-1"
+    bucket: "cctv"
+    use_path_style: true
+    access_key: "ENV:S3_RO_ACCESS_KEY"                    # read-only credentials
+    secret_key: "FILE:/run/secrets/s3_ro_secret_key"
+  # local:                            # tests only
+  #   base_dir: "/tmp/zrelay-test"
+
+index:
+  hot_refresh_seconds: 30             # yesterday, today and tomorrow (UTC) are re-listed at most this often
+  cold_cache_days: 60                 # LRU of older day indexes
+  assumed_max_clip_seconds: 300       # bounds an incomplete clip's end time
+  retention_days: 30                  # match the MinIO ILM --expire-days (design §6.7)
+  cameras_fallback: []                # used only when status/relay.json is missing or stale
+
+live:
+  upstream: "http://zrelay:9465"
