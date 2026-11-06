@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -16,20 +17,40 @@ import (
 
 var _ storage.Recoverer = (*Driver)(nil)
 
-// ListIncomplete implements storage.Recoverer with ListMultipartUploads,
-// keeping uploads under prefix (by whole path element, as List) whose
-// Initiated time is at least olderThan ago. Initiated comes from the server's
-// clock, so olderThan <= 0 lists every upload regardless of clock skew. Each
-// candidate has Key = the final key, UploadID set, Size = the sum of its
-// listed parts (one ListParts per upload) and ModTime = Initiated in UTC.
+// stagingSuffix and finalSuffix map a staging sidecar to its video:
+// ".<base>.json.part" belongs to "<base>.zrec" (Contract §7.2, §7.3).
+const (
+	stagingSuffix = ".json.part"
+	finalSuffix   = ".zrec"
+)
+
+// ListIncomplete implements storage.Recoverer: it lists the multipart uploads
+// under prefix (by whole path element, as List) whose Initiated time is at
+// least olderThan ago. Initiated comes from the server's clock, so
+// olderThan <= 0 lists every upload regardless of clock skew. Each candidate
+// has Key = the final key, UploadID set, Size = the sum of its listed parts
+// (one ListParts per upload) and ModTime = Initiated in UTC.
 //
-// The listing is bucket-wide and filtered here: MinIO's ListMultipartUploads
-// matches a non-empty prefix only against the exact object name, so a
-// directory prefix would list nothing. Open uploads are few (one per clip in
-// flight plus crash leftovers), so this stays cheap.
+// A bucket-wide ListMultipartUploads is NOT reliable on MinIO, the
+// production target (design D11): with an empty prefix MinIO answers from an
+// in-memory cache of the uploads started since the server process began, so
+// after a restart (the normal power-cut case) it lists none of the uploads
+// that survived on disk. A non-empty prefix is matched against the exact
+// object name only, and that lookup does survive restarts. So the candidates
+// come from two sources, united and deduplicated by upload id:
+//
+//   - for every staging sidecar ".<base>.json.part" under prefix
+//     (Contract §7.3 step 0, listed with ListObjectsV2 including dot-names),
+//     the uploads of the exact key "<base>.zrec" next to it;
+//   - the bucket-wide listing with no prefix, which still finds uploads that
+//     have no sidecar for as long as the server's cache has them.
+//
+// An upload that has neither a sidecar nor a cache entry cannot be found
+// after a MinIO restart. Recovery would abort it anyway (design §6.5, upload
+// with no staging sidecar), and the server's stale-upload expiry reaps it.
 //
 // Only streams are multipart uploads: staging sidecars are PutObject objects
-// and are never listed (Contract §7.3 step 0).
+// and are never listed as uploads (Contract §7.3 step 0).
 func (d *Driver) ListIncomplete(ctx context.Context, prefix string, olderThan time.Duration) ([]storage.Incomplete, error) {
 	if prefix != "" {
 		if _, err := storage.CleanKey(prefix); err != nil {
@@ -48,49 +69,117 @@ func (d *Driver) ListIncomplete(ctx context.Context, prefix string, olderThan ti
 	}
 	cutoff := time.Now().Add(-olderThan)
 
-	var out []storage.Incomplete
+	var (
+		out  []storage.Incomplete
+		seen = map[string]bool{}
+	)
+	consider := func(u types.MultipartUpload) error {
+		k := aws.ToString(u.Key)
+		id := aws.ToString(u.UploadId)
+		if !under(k) || seen[id] {
+			return nil
+		}
+		seen[id] = true
+		if d.root != "" {
+			k = strings.TrimPrefix(k, d.root+"/")
+		}
+		initiated := aws.ToTime(u.Initiated).UTC()
+		if olderThan > 0 && initiated.After(cutoff) {
+			return nil
+		}
+		if _, err := storage.CleanKey(k); err != nil {
+			return nil // not a key this driver could have written
+		}
+		_, size, err := d.listParts(ctx, k, id)
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil // completed or aborted since the listing
+		}
+		if err != nil {
+			return err
+		}
+		out = append(out, storage.Incomplete{Key: k, UploadID: id, Size: size, ModTime: initiated})
+		return nil
+	}
+
+	finals, err := d.stagedFinalKeys(ctx, prefix, full)
+	if err != nil {
+		return nil, err
+	}
+	for _, fk := range finals {
+		if err := d.eachUpload(ctx, prefix, fk, consider); err != nil {
+			return nil, err
+		}
+	}
+	if err := d.eachUpload(ctx, prefix, "", consider); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// stagedFinalKeys returns the full object keys (root included) of the videos
+// whose staging sidecars ".<base>.json.part" exist under prefix. The public
+// List omits dot-names, so this lists the bucket directly.
+func (d *Driver) stagedFinalKeys(ctx context.Context, prefix, full string) ([]string, error) {
+	byPrefix := full
+	if prefix == "" && d.root != "" {
+		byPrefix = d.root + "/"
+	}
+	var out []string
+	pages := awss3.NewListObjectsV2Paginator(d.client, &awss3.ListObjectsV2Input{
+		Bucket: aws.String(d.bucket),
+		Prefix: aws.String(byPrefix),
+	})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list staging sidecars under %q: %w", prefix, err)
+		}
+		for _, o := range page.Contents {
+			k := aws.ToString(o.Key)
+			if prefix != "" && k != full && !strings.HasPrefix(k, full+"/") {
+				continue
+			}
+			dir, name := path.Split(k)
+			base, ok := strings.CutSuffix(name, stagingSuffix)
+			if !ok || !strings.HasPrefix(base, ".") || len(base) < 2 {
+				continue
+			}
+			out = append(out, dir+base[1:]+finalSuffix)
+		}
+	}
+	return out, nil
+}
+
+// eachUpload pages through ListMultipartUploads with the given server-side
+// prefix (empty: bucket-wide) and calls fn for every upload. what names the
+// caller's prefix in errors.
+func (d *Driver) eachUpload(ctx context.Context, what, serverPrefix string, fn func(types.MultipartUpload) error) error {
 	in := &awss3.ListMultipartUploadsInput{Bucket: aws.String(d.bucket)}
+	if serverPrefix != "" {
+		in.Prefix = aws.String(serverPrefix)
+	}
 	for {
 		page, err := d.client.ListMultipartUploads(ctx, in)
 		if err != nil {
-			return nil, fmt.Errorf("s3: list incomplete %q: %w", prefix, err)
+			return fmt.Errorf("s3: list incomplete %q: %w", what, err)
 		}
 		for _, u := range page.Uploads {
-			k := aws.ToString(u.Key)
-			if !under(k) {
-				continue
+			if err := fn(u); err != nil {
+				return err
 			}
-			if d.root != "" {
-				k = strings.TrimPrefix(k, d.root+"/")
-			}
-			initiated := aws.ToTime(u.Initiated).UTC()
-			if olderThan > 0 && initiated.After(cutoff) {
-				continue
-			}
-			if _, err := storage.CleanKey(k); err != nil {
-				continue // not a key this driver could have written
-			}
-			id := aws.ToString(u.UploadId)
-			_, size, err := d.listParts(ctx, k, id)
-			if errors.Is(err, storage.ErrNotFound) {
-				continue // completed or aborted since the listing
-			}
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, storage.Incomplete{Key: k, UploadID: id, Size: size, ModTime: initiated})
 		}
 		if !aws.ToBool(page.IsTruncated) {
-			return out, nil
+			return nil
 		}
 		next := &awss3.ListMultipartUploadsInput{
 			Bucket:         in.Bucket,
+			Prefix:         in.Prefix,
 			KeyMarker:      page.NextKeyMarker,
 			UploadIdMarker: page.NextUploadIdMarker,
 		}
 		if aws.ToString(next.KeyMarker) == aws.ToString(in.KeyMarker) &&
 			aws.ToString(next.UploadIdMarker) == aws.ToString(in.UploadIdMarker) {
-			return nil, fmt.Errorf("s3: list incomplete %q: truncated listing did not advance", prefix)
+			return fmt.Errorf("s3: list incomplete %q: truncated listing did not advance", what)
 		}
 		in = next
 	}

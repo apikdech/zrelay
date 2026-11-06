@@ -25,11 +25,19 @@ type fakeRecoverS3 struct {
 	maxUploads int // page size of ListMultipartUploads
 	maxParts   int // page size of ListParts
 	initiated  map[string]time.Time
+	// uncached holds the uploads created before a simulated server restart.
+	// MinIO serves a ListMultipartUploads with an empty prefix from an
+	// in-memory cache of uploads started since the process began, so these
+	// are no longer listed by it; an exact object name still finds them.
+	uncached map[string]bool
+	// stuck makes every truncated ListMultipartUploads page repeat the
+	// request's markers, as a broken server would.
+	stuck bool
 }
 
 func newFakeRecoverS3(t *testing.T) *fakeRecoverS3 {
 	t.Helper()
-	f := &fakeRecoverS3{fakeS3: newFakeS3(t), maxUploads: 2, maxParts: 1, initiated: map[string]time.Time{}}
+	f := &fakeRecoverS3{fakeS3: newFakeS3(t), maxUploads: 2, maxParts: 1, initiated: map[string]time.Time{}, uncached: map[string]bool{}}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	f.URL = srv.URL
@@ -46,6 +54,16 @@ func (f *fakeRecoverS3) addUpload(key string, initiated time.Time, parts map[int
 	f.uploads[id] = &fakeUpload{key: key, parts: parts}
 	f.initiated[id] = initiated
 	return id
+}
+
+// restart simulates a server restart: every open upload leaves the cache an
+// empty-prefix listing is served from.
+func (f *fakeRecoverS3) restart() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id := range f.uploads {
+		f.uncached[id] = true
+	}
 }
 
 func (f *fakeRecoverS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +87,9 @@ func (f *fakeRecoverS3) listUploads(w http.ResponseWriter, prefix, keyMarker, id
 	for id, u := range f.uploads {
 		// As MinIO does: a non-empty prefix matches only the exact object
 		// name, never a byte prefix of it.
+		if prefix == "" && f.uncached[id] {
+			continue
+		}
 		if (prefix == "" || u.key == prefix) && (u.key > keyMarker || u.key == keyMarker && id > idMarker) {
 			all = append(all, up{u.key, id})
 		}
@@ -82,6 +103,9 @@ func (f *fakeRecoverS3) listUploads(w http.ResponseWriter, prefix, keyMarker, id
 	fmt.Fprintf(&b, `<ListMultipartUploadsResult><Bucket>zrelay</Bucket><Prefix>%s</Prefix><MaxUploads>%d</MaxUploads><IsTruncated>%t</IsTruncated>`, prefix, f.maxUploads, truncated)
 	if truncated {
 		last := all[len(all)-1]
+		if f.stuck {
+			last = up{keyMarker, idMarker}
+		}
 		fmt.Fprintf(&b, `<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>`, last.key, last.id)
 	}
 	for _, u := range all {
@@ -201,6 +225,90 @@ func TestListIncompleteFiltersByInitiated(t *testing.T) {
 	}
 	if got, want := keys(0), []string{"clips/cam/new.zrec", "clips/cam/old.zrec", "clips/cam/skew.zrec"}; !slices.Equal(got, want) {
 		t.Errorf("olderThan 0 = %q, want %q", got, want)
+	}
+}
+
+func TestListIncompleteStuckListingErrors(t *testing.T) {
+	f := newFakeRecoverS3(t)
+	f.maxUploads = 1
+	old := time.Date(2026, 11, 6, 1, 2, 3, 0, time.UTC)
+	f.addUpload("cctv/clips/cam/a.zrec", old, map[int][]byte{})
+	f.addUpload("cctv/clips/cam/b.zrec", old, map[int][]byte{})
+	f.stuck = true
+	d := stubDriver(t, f.URL, "cctv")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.ListIncomplete(t.Context(), "clips/cam", 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "did not advance") {
+			t.Errorf("ListIncomplete with a stuck truncated listing error = %v, want a \"did not advance\" error", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ListIncomplete looped on a truncated listing that did not advance")
+	}
+}
+
+func TestListIncompleteSurvivesServerRestart(t *testing.T) {
+	const (
+		dir  = "clips/cam/2026/11/06/"
+		base = "120000000_01JC0000000000000000000019"
+		pre  = "cctv/" + dir
+	)
+	f := newFakeRecoverS3(t)
+	old := time.Date(2026, 11, 6, 1, 2, 3, 0, time.UTC)
+	parts := map[int][]byte{1: []byte("aaaa"), 2: []byte("bb")}
+	f.addUpload(pre+base+".zrec", old, parts)
+	f.set(pre+"."+base+".json.part", []byte("{}"))
+	// An upload with no staging sidecar: only the cache can find it.
+	f.addUpload(pre+"130000000_01JC000000000000000000001A.zrec", old, parts)
+	// Staging-like objects that must not produce candidates.
+	f.set(pre+".140000000_01JC000000000000000000001B.json.part", []byte("{}")) // no upload
+	f.set(pre+".150000000_01JC000000000000000000001C.tmp", []byte("x"))
+	f.set(pre+".160000000_01JC000000000000000000001D.json", []byte("x"))
+	f.set(pre+"170000000_01JC000000000000000000001E.json.part", []byte("x")) // not a dot-name
+	// Another camera, with a sidecar of its own.
+	f.addUpload("cctv/clips/cam2/2026/11/06/180000000_01JC000000000000000000001F.zrec", old, parts)
+	f.set("cctv/clips/cam2/2026/11/06/.180000000_01JC000000000000000000001F.json.part", []byte("{}"))
+	d := stubDriver(t, f.URL, "cctv")
+
+	list := func(prefix string, olderThan time.Duration) []string {
+		t.Helper()
+		incs, err := d.ListIncomplete(t.Context(), prefix, olderThan)
+		if err != nil {
+			t.Fatalf("ListIncomplete(%q): %v", prefix, err)
+		}
+		var ks []string
+		for _, inc := range incs {
+			if inc.Key == dir+base+".zrec" && (inc.Size != 6 || inc.UploadID == "" || inc.StagingKey != "") {
+				t.Errorf("Incomplete %+v: want size 6, an upload id and no staging key", inc)
+			}
+			ks = append(ks, inc.Key)
+		}
+		slices.Sort(ks)
+		return ks
+	}
+	withSidecar := dir + base + ".zrec"
+	bare := dir + "130000000_01JC000000000000000000001A.zrec"
+
+	if got, want := list("clips/cam", 0), []string{withSidecar, bare}; !slices.Equal(got, want) {
+		t.Errorf("before the restart ListIncomplete(clips/cam) = %q, want %q (each upload once)", got, want)
+	}
+	f.restart()
+	if got, want := list("clips/cam", 0), []string{withSidecar}; !slices.Equal(got, want) {
+		t.Errorf("after the restart ListIncomplete(clips/cam) = %q, want %q (the upload with a staging sidecar)", got, want)
+	}
+	if got := list("clips/cam", time.Hour); len(got) != 1 {
+		t.Errorf("after the restart ListIncomplete(clips/cam, 1h) = %q, want the old upload", got)
+	}
+	if got, want := list("", 0), []string{withSidecar, "clips/cam2/2026/11/06/180000000_01JC000000000000000000001F.zrec"}; !slices.Equal(got, want) {
+		t.Errorf("after the restart ListIncomplete(\"\") = %q, want %q", got, want)
+	}
+	if got := list("clips/ca", 0); len(got) != 0 {
+		t.Errorf("after the restart ListIncomplete(clips/ca) = %q, want none (whole path elements)", got)
 	}
 }
 

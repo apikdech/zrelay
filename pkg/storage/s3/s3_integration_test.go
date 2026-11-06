@@ -36,11 +36,18 @@ var rootSeq atomic.Int64
 // driver returns a driver on a fresh root, so its key space is empty.
 func (e minioEnv) driver(t *testing.T, endpoint string) *s3.Driver {
 	t.Helper()
+	return e.driverOn(t, endpoint, fmt.Sprintf("cctv-%d", rootSeq.Add(1)))
+}
+
+// driverOn returns a driver on the given root, e.g. to reach the same key
+// space through a restarted server's new endpoint.
+func (e minioEnv) driverOn(t *testing.T, endpoint, root string) *s3.Driver {
+	t.Helper()
 	d, err := s3.New(t.Context(), s3.Config{
 		Endpoint:     endpoint,
 		Region:       "us-east-1",
 		Bucket:       e.bucket,
-		Root:         fmt.Sprintf("cctv-%d", rootSeq.Add(1)),
+		Root:         root,
 		AccessKey:    e.accessKey,
 		SecretKey:    e.secretKey,
 		UsePathStyle: true,
@@ -283,6 +290,67 @@ func TestListIncompleteRespectsAge(t *testing.T) {
 	}
 	if inc, ok := findUpload(t, d, "clips/cam", time.Hour, key); ok {
 		t.Errorf("ListIncomplete(olderThan 1h) listed a fresh upload: %+v", inc)
+	}
+}
+
+// TestListIncompleteSurvivesMinIORestart is the power-cut case: the server
+// restarts after the relay crashed mid-upload. MinIO then lists no uploads
+// for an empty prefix (it serves that from a cache of the uploads started
+// since the process began), so recovery finds the candidate through its
+// staging sidecar and an exact-key lookup (design §6.5, Contract §7.4).
+func TestListIncompleteSurvivesMinIORestart(t *testing.T) {
+	m := storagetest.StartRestartableMinIO(t)
+	e := minioEnv{endpoint: m.Endpoint, accessKey: m.AccessKey, secretKey: m.SecretKey, bucket: m.Bucket}
+	const (
+		root = "cctv-restart"
+		dir  = "clips/cam/2026/11/06/"
+		base = "120000000_01JC000000000000000000001D"
+		key  = dir + base + ".zrec"
+	)
+	d := e.driverOn(t, m.Endpoint, root)
+	data := make([]byte, 11*mib+123)
+	rng := rand.NewChaCha8([32]byte{20})
+	_, _ = rng.Read(data)
+
+	// Contract §7.3 step 0: the staging sidecar precedes the first chunk.
+	if err := d.PutSmall(t.Context(), dir+"."+base+".json.part", []byte(`{"schema":"zrec.sidecar/2"}`), "application/json"); err != nil {
+		t.Fatalf("PutSmall(staging sidecar): %v", err)
+	}
+	if durable := crashedUpload(t, d, key, data); durable != 10*mib {
+		t.Fatalf("DurableOffset before the crash = %d, want %d (2 parts)", durable, 10*mib)
+	}
+	if _, ok := findUpload(t, d, "clips/cam", 0, key); !ok {
+		t.Fatalf("ListIncomplete does not list %q before the restart", key)
+	}
+
+	m.Restart(t)
+	d = e.driverOn(t, m.Endpoint, root)
+
+	inc, ok := findUpload(t, d, "clips/cam", 0, key)
+	if !ok {
+		t.Fatalf("ListIncomplete does not list %q after the MinIO restart", key)
+	}
+	if inc.UploadID == "" || inc.Size != 10*mib {
+		t.Errorf("Incomplete = %+v, want an upload id and %d bytes", inc, 10*mib)
+	}
+	info, err := d.RecoverCommit(t.Context(), inc)
+	if err != nil {
+		t.Fatalf("RecoverCommit after the restart: %v", err)
+	}
+	if info.Key != key || info.Size != 10*mib {
+		t.Fatalf("RecoverCommit = %+v, want key %q and %d bytes", info, key, 10*mib)
+	}
+	or, err := d.OpenRange(t.Context(), key, 0, -1)
+	if err != nil {
+		t.Fatalf("OpenRange: %v", err)
+	}
+	defer or.Close()
+	got, err := io.ReadAll(or)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(got, data[:10*mib]) {
+		t.Errorf("recovered object (%d bytes) is not the first 2 parts", len(got))
 	}
 }
 

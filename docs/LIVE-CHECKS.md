@@ -94,10 +94,19 @@ resynchronisation), exactly one `Codec` line, and the logged wall drift vs media
 pass. Unit tests against an in-process fake (`make test`) cover paginated ListMultipartUploads and
 ListParts, element-wise prefix and root filtering, the Initiated age filter with server clock skew,
 gapped part numbers, a lost CompleteMultipartUpload response followed by a retried `RecoverCommit`,
-a gone upload, zero parts and malformed candidates. A probe against the pinned MinIO showed that
-MinIO's ListMultipartUploads honours only an empty prefix or an exact object name (a directory
-prefix such as `<root>/clips/cam/` lists nothing), so the driver lists the bucket's uploads with no
-prefix and filters client-side. The Synology MinIO was not reachable.
+a gone upload, zero parts, malformed candidates and a truncated listing whose markers do not
+advance (an error, not a loop). A probe against the pinned MinIO showed that MinIO's
+ListMultipartUploads honours only an empty prefix or an exact object name (a directory prefix such
+as `<root>/clips/cam/` lists nothing), and that an empty-prefix listing is served from an in-memory
+cache of uploads started since the server process began, so it returns nothing after a MinIO
+restart. `ListIncomplete` therefore derives candidate keys from the staging sidecars
+(`.<base>.json.part` maps to `<base>.zrec`, listed with ListObjectsV2 including dot-names), lists
+uploads by each exact key, and unions that with the empty-prefix listing, deduplicated by upload id.
+`TestListIncompleteSurvivesMinIORestart` (`make integration`, via
+`storagetest.StartRestartableMinIO` and `MinIO.Restart`) crashes a writer after 2 parts, restarts
+the container, and asserts the upload is listed and recovered as exactly those 2 parts; it failed
+before the fix. The fake models the cache (`fakeRecoverS3.restart`). The Synology MinIO was not
+reachable.
 
 **Manual steps:**
 1. On a host on the tailnet, set the relay's S3 credentials without echoing them:
@@ -115,12 +124,23 @@ prefix and filters client-side. The Synology MinIO was not reachable.
    `... s3api list-parts --bucket "$B" --key "$R/clips/livecheck/2026/11/06/000000000_01JC0000000000000000000000.zrec" --upload-id <UploadId>`
 6. Abort it:
    `... s3api abort-multipart-upload --bucket "$B" --key "$R/clips/livecheck/2026/11/06/000000000_01JC0000000000000000000000.zrec" --upload-id <UploadId>`,
-   then repeat step 3. Finally `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY`.
+   then repeat step 3.
+7. Restart check. Repeat step 2 (note the new `UploadId`), then restart the Synology MinIO (Container
+   Manager, or `docker restart <minio-container>` over SSH) and wait until it answers:
+   `docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY amazon/aws-cli:2.22.0 --endpoint-url "$EP" --region us-east-1 s3api head-bucket --bucket "$B"`.
+8. List with no prefix, then by the exact object name:
+   `... s3api list-multipart-uploads --bucket "$B"` and
+   `... s3api list-multipart-uploads --bucket "$B" --prefix "$R/clips/livecheck/2026/11/06/000000000_01JC0000000000000000000000.zrec"`.
+9. Clean up: abort the upload from step 7 as in step 6, then
+   `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY`.
 
 **Expected result:** steps 2, 3, 5 and 6 succeed under the relay policy (design §6.5); step 3 lists
 the upload with an `Initiated` time in UTC within a few seconds of the host clock; step 5 returns
 no parts; after step 6, step 3 no longer lists it. Step 4 may list nothing (MinIO's exact-name
-prefix behaviour); that is expected and does not matter to the driver.
+prefix behaviour); that is expected. After the restart, step 8's empty-prefix listing may be empty
+(MinIO's cache is gone) but the exact-name listing MUST show the upload from step 7 with its
+original `Initiated` time; that exact-key lookup is what `ListIncomplete` relies on through each
+staging sidecar.
 
 **If the result differs, update:**
 - Step 3 denied (AccessDenied) while step 4 is allowed: the relay MinIO policy restricts
@@ -128,6 +148,12 @@ prefix behaviour); that is expected and does not matter to the driver.
   prefix condition in the runbook policy (design §6.5), or, if the server matches byte prefixes,
   send `Prefix: <root>/` in `ListIncomplete` (`pkg/storage/s3/recover.go`) and change the fake's
   prefix rule in `fakeRecoverS3.listUploads` (`pkg/storage/s3/recover_test.go`) to match.
+- Step 8's exact-name listing is empty after the restart (the Synology MinIO build does not keep
+  uploads across restarts, or scopes them differently): the sidecar-derived lookup in
+  `ListIncomplete` (`stagedFinalKeys`, `pkg/storage/s3/recover.go`) cannot find crash leftovers;
+  record the behaviour, then change the lookup, `fakeRecoverS3.listUploads`/`restart`
+  (`pkg/storage/s3/recover_test.go`), `TestListIncompleteSurvivesMinIORestart`, and design §6.5 /
+  Contract §7.4 recovery wording to match.
 - `Initiated` far from the host clock: the age filter in `ListIncomplete` trusts the server clock
   against `time.Now()`; fix NTP on the NAS, or widen the 2-minute candidate age in the caller
   (Contract §7.4, design §6.5).
