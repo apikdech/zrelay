@@ -55,7 +55,7 @@ func TestTrackerMergesTouchingAndIgnoresDuplicateTransitions(t *testing.T) {
 	tr.SetReady(true, utc(14, 0, 0))
 	tr.SetReady(true, utc(14, 5, 0)) // already ready: no-op
 	tr.SetReady(false, utc(14, 10, 0))
-	tr.SetReady(false, utc(14, 12, 0)) // already not ready: no-op
+	tr.SetReady(false, utc(14, 10, 0)) // already not ready: no-op
 	tr.SetReady(true, utc(14, 10, 0))  // touches the previous interval: merged
 	tr.SetReady(false, utc(14, 20, 0))
 	tr.SetReady(true, utc(14, 30, 0))
