@@ -32,6 +32,10 @@ services:
     image: zrelay:local
     restart: unless-stopped
     read_only: true
+    # zrelay drains or drops its backlog within relay.shutdown_grace_seconds
+    # (default 30) after SIGTERM; Docker's default 10 s would SIGKILL it first.
+    # Keep this above shutdown_grace_seconds in zrelay.yaml.
+    stop_grace_period: 40s
     env_file: .env
     environment:
       TAILSCALE_IP: ${TAILSCALE_IP:?TAILSCALE_IP is unset; run deploy/deploy.sh}

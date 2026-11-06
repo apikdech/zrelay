@@ -1,7 +1,8 @@
 // Command zrelay is the relay daemon and its tools (relay-spec §6).
 //
 // Exit codes: 0 OK, 1 the check failed (memory budget over 80% of
-// max_memory_mb), 2 usage error or invalid configuration.
+// max_memory_mb) or the daemon stopped with an error, 2 usage error or
+// invalid configuration.
 package main
 
 import (
@@ -10,12 +11,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"slices"
 	"syscall"
 	"time"
 
+	"github.com/apikdech/zrelay-v2/internal/relay/app"
 	"github.com/apikdech/zrelay-v2/internal/relay/config"
 	"github.com/apikdech/zrelay-v2/internal/relay/events"
 	"github.com/apikdech/zrelay-v2/pkg/secretref"
@@ -24,6 +27,7 @@ import (
 const usage = `usage: zrelay [--env-file <path>] <command> [flags]
 
 commands:
+  run --config <path>            run the daemon (SIGTERM or SIGINT stops it within shutdown_grace_seconds)
   config check --config <path>   validate the config and print the memory budget and key fingerprint
   onvif discover --config <path> --camera <id> [--listen 60s]
                                  list the camera's ONVIF event topics, stream its
@@ -55,6 +59,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	rest := fs.Args()
 	switch {
+	case len(rest) >= 1 && rest[0] == "run":
+		return runDaemon(rest[1:], stderr)
 	case len(rest) >= 2 && rest[0] == "config" && rest[1] == "check":
 		return configCheck(rest[2:], stdout, stderr)
 	case len(rest) >= 2 && rest[0] == "onvif" && rest[1] == "discover":
@@ -65,6 +71,48 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, usage)
 		return exitInvalid
 	}
+}
+
+// version is reported in sidecars and the status object; releases set it
+// with -ldflags "-X main.version=...".
+var version = "dev"
+
+// runApp is app.Run; tests replace it.
+var runApp = app.Run
+
+// runDaemon implements "zrelay run" (relay-spec §6): load the config and run
+// the relay until SIGTERM or SIGINT, then shut down within
+// shutdown_grace_seconds.
+func runDaemon(args []string, stderr io.Writer) int {
+	fs := newFlagSet("zrelay run", stderr)
+	path := fs.String("config", "", "config file `path`")
+	envFile := fs.String("env-file", "", "load KEY=VALUE lines into the environment before resolving ENV: references")
+	if code, ok := parse(fs, args); !ok {
+		return code
+	}
+	if *path == "" || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: zrelay run --config <path>")
+		return exitInvalid
+	}
+	if code, ok := loadEnvFile(*envFile, stderr); !ok {
+		return code
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		fmt.Fprintf(stderr, "zrelay: run: %v\n", err)
+		return exitInvalid
+	}
+	if r := config.Budget(cfg); !r.OK {
+		slog.Warn("memory budget exceeds 80% of max_memory_mb; run \"zrelay config check\"",
+			"total_bytes", r.Total, "limit_bytes", r.Limit)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runApp(ctx, cfg, app.Options{Version: version}); err != nil {
+		fmt.Fprintf(stderr, "zrelay: run: %v\n", err)
+		return exitFailed
+	}
+	return exitOK
 }
 
 // configCheck implements "zrelay config check" (relay-spec §5.3, design

@@ -68,6 +68,11 @@ type fakeStore struct {
 	// commitIgnoresCtx makes a gated Commit succeed even if ctx ended while it
 	// waited (the server completed the upload but the caller gave up).
 	commitIgnoresCtx bool
+	// hangPuts makes PutSmall block until its ctx ends (a black-holed
+	// endpoint); hangWrites does the same for Write. Both count the calls
+	// that entered in hungPuts and hungWrites.
+	hangPuts, hangWrites bool
+	hungPuts, hungWrites int
 
 	writeCalls, writeErrs, resumes, partAttempts int
 }
@@ -101,6 +106,12 @@ func (s *fakeStore) PutSmall(ctx context.Context, key string, data []byte, conte
 		return err
 	}
 	s.mu.Lock()
+	if s.hangPuts {
+		s.hungPuts++
+		s.mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	if gate := s.finalGate; gate != nil && !strings.Contains(key, "/.") {
 		s.mu.Unlock()
 		select {
@@ -135,7 +146,7 @@ func (s *fakeStore) Create(ctx context.Context, key string) (storage.ObjectWrite
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("create", key)
-	o := &fakeObj{s: s, key: key, createGoid: goid()}
+	o := &fakeObj{s: s, key: key, createGoid: goid(), ctx: ctx}
 	s.objs[key] = o
 	return o, nil
 }
@@ -150,6 +161,7 @@ type fakeObj struct {
 	createGoid uint64
 	abortGoid  uint64
 	aborted    bool
+	ctx        context.Context // from Create, like the S3 driver's part uploads
 }
 
 func (o *fakeObj) Write(p []byte) (int, error) {
@@ -157,6 +169,13 @@ func (o *fakeObj) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writeCalls++
+	if s.hangWrites {
+		s.hungWrites++
+		s.mu.Unlock()
+		<-o.ctx.Done()
+		s.mu.Lock()
+		return 0, o.ctx.Err()
+	}
 	if s.partSize > 0 {
 		return o.writeBuffered(p)
 	}

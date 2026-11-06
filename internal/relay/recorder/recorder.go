@@ -353,6 +353,23 @@ func (d DirectSink) dropStaging(ctx context.Context, c *PendingClip) {
 	}
 }
 
+// RunOption configures Run.
+type RunOption func(*runOptions)
+
+type runOptions struct {
+	force  <-chan struct{}
+	resume func() bool
+}
+
+// WithBacklogPolicy lets the egress backlog policy (relay-spec §4.8), which
+// runs on other goroutines, act on the camera from the recorder goroutine:
+// a receive on force finalizes the active clip with backlog_overflow and
+// suppresses the camera, and on every tick a Suppressed camera is released
+// when resume reports true (backlog < 50% of the limit, relay-spec §4.5).
+func WithBacklogPolicy(force <-chan struct{}, resume func() bool) RunOption {
+	return func(o *runOptions) { o.force, o.resume = force, resume }
+}
+
 // Run is the per-camera recorder loop: it feeds Hub events and tracker
 // changes to the clip machine and ticks it every 250 ms, until ctx is done or
 // sub is closed. It then shuts the machine down (finalizing any open clip
@@ -360,9 +377,13 @@ func (d DirectSink) dropStaging(ctx context.Context, c *PendingClip) {
 //
 // The tracker reports only which kinds are active, so the trigger signals the
 // machine records carry host receive time and no raw topic.
-func Run(ctx context.Context, sub *camera.Sub, tracker *events.Tracker, m *clip.Machine) {
+func Run(ctx context.Context, sub *camera.Sub, tracker *events.Tracker, m *clip.Machine, opts ...RunOption) {
 	defer sub.Close()
 	defer m.Shutdown()
+	var ro runOptions
+	for _, o := range opts {
+		o(&ro)
+	}
 
 	active := map[events.Kind]bool{}
 	syncTriggers := func() {
@@ -404,8 +425,13 @@ func Run(ctx context.Context, sub *camera.Sub, tracker *events.Tracker, m *clip.
 			}
 		case <-tracker.Changes():
 			syncTriggers()
+		case <-ro.force:
+			m.ForceFinalize(clip.ReasonBacklogOverflow)
 		case <-ticker.C:
 			m.Tick()
+			if ro.resume != nil && m.State() == "Suppressed" && ro.resume() {
+				m.Unsuppress()
+			}
 		}
 	}
 }

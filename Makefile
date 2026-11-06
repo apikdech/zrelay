@@ -1,4 +1,4 @@
-.PHONY: test vet integration vectors web web-e2e
+.PHONY: test vet integration chaos vectors web web-e2e
 
 # Unit tests with the race detector.
 test:
@@ -11,6 +11,12 @@ vet:
 # Integration-tagged tests (MinIO and other fixtures run in Docker).
 integration:
 	go test -race -tags integration ./...
+
+# Chaos run (design §9): three 4 Mbps cameras, MinIO black-holed for ten real
+# minutes, memory bounded. Takes about 15 minutes; not part of CI. No -race:
+# the detector's shadow memory would distort the memory assertion.
+chaos:
+	go test -tags chaos -run TestChaos -count=1 -timeout 40m -v ./internal/relay/app
 
 # Regenerate the cross-language zrec vectors (Contract §4.5).
 vectors:
