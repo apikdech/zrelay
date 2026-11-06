@@ -324,3 +324,30 @@ func TestRTSPServerSetParamSets(t *testing.T) {
 		}
 	}
 }
+
+func TestRTSPServerStopsAfterLastAUWithoutLoop(t *testing.T) {
+	aus := testutil.LoadAnnexB(t, h264Fixture)[:3]
+	srv := testutil.StartRTSPServer(t, testutil.RTSPServerOpts{Codec: "h264", AUs: aus, FPS: 15})
+
+	c, desc := dialAndSetup(t, srv.URL())
+	medi, forma := h264Medi(t, desc)
+	sink := newSink()
+	c.OnPacketRTP(medi, forma, func(p *rtp.Packet) { sink.add(p) })
+	play(t, c)
+
+	marked := func(p []*rtp.Packet) int {
+		n := 0
+		for _, pk := range p {
+			if pk.Marker {
+				n++
+			}
+		}
+		return n
+	}
+	sink.waitFor(t, "3 access units", func(p []*rtp.Packet) bool { return marked(p) >= 3 })
+	// Six frame periods: a looping server would have sent more AUs by now.
+	time.Sleep(6 * time.Second / 15)
+	if got := marked(sink.snapshot()); got != 3 {
+		t.Fatalf("got %d access units, want exactly 3 without Loop", got)
+	}
+}
