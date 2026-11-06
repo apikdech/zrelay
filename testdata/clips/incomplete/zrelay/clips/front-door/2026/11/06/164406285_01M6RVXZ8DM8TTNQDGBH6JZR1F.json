@@ -1,0 +1,40 @@
+{
+  "schema": "zrec.sidecar/2",
+  "status": "incomplete",
+  "clip_id": "01M6RVXZ8DM8TTNQDGBH6JZR1F",
+  "series_id": "01M6RVXZ8DBBZVMJ5B1BFHN6J2",
+  "segment_index": 0,
+  "camera": {
+    "id": "front-door",
+    "name": "Front Door",
+    "brand": "tapo",
+    "tags": [
+      "exterior"
+    ]
+  },
+  "start_time": "2026-11-06T16:44:06.285Z",
+  "end_time": null,
+  "duration_ms": null,
+  "pre_roll_ms": 0,
+  "end_reason": "recovered",
+  "triggers": [],
+  "video": {
+    "object": "164406285_01M6RVXZ8DM8TTNQDGBH6JZR1F.zrec",
+    "format_version": 1,
+    "key_id": "24f301fa8d9378d6",
+    "chunk_size": 65536,
+    "size_bytes": 2248160,
+    "plaintext_size_bytes": null,
+    "container": "fmp4",
+    "codec": "avc1.640016",
+    "width": 640,
+    "height": 360,
+    "init_segment_bytes": 686,
+    "seek_index": null
+  },
+  "recorder": {
+    "relay_id": "fixture-relay",
+    "version": "fixture",
+    "time_source": "arrival"
+  }
+}
