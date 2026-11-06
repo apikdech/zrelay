@@ -720,10 +720,12 @@ func (a *app) shutdown() {
 	}
 
 	// 2. Drain the egress. A reserve of the grace is kept for aborting what
-	// cannot finish, the status flush and closing the servers, so the
-	// process still exits within shutdown_grace_seconds.
+	// cannot finish, the status flush, closing the servers and the ONVIF
+	// unsubscribe, so the process still exits within shutdown_grace_seconds.
+	// The abort phase, which may hang in a request into an unreachable
+	// endpoint, gets half of it; the rest stays for the steps after.
 	reserve := min(a.grace()/5, 3*time.Second)
-	dropped := a.eg.Shutdown(max(0, left()-reserve))
+	dropped := a.eg.ShutdownWithin(max(0, left()-reserve), reserve/2)
 	if dropped > 0 {
 		slog.Warn("shutdown dropped clips that could not be uploaded", "dropped", dropped)
 	}

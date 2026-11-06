@@ -274,6 +274,9 @@ type downStorage struct {
 	down atomic.Bool
 	// recoveryFails makes the recovery scan fail while writes still work.
 	recoveryFails atomic.Bool
+	// blackholeAbort makes Abort of an upload that was created while up hang
+	// until its context ends, like a request into a black-holed endpoint.
+	blackholeAbort atomic.Bool
 
 	mu          sync.Mutex
 	healthCalls int
@@ -298,7 +301,33 @@ func (s *downStorage) Create(ctx context.Context, key string) (storage.ObjectWri
 	if s.down.Load() {
 		return nil, errDown
 	}
-	return s.Provider.Create(ctx, key)
+	w, err := s.Provider.Create(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return &downWriter{ObjectWriter: w, s: s}, nil
+}
+
+// downWriter is an upload that fails its writes while the storage is down
+// and may hang its Abort.
+type downWriter struct {
+	storage.ObjectWriter
+	s *downStorage
+}
+
+func (w *downWriter) Write(p []byte) (int, error) {
+	if w.s.down.Load() {
+		return 0, errDown
+	}
+	return w.ObjectWriter.Write(p)
+}
+
+func (w *downWriter) Abort(ctx context.Context) error {
+	if w.s.blackholeAbort.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return w.ObjectWriter.Abort(ctx)
 }
 
 func (s *downStorage) PutSmall(ctx context.Context, key string, data []byte, ct string) error {
