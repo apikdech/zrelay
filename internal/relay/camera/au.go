@@ -2,6 +2,7 @@ package camera
 
 import (
 	"bytes"
+	"log/slog"
 	"time"
 
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
@@ -74,6 +75,14 @@ const (
 	// waits for an RTCP sender report before it settles on arrival time.
 	// Access units are held (not dropped) meanwhile.
 	timeSourceWait = 2 * videoClockRate
+	// maxTimestampStep is the largest step between the RTP timestamps of two
+	// consecutive access units that is believed. A larger one (either way)
+	// means the camera restarted its encoder or RTP clock, and the session
+	// re-bases its timeline instead of carrying the jump into DTS and Wall.
+	maxTimestampStep = 10 * videoClockRate
+	// defaultFrameTicks is the DTS step used across a re-base before two
+	// access units have set a real one (30 fps).
+	defaultFrameTicks = videoClockRate / 30
 )
 
 func ticksToDuration(t int64) time.Duration {
@@ -172,9 +181,12 @@ var h265Rules = codecRules{
 
 // pendingAU is an access unit held while the time source is undecided.
 type pendingAU struct {
-	au    *AccessUnit
-	rtp   uint32 // RTP timestamp (PTS)
-	codec *Codec // non-nil when this AU starts a new parameter set generation
+	au     *AccessUnit
+	rtp    uint32    // RTP timestamp (PTS)
+	anchor time.Time // arrival-mode wall time of DTS 0 when the unit was queued
+	codec  *Codec    // non-nil when this AU starts a new parameter set generation
+	// rebased marks the unit that opened a new RTP timeline (see rebase).
+	rebased bool
 }
 
 // assembler turns decoded access units into SessionSink calls: it tracks
@@ -200,6 +212,7 @@ type assembler struct {
 	havePacket   bool
 	firstArrival time.Time
 	firstTicks   int64
+	lastArrival  time.Time
 
 	started    bool  // the first IDR has been seen
 	base       int64 // unwrapped RTP time of the first IDR
@@ -208,9 +221,20 @@ type assembler struct {
 	needIDR    bool
 	haveDTS    bool
 	lastDTS    int64
+	lastPTS    int64 // PTS of the latest accepted unit
+	lastTicks  int64 // unwrapped RTP time of the latest accepted unit
+	frameTicks int64 // latest DTS step, the duration assumed across a re-base
 	decided    bool
 	timeSource TimeSource
 	pending    []pendingAU
+
+	// discontinuities counts RTP timeline re-bases in this session.
+	discontinuities uint64
+
+	// ntpStale is set (in emit order) from a re-based unit until the NTP
+	// mapping agrees with the arrival-based time again, i.e. until a sender
+	// report on the new clock has arrived. See wall.
+	ntpStale bool
 
 	haveWall    bool
 	lastWall    time.Time
@@ -248,6 +272,7 @@ func (a *assembler) packet(ts uint32, arrival time.Time) {
 	if !a.havePacket {
 		a.havePacket, a.firstArrival, a.firstTicks = true, arrival, ticks
 	}
+	a.lastArrival = arrival
 }
 
 // ticksOf unwraps the RTP timestamp of an access unit relative to the latest
@@ -283,15 +308,25 @@ func (a *assembler) accessUnit(nalus [][]byte, raw uint32, ticks int64) {
 	}
 
 	pts := ticks - a.base
+	rebased := a.discontinuous(ticks, pts)
+	if rebased {
+		pts = a.rebase(ticks)
+		if idr {
+			a.dts = a.rules.newDTS() // reordering state of the old timeline
+		}
+	}
 	dts, err := a.dts.Extract(a.withParamSets(nalus, idr), pts)
 	if err != nil || (a.haveDTS && dts <= a.lastDTS) {
 		// Resynchronise at the next IDR rather than emit a non-monotonic DTS.
 		a.needIDR = true
 		return
 	}
-	a.haveDTS, a.lastDTS = true, dts
+	if a.haveDTS {
+		a.frameTicks = dts - a.lastDTS
+	}
+	a.haveDTS, a.lastDTS, a.lastPTS, a.lastTicks = true, dts, pts, ticks
 
-	p := pendingAU{rtp: raw, codec: a.announcement()}
+	p := pendingAU{rtp: raw, anchor: a.anchor, codec: a.announcement(), rebased: rebased}
 	au := &AccessUnit{PTS: pts, DTS: dts, IDR: idr, NALUs: cloneNALUs(nalus), ParamGen: a.gen}
 	for _, n := range au.NALUs {
 		au.Bytes += len(n)
@@ -308,6 +343,44 @@ func (a *assembler) accessUnit(nalus [][]byte, raw uint32, ticks int64) {
 		return
 	}
 	a.emit(p)
+}
+
+// discontinuous reports whether an access unit with unwrapped RTP time ticks
+// and PTS pts (on the current timeline) cannot follow the last accepted one:
+// its PTS is not above the last DTS (a PTS is never below its own DTS, and
+// DTS strictly increases), or the RTP time stepped by more than
+// maxTimestampStep either way. This is a camera that restarted its encoder
+// or RTP clock mid-session; the unwrapper cannot tell, and a fresh DTS
+// extractor would keep rejecting units until the new clock caught up with
+// the old one.
+func (a *assembler) discontinuous(ticks, pts int64) bool {
+	if !a.haveDTS {
+		return false
+	}
+	step := ticks - a.lastTicks
+	return pts <= a.lastDTS || step > maxTimestampStep || step < -maxTimestampStep
+}
+
+// rebase continues the timeline from the access unit with RTP time ticks as
+// if it followed the last accepted unit by one frame: PTS/DTS go on from
+// there and, in arrival mode, Wall is re-anchored to the arrival time (emit
+// keeps it strictly increasing). It returns the unit's new PTS.
+func (a *assembler) rebase(ticks int64) int64 {
+	a.discontinuities++
+	frame := a.frameTicks
+	if frame <= 0 {
+		frame = defaultFrameTicks
+	}
+	next := max(a.lastPTS, a.lastDTS) + frame
+	slog.Warn("camera RTP timeline discontinuity; re-based",
+		"rtp_step_seconds", float64(ticks-a.lastTicks)/videoClockRate, "count", a.discontinuities)
+	a.base = ticks - next
+	arrival := a.lastArrival
+	if !a.havePacket {
+		arrival = a.anchor.Add(ticksToDuration(a.lastDTS + frame))
+	}
+	a.anchor = arrival.Add(-ticksToDuration(next)).UTC()
+	return next
 }
 
 // announcement returns the codec to announce with the access unit about to
@@ -356,13 +429,34 @@ func (a *assembler) emit(p pendingAU) {
 	a.sink.Video(p.au)
 }
 
+// wall returns the wall time of p. In rtcp mode that is the NTP mapping,
+// except after a re-base: until the camera's first sender report on the new
+// clock, the mapping extrapolates the old clock (gortsplib computes
+// int32(ts - lastSenderReportTimeRTP)) and puts the new timestamps hours away
+// from the real time, and emit would follow a forward step and keep it. Such a
+// mapping, further than maxTimestampStep from the arrival-based time, is
+// ignored in favour of the arrival-based time (re-anchored by rebase). The
+// first mapping that agrees with it ends the wait.
 func (a *assembler) wall(p pendingAU) time.Time {
-	if a.timeSource == TimeSourceRTCP {
-		if t, ok := a.ntp(p.rtp); ok {
-			return t.Add(-ticksToDuration(p.au.PTS - p.au.DTS)).UTC()
-		}
+	byArrival := p.anchor.Add(ticksToDuration(p.au.DTS))
+	if a.timeSource != TimeSourceRTCP {
+		return byArrival
 	}
-	return a.anchor.Add(ticksToDuration(p.au.DTS))
+	if p.rebased {
+		a.ntpStale = true
+	}
+	t, ok := a.ntp(p.rtp)
+	if !ok {
+		return byArrival
+	}
+	t = t.Add(-ticksToDuration(p.au.PTS - p.au.DTS)).UTC()
+	if a.ntpStale {
+		if d := t.Sub(byArrival); d > ticksToDuration(maxTimestampStep) || d < -ticksToDuration(maxTimestampStep) {
+			return byArrival
+		}
+		a.ntpStale = false
+	}
+	return t
 }
 
 // inBandParams returns the codec updated with the parameter sets carried in
