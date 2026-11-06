@@ -78,6 +78,26 @@ describe('parseSidecar', () => {
     expect(parseSidecar(s).status).toBe('incomplete');
   });
 
+  it('accepts the null seek_index the Go writer emits for a recovered clip and normalises it to []', () => {
+    const s: Record<string, unknown> = { ...good(), status: 'incomplete', end_time: null, duration_ms: null, end_reason: 'recovered' };
+    s.video = { ...(s.video as object), plaintext_size_bytes: null, seek_index: null };
+    expect(parseSidecar(s).video.seek_index).toEqual([]);
+    expect(parseClipList([s]).clips[0]!.video.seek_index).toEqual([]);
+  });
+
+  it('still rejects a null or missing seek_index on a complete full sidecar', () => {
+    expect(() => parseSidecar(withVideo({ seek_index: null }))).toThrow(SchemaError);
+  });
+
+  it('accepts an empty but present seek_index on a complete clip, like sidecar.Validate', () => {
+    expect(parseSidecar(withVideo({ seek_index: [] })).video.seek_index).toEqual([]);
+  });
+
+  it('rejects init_segment_bytes of 0, like sidecar.Validate', () => {
+    expect(() => parseSidecar(withVideo({ init_segment_bytes: 0 }))).toThrow(SchemaError);
+    expect(() => parseSidecar(withVideo({ init_segment_bytes: 1 }))).not.toThrow();
+  });
+
   it('requires seek_index on a complete full sidecar', () => {
     const s = good();
     const { seek_index: _drop, ...video } = s.video as Record<string, unknown>;

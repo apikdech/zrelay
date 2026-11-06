@@ -1,5 +1,5 @@
 // Main-thread side of the crypto/data worker protocol.
-import { ErrAuth } from './zrec/errors';
+import { ErrAuth, ErrAuthHeader, ErrFormat, ErrTrailingData, ErrTruncated, ErrUnknownKey } from './zrec/errors';
 import type { Envelope, Reply, Request, WireError } from '../worker/protocol';
 
 /** The slice of `Worker` the client needs, so tests can use an in-memory pair. */
@@ -19,11 +19,26 @@ function collectBuffers(v: unknown, out: Set<ArrayBuffer>, depth = 0): void {
   } else for (const x of Object.values(v)) collectBuffers(x, out, depth + 1);
 }
 
+/** The zrec errors callers branch on with `instanceof`; any other error keeps only its `name`. */
+const ZREC_ERRORS: Record<string, new (message: string) => Error> = {
+  ErrFormat,
+  ErrUnknownKey,
+  ErrAuthHeader,
+  ErrTruncated,
+  ErrTrailingData,
+};
+
 /** Rebuilds a typed error from the wire. ErrAuth keeps its chunk index. */
 function rehydrate(e: WireError): Error {
-  const err = e.name === 'ErrAuth' ? new ErrAuth(e.chunk ?? -1) : new Error(e.message);
-  if (e.name !== 'ErrAuth') err.name = e.name;
-  else err.message = e.message;
+  let err: Error;
+  if (e.name === 'ErrAuth') {
+    err = new ErrAuth(e.chunk ?? -1);
+    err.message = e.message;
+  } else {
+    const Cls = Object.hasOwn(ZREC_ERRORS, e.name) ? ZREC_ERRORS[e.name] : undefined;
+    err = Cls ? new Cls(e.message) : new Error(e.message);
+    err.name = e.name;
+  }
   if (e.status !== undefined) (err as Error & { status?: number }).status = e.status;
   return err;
 }
@@ -77,10 +92,15 @@ export class WorkerClient {
 
 let shared: WorkerClient | null = null;
 
-/** The app-wide client; the worker starts on first use. */
-export function workerClient(): WorkerClient {
+/** The app-wide client instance (for APIs that take a client); the worker starts on first use. */
+export function getWorkerClient(): WorkerClient {
   shared ??= new WorkerClient(
     new Worker(new URL('../worker/worker.ts', import.meta.url), { type: 'module' }) as unknown as WorkerLike,
   );
   return shared;
 }
+
+/** `workerClient.call<T>(msg): Promise<T>` on the app-wide client; the worker starts on first call. */
+export const workerClient = {
+  call: <T = unknown>(msg: Request): Promise<T> => getWorkerClient().call<T>(msg),
+};

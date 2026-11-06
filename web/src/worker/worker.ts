@@ -94,7 +94,16 @@ export function attachWorker(core: Worker, scope: Scope): void {
       } catch (err) {
         reply = { id: env.id, ok: false, error: toWire(err) };
       }
-      scope.postMessage(reply, transfer);
+      try {
+        scope.postMessage(reply, transfer);
+      } catch (err) {
+        // e.g. DataCloneError: still settle the caller's promise.
+        try {
+          scope.postMessage({ id: env.id, ok: false, error: toWire(err) } satisfies Reply);
+        } catch {
+          /* nothing more can be done */
+        }
+      }
     })();
   };
 }

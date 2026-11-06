@@ -505,3 +505,13 @@ call, including `DeleteObject` on the dot-named staging key.
 **Expected result:** the first restart changes nothing (no `Discarded`, the staging sidecar and the multipart upload are still there); the second restart recovers the clip (`Recovered: 1`) with an `incomplete` sidecar.
 **If the result differs, update:** the age comparison in `recovery.scan` (`internal/relay/recovery/recovery.go`) and Contract §7.4. If host and MinIO clocks differ, see the clock-skew note in the Task 27 entry above.
 **Status:** not run
+
+## Task 35 (fix) — Crypto/data worker: real-browser worker and recovered clip
+**Automated in this task:** Vitest covers the worker core, `attachWorker`, the `worker.ts` bootstrap under a stubbed `WorkerGlobalScope`, the `getWorkerClient()`/`workerClient.call` singleton with a stubbed `globalThis.Worker`, a Go-shaped recovered sidecar (`seek_index: null`), 401 fallback memory, and bounded response bodies. `make vet test` and `make web` pass. None of it runs a real browser Worker.
+**Manual steps:**
+1. Start a stack with a recovered clip: run zrelay against MinIO, kill it mid-clip (`docker kill zrelay`), restart it so crash recovery writes an `incomplete` sidecar, then start `zview-server`.
+2. Build the SPA (`cd web && pnpm build`), open it in Chromium and WebKit over the tailnet URL, import the master key, and open the recovered clip from the clip list.
+3. In DevTools, confirm `GET /api/v1/clips/{id}` returned `"seek_index": null` and the worker did not report ErrSchema; check that the Network panel shows a `new Worker` module script load for the worker bundle and no `Authorization` header or `zk1-` text in main-thread messages.
+**Expected result:** The incomplete clip opens, plays up to the last intact chunk, and ends with a "truncated" notice rather than an auth or schema error. The worker script loads in both browsers.
+**If the result differs, update:** `web/src/worker/schemas.ts` (`video.seek_index`, `crossChecks`), `web/src/worker/clips.ts` (`allowIncomplete`), `web/src/lib/workerClient.ts` (`getWorkerClient` Worker URL/options), the Vite worker build config in `web/vite.config.ts`, and the matching tests in `schemas.test.ts`, `worker.test.ts`, `workerClient.test.ts`.
+**Status:** not run

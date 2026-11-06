@@ -1,7 +1,7 @@
 // Clip sessions: header fetch and validation, G3 comparison and chunk reads
 // (ui-spec §4.2, Contract §4.4). Ciphertext is fetched by Range, at most two
 // chunk fetches in flight per clip, and everything is cancelled on close.
-import { fetchSidecar, type AuthFetch } from './api';
+import { fetchSidecar, readBounded, type AuthFetch } from './api';
 import type { ClipOpenResult, ClipReadResult, HeaderInfo, Verification } from './protocol';
 import { SchemaError, isUlid } from './schemas';
 import { ErrTruncated } from '../lib/zrec/errors';
@@ -10,6 +10,7 @@ import { chunkRange, decryptChunk, numChunks, openClip, type ClipKey, type Keyri
 
 /** Contract §4.1: the largest header is 105 + 64 bytes, so bytes=0-168 always covers it. */
 const HEADER_RANGE = 'bytes=0-168';
+const HEADER_RANGE_LEN = 169;
 const MAX_INFLIGHT = 2;
 
 /** A read or close for a clip that is not open. */
@@ -98,8 +99,9 @@ function parseContentRange(res: Response): { start: number; end: number; total: 
   return { start, end, total };
 }
 
-async function rangeBody(res: Response): Promise<Uint8Array> {
-  return new Uint8Array(await res.arrayBuffer());
+/** Reads a range body, refusing more than the `max` bytes that were asked for. */
+function rangeBody(res: Response, max: number): Promise<Uint8Array> {
+  return readBounded(res, max, () => new RangeMismatchError('range body longer than requested'));
 }
 
 export class Clips {
@@ -132,7 +134,7 @@ export class Clips {
       }
       const cr = parseContentRange(res);
       if (cr.start !== 0) throw new RangeMismatchError('header range does not start at 0');
-      const head = await rangeBody(res);
+      const head = await rangeBody(res, HEADER_RANGE_LEN);
       if (head.length !== cr.end + 1) throw new RangeMismatchError('header body length mismatch');
 
       const header = parseHeader(head);
@@ -194,7 +196,7 @@ export class Clips {
         void res.body?.cancel();
         throw new RangeMismatchError('chunk range or object length changed');
       }
-      ct = await rangeBody(res);
+      ct = await rangeBody(res, end - start);
       if (ct.length !== end - start) throw new RangeMismatchError('chunk body length mismatch');
     } finally {
       release();

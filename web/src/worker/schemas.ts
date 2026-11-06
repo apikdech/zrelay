@@ -63,8 +63,11 @@ const video = v.object({
   codec: capped,
   width: v.optional(nat, 0),
   height: v.optional(nat, 0),
-  init_segment_bytes: nat,
-  seek_index: v.optional(v.pipe(v.array(seekEntry), v.maxLength(SEEK_MAX)), []),
+  // pkg/sidecar.Validate: init_segment_bytes > 0.
+  init_segment_bytes: v.pipe(nat, v.minValue(1)),
+  // The Go writer emits `null` when the index is absent (recovered clips), so null and
+  // missing both mean "no index"; crossChecks decides where that is allowed.
+  seek_index: v.optional(v.nullable(v.pipe(v.array(seekEntry), v.maxLength(SEEK_MAX)))),
 });
 
 const sidecarObject = v.object({
@@ -104,18 +107,22 @@ const sidecarObject = v.object({
 
 type RawSidecar = v.InferOutput<typeof sidecarObject>;
 
-/** Cross-field rules of Contract §6.2 and ui-spec §4.5. `full` also demands seek_index. */
+/**
+ * Cross-field rules of Contract §6.2 and ui-spec §4.5. `full` also demands that a
+ * complete clip carries seek_index (present and non-null; empty is allowed, as in
+ * pkg/sidecar.Validate).
+ */
 function crossChecks(s: RawSidecar, full: boolean, add: (msg: string) => void): void {
   const vid = s.video;
   if (s.status === 'complete') {
     if (s.end_time === null || s.duration_ms === null) add('complete clip needs end_time and duration_ms');
     if (vid.plaintext_size_bytes === null) add('complete clip needs plaintext_size_bytes');
-    if (full && vid.seek_index.length === 0) add('complete clip needs seek_index');
+    if (full && !vid.seek_index) add('complete clip needs seek_index');
   }
   const size = vid.plaintext_size_bytes;
   let prevT = -1;
   let prevO = -1;
-  for (const [t, o] of vid.seek_index) {
+  for (const [t, o] of vid.seek_index ?? []) {
     if (t < prevT) add('seek_index time goes backwards');
     if (o <= prevO) add('seek_index offsets are not increasing');
     if (size !== null && o >= size) add('seek_index offset beyond plaintext_size_bytes');
@@ -130,6 +137,8 @@ function withCross(full: boolean) {
     v.rawCheck(({ dataset, addIssue }) => {
       if (dataset.typed) crossChecks(dataset.value, full, (message) => addIssue({ message }));
     }),
+    // Downstream code sees an always-present array.
+    v.transform((s) => ({ ...s, video: { ...s.video, seek_index: s.video.seek_index ?? [] } })),
   );
 }
 

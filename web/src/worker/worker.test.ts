@@ -1,5 +1,5 @@
 import { IDBFactory } from 'fake-indexeddb';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   keyText,
   loadVector,
@@ -13,7 +13,8 @@ import {
 import { sha256Hex } from '../../test-support/vectors-runner';
 import { ErrAuth, ErrUnknownKey } from '../lib/zrec/errors';
 import type { Request } from './protocol';
-import { createWorker } from './worker';
+import { readJson } from './api';
+import { attachWorker, createWorker } from './worker';
 
 let token: string;
 beforeEach(async () => {
@@ -310,6 +311,20 @@ describe('clip.read', () => {
     await expect(complete.call({ type: 'clip.read', clipId: CLIP, chunk: 1 })).rejects.toMatchObject({ name: 'ErrAuth' });
   });
 
+  it('opens and reads a recovered clip whose sidecar has seek_index null (what pkg/sidecar emits)', async () => {
+    const video = loadVector('pos-two-chunks.zrec').slice();
+    video[video.length - 1] = video[video.length - 1]! ^ 0xff;
+    const recovered = sidecarFor(131072, 1, { status: 'incomplete', end_time: null, duration_ms: null, end_reason: 'recovered' }, { plaintext_size_bytes: null, seek_index: null });
+    const h = harness({ video, sidecar: recovered });
+    await importVectorKey(h);
+    const sc = await h.call({ type: 'api.get', path: `/api/v1/clips/${CLIP}`, query: {} });
+    expect(sc.video.seek_index).toEqual([]);
+    const opened = await h.call({ type: 'clip.open', clipId: CLIP });
+    expect(opened.status).toBe('incomplete');
+    expect(opened.seekIndex).toEqual([]);
+    await expect(h.call({ type: 'clip.read', clipId: CLIP, chunk: 1 })).rejects.toMatchObject({ name: 'ErrTruncated' });
+  });
+
   it('rejects an out-of-range chunk index', async () => {
     const h = harness();
     await importVectorKey(h);
@@ -516,5 +531,134 @@ describe('main thread never receives key material', () => {
     const s = JSON.stringify({ n: (err as Error).name, m: (err as Error).message });
     expect(s).not.toContain(token);
     expect(s).not.toContain('zk1-');
+  });
+});
+
+describe('token fallback', () => {
+  it('remembers the token that worked instead of drawing a 401 on every request', async () => {
+    const h = harness();
+    await importVectorKey(h);
+    // A newer, unrelated key that the server does not accept.
+    await h.call({ type: 'key.import', encoded: await keyText('ee'.repeat(32)), remember: false });
+    for (let i = 0; i < 4; i++) {
+      await h.call({ type: 'api.get', path: `/api/v1/clips/${CLIP}`, query: {} });
+    }
+    const rejected = h.server.calls.filter((c) => c.headers.get('Authorization') !== `Bearer ${token}`);
+    expect(rejected).toHaveLength(1);
+  });
+});
+
+describe('response size caps', () => {
+  /** A very long body; counts how much was pulled and whether it was cancelled. */
+  function endless(chunkBytes: number) {
+    const state = { pulled: 0, cancelled: false };
+    const body = new ReadableStream<Uint8Array>({
+      pull(ctl) {
+        // "Endless" is bounded at 48 MiB so a reader that never stops cannot exhaust memory.
+        if (state.pulled >= 48 << 20) return ctl.close();
+        state.pulled += chunkBytes;
+        ctl.enqueue(new Uint8Array(chunkBytes));
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    });
+    return { state, body };
+  }
+
+  it('readJson refuses an oversized Content-Length without reading the body', async () => {
+    const { state, body } = endless(1 << 20);
+    const res = new Response(body, { headers: { 'Content-Length': String(64 << 20) } });
+    await expect(readJson(res, (j) => j)).rejects.toMatchObject({ name: 'ErrSchema' });
+    expect(state.cancelled).toBe(true);
+    expect(state.pulled).toBeLessThanOrEqual(2 << 20); // only the stream's own prefetch, nothing read by us
+  });
+
+  it('readJson aborts a streamed body once the cap is exceeded', async () => {
+    const { state, body } = endless(1 << 20);
+    await expect(readJson(new Response(body), (j) => j)).rejects.toMatchObject({ name: 'ErrSchema' });
+    expect(state.cancelled).toBe(true);
+    expect(state.pulled).toBeLessThanOrEqual(20 << 20);
+  });
+
+  it('clip.open aborts a header response longer than the requested range', async () => {
+    const { state, body } = endless(4096);
+    const h = harness({
+      routes: {
+        ['GET /api/v1/clips/' + CLIP + '/video']: () =>
+          new Response(body, { status: 206, headers: { 'Content-Range': 'bytes 0-168/200000' } }),
+      },
+    });
+    await importVectorKey(h);
+    await expect(h.call({ type: 'clip.open', clipId: CLIP })).rejects.toMatchObject({ name: 'ErrRange' });
+    expect(state.cancelled).toBe(true);
+    expect(state.pulled).toBeLessThan(1 << 20);
+  });
+
+  it('clip.read aborts a chunk response longer than the requested range', async () => {
+    const base = harness();
+    const { state, body } = endless(65536);
+    let served = 0;
+    const h = harness({
+      routes: {
+        ['GET /api/v1/clips/' + CLIP + '/video']: async (req) => {
+          if (served++ === 0) return base.server.fetch(req.url, { method: 'GET', headers: req.headers });
+          const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.get('Range')!)!;
+          return new Response(body, { status: 206, headers: { 'Content-Range': `bytes ${m[1]}-${m[2]}/${loadVector('pos-two-and-half-chunks.zrec').length}` } });
+        },
+      },
+    });
+    await importVectorKey(h);
+    await h.call({ type: 'clip.open', clipId: CLIP });
+    await expect(h.call({ type: 'clip.read', clipId: CLIP, chunk: 0 })).rejects.toMatchObject({ name: 'ErrRange' });
+    expect(state.cancelled).toBe(true);
+    expect(state.pulled).toBeLessThan(1 << 20);
+  });
+});
+
+describe('attachWorker', () => {
+  it('replies with an error for the same id when postMessage of the result throws', async () => {
+    const posted: { msg: { id: number; ok: boolean; error?: { name: string } }; transfer: Transferable[] }[] = [];
+    const scope = {
+      onmessage: null as ((e: { data: unknown }) => void) | null,
+      postMessage(msg: unknown, transfer: Transferable[] = []) {
+        const m = msg as { id: number; ok: boolean; error?: { name: string } };
+        if (m.ok) throw new DOMException('cannot clone', 'DataCloneError');
+        posted.push({ msg: m, transfer });
+      },
+    };
+    attachWorker({ handle: async () => ({ result: { fn: () => 1 } }) }, scope);
+    scope.onmessage!({ data: { id: 7, msg: { type: 'key.list' } } });
+    await vi.waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]!.msg).toMatchObject({ id: 7, ok: false, error: { name: 'DataCloneError' } });
+  });
+});
+
+describe('worker bootstrap', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('attaches the protocol to the global scope when running inside a Dedicated Worker', async () => {
+    class FakeWorkerGlobalScope {}
+    const server = mockServer({ token });
+    const posted: unknown[] = [];
+    const scope = Object.assign(new FakeWorkerGlobalScope(), {
+      onmessage: null as ((e: { data: unknown }) => void) | null,
+      postMessage: (msg: unknown) => void posted.push(msg),
+      fetch: server.fetch,
+      indexedDB: new IDBFactory(),
+    });
+    vi.stubGlobal('WorkerGlobalScope', FakeWorkerGlobalScope);
+    vi.stubGlobal('self', scope);
+    vi.resetModules();
+    await import('./worker');
+    expect(scope.onmessage).toBeTypeOf('function');
+    scope.onmessage!({ data: { id: 3, msg: { type: 'key.list' } } });
+    await vi.waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toEqual({ id: 3, ok: true, result: { keys: [] } });
+  });
+
+  it('does nothing when imported outside a worker', async () => {
+    vi.resetModules();
+    await expect(import('./worker')).resolves.toBeDefined();
   });
 });

@@ -1,6 +1,6 @@
 // WHEP signaling for live view. The worker does the POST/DELETE with K_api;
 // RTCPeerConnection runs on the main thread, which sees only SDP.
-import type { AuthFetch } from './api';
+import { readBounded, type AuthFetch } from './api';
 import type { LiveOfferResult } from './protocol';
 import { SchemaError, isCameraId } from './schemas';
 
@@ -50,8 +50,9 @@ export async function liveOffer(authFetch: AuthFetch, cameraId: string, sdp: str
   }
   const m = SESSION_RE.exec(path);
   if (!m || m[1] !== cameraId) throw new LiveError('live offer returned a Location outside the camera session space');
-  const answer = await res.text();
-  if (answer.length > MAX_SDP_BYTES) throw new LiveError('answer too large');
+  const answer = new TextDecoder().decode(
+    await readBounded(res, MAX_SDP_BYTES, () => new LiveError('answer too large')),
+  );
   return { sdp: answer, sessionPath: path };
 }
 

@@ -1,9 +1,9 @@
 import { IDBFactory } from 'fake-indexeddb';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadVector, manifest, masterText, mockServer, sidecarFor, vectorToken } from '../../test-support/worker-fixtures';
-import { ErrAuth } from './zrec/errors';
+import { ErrAuth, ErrAuthHeader, ErrFormat, ErrTrailingData, ErrTruncated, ErrUnknownKey } from './zrec/errors';
 import { attachWorker, createWorker } from '../worker/worker';
-import { WorkerClient, type WorkerLike } from './workerClient';
+import { WorkerClient, getWorkerClient, workerClient, type WorkerLike } from './workerClient';
 
 /** In-memory Worker pair: messages are structured-cloned with their transfer lists, like postMessage. */
 function loopback(token: string, video?: Uint8Array) {
@@ -107,5 +107,55 @@ describe('WorkerClient', () => {
     wc.terminate();
     await expect(p).rejects.toThrow();
     expect(terminated).toBe(true);
+  });
+});
+
+describe('error rehydration', () => {
+  it.each([
+    ['ErrFormat', ErrFormat],
+    ['ErrUnknownKey', ErrUnknownKey],
+    ['ErrAuthHeader', ErrAuthHeader],
+    ['ErrTruncated', ErrTruncated],
+    ['ErrTrailingData', ErrTrailingData],
+  ] as const)('rebuilds %s as its real class', async (name, Cls) => {
+    const w: WorkerLike = { onmessage: null, onerror: null, postMessage() {}, terminate() {} };
+    const wc = new WorkerClient(w);
+    const p = wc.call({ type: 'key.list' });
+    w.onmessage?.({ data: { id: 1, ok: false, error: { name, message: 'm' } } });
+    const err = await p.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Cls);
+    expect((err as Error).name).toBe(name);
+    expect((err as Error).message).toBe('m');
+  });
+});
+
+describe('shared client singleton', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('starts one module Worker lazily and routes workerClient.call through it', async () => {
+    const created: { url: URL; opts: unknown }[] = [];
+    const posted: unknown[] = [];
+    class FakeWorker implements WorkerLike {
+      onmessage: WorkerLike['onmessage'] = null;
+      onerror: WorkerLike['onerror'] = null;
+      constructor(url: URL, opts: unknown) {
+        created.push({ url, opts });
+      }
+      postMessage(msg: unknown) {
+        posted.push(msg);
+        const { id } = msg as { id: number };
+        queueMicrotask(() => this.onmessage?.({ data: { id, ok: true, result: { keys: [] } } }));
+      }
+      terminate() {}
+    }
+    vi.stubGlobal('Worker', FakeWorker);
+    expect(created).toHaveLength(0);
+    expect(await workerClient.call({ type: 'key.list' })).toEqual({ keys: [] });
+    expect(getWorkerClient()).toBe(getWorkerClient());
+    await getWorkerClient().call({ type: 'key.list' });
+    expect(created).toHaveLength(1);
+    expect(created[0]!.opts).toEqual({ type: 'module' });
+    expect(String(created[0]!.url)).toMatch(/worker\/worker\.ts$/);
+    expect(posted).toHaveLength(2);
   });
 });
