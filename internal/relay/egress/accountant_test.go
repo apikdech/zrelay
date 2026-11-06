@@ -206,3 +206,24 @@ func TestAccountantNilCallbacksConcurrent(t *testing.T) {
 		t.Fatalf("Total = %d, accountant did not enforce", a.Total())
 	}
 }
+
+// A clip whose video is committed is not backlog even while its stream still
+// holds bytes (the window before the owner releases them): it must not be
+// evicted and reported as a drop.
+func TestAccountantSkipsCommittedClip(t *testing.T) {
+	var r recorder
+	a := egress.NewAccountant(1000, r.onDrop, r.forceFinalize)
+	committed := newClip("a", 0, true)
+	committed.Committed.Store(true)
+	live := newClip("b", time.Second, false)
+	a.Register(committed)
+	a.Register(live)
+	fill(t, committed, 800)
+	fill(t, live, 800)
+	if evicted(committed) || len(r.drops) != 0 {
+		t.Fatalf("committed clip evicted: drops=%v", r.why)
+	}
+	if len(r.forced) != 1 || r.forced[0] != "b" {
+		t.Fatalf("forced = %v, want the in-progress camera b", r.forced)
+	}
+}

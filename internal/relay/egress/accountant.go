@@ -22,6 +22,10 @@ type Clip struct {
 	Final     func() ([]byte, error)
 	Stream    *Stream
 	Finalized atomic.Bool
+	// Committed is set by the owner as soon as the video object is
+	// committed. A committed clip is no longer backlog: the accountant never
+	// evicts it, even while its stream still holds bytes.
+	Committed atomic.Bool
 	Created   time.Time
 }
 
@@ -148,7 +152,7 @@ func (a *Accountant) Enforce() {
 func (a *Accountant) oldestFinalizedLocked() *Clip {
 	var best *Clip
 	for c := range a.clips {
-		if !c.Finalized.Load() || c.Stream.isEvicted() || c.Stream.Buffered() == 0 {
+		if !c.Finalized.Load() || c.Committed.Load() || c.Stream.isEvicted() || c.Stream.Buffered() == 0 {
 			continue
 		}
 		if best == nil || c.Created.Before(best.Created) {

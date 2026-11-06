@@ -184,6 +184,13 @@ func (s *Stream) isEvicted() bool {
 	return s.evicted
 }
 
+// releasedBytes returns the offset below which bytes are gone.
+func (s *Stream) releasedBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.released
+}
+
 // Buffered returns the bytes written but not yet released.
 func (s *Stream) Buffered() int64 {
 	s.mu.Lock()
