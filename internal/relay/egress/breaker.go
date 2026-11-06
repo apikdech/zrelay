@@ -25,17 +25,18 @@ const (
 	Open BreakerState = 2
 )
 
+// probeTimeout bounds each half-open probe. It is deliberately not a
+// BreakerConfig field: design §6.3 defines only failure_threshold, base_delay
+// and max_delay.
+const probeTimeout = 30 * time.Second
+
 // BreakerConfig configures a Breaker. Non-positive fields take the design
-// defaults (failure_threshold 5, base_delay 1 s, max_delay 5 min) and a 30 s
-// probe timeout.
+// defaults (failure_threshold 5, base_delay 1 s, max_delay 5 min), and a
+// MaxDelay below BaseDelay is raised to BaseDelay.
 type BreakerConfig struct {
 	FailureThreshold int
 	BaseDelay        time.Duration
 	MaxDelay         time.Duration
-	// ProbeTimeout bounds each half-open probe: the context handed to probe
-	// is cancelled after it, and a probe that returns an error then counts as
-	// failed. It is measured on the breaker's clock.
-	ProbeTimeout time.Duration
 }
 
 // Breaker is the circuit breaker for one storage endpoint. It is safe for
@@ -48,6 +49,8 @@ type Breaker struct {
 
 	// jitter returns a duration in [0, max]; replaced by tests.
 	jitter func(max time.Duration) time.Duration
+	// probeTimeout bounds each probe; tests may override it.
+	probeTimeout time.Duration
 
 	mu       sync.Mutex
 	state    BreakerState
@@ -60,9 +63,9 @@ type Breaker struct {
 }
 
 // NewBreaker returns a Closed breaker. probe is the half-open health check
-// (HeadBucket); it is run with a context cancelled after cfg.ProbeTimeout, so
-// a hung endpoint cannot hold the breaker half-open forever, and it should
-// return promptly once that context is done. onChange, which may be nil, is
+// (HeadBucket); it is run with a context cancelled after an internal 30 s
+// timeout, so a hung endpoint cannot hold the breaker half-open forever, and
+// it should return promptly once that context is done. onChange, which may be nil, is
 // called once per state transition, in transition order and never
 // concurrently with itself, without holding any breaker lock: it may call back
 // into the breaker (State, Failure, ...) and may be slow without stalling
@@ -82,18 +85,17 @@ func NewBreaker(cfg BreakerConfig, clk clock.Clock, probe func(ctx context.Conte
 	if cfg.MaxDelay < cfg.BaseDelay {
 		cfg.MaxDelay = cfg.BaseDelay
 	}
-	if cfg.ProbeTimeout <= 0 {
-		cfg.ProbeTimeout = 30 * time.Second
-	}
 	return &Breaker{
 		cfg:      cfg,
 		clk:      clk,
 		probe:    probe,
 		onChange: onChange,
 		jitter:   fullJitter,
-		since:    clk.Now(),
-		bound:    cfg.BaseDelay,
-		changed:  make(chan struct{}),
+
+		probeTimeout: probeTimeout,
+		since:        clk.Now(),
+		bound:        cfg.BaseDelay,
+		changed:      make(chan struct{}),
 	}
 }
 
@@ -188,7 +190,10 @@ func (b *Breaker) transitionLocked(s BreakerState) {
 // notify delivers queued onChange notifications in order. At most one goroutine
 // drains the queue at a time; one that finds another draining returns at once,
 // and the drainer delivers its transition. b.mu is never held, and no other
-// lock is taken, while onChange runs.
+// lock is taken, while onChange runs. If onChange panics, the panic propagates
+// to the caller (which may recover it) but the drainer role is released, so
+// later transitions are still delivered; transitions still queued behind the
+// panicking one are delivered with the next transition.
 func (b *Breaker) notify() {
 	b.mu.Lock()
 	if b.notifier {
@@ -196,6 +201,15 @@ func (b *Breaker) notify() {
 		return
 	}
 	b.notifier = true
+	clean := false
+	defer func() {
+		if clean {
+			return
+		}
+		b.mu.Lock()
+		b.notifier = false
+		b.mu.Unlock()
+	}()
 	for len(b.pending) > 0 {
 		s := b.pending[0]
 		b.pending = b.pending[1:]
@@ -204,13 +218,14 @@ func (b *Breaker) notify() {
 		b.mu.Lock()
 	}
 	b.notifier = false
+	clean = true
 	b.mu.Unlock()
 }
 
-// runProbe runs one probe under a context cancelled after ProbeTimeout.
+// runProbe runs one probe under a context cancelled after b.probeTimeout.
 func (b *Breaker) runProbe(ctx context.Context) error {
 	pctx, cancel := context.WithCancel(ctx)
-	timer := b.clk.NewTimer(b.cfg.ProbeTimeout)
+	timer := b.clk.NewTimer(b.probeTimeout)
 	stopped := make(chan struct{})
 	go func() {
 		select {

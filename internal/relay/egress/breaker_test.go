@@ -402,20 +402,21 @@ func TestSinceMarksOutageStart(t *testing.T) {
 }
 
 // TestProbeIsBoundedByTimeout: a probe that hangs (blackholed endpoint) gets
-// its context cancelled after ProbeTimeout, counts as a failed probe and
+// its context cancelled after the (unexported) probe timeout, counts as a failed probe and
 // reopens the breaker with the delay doubled.
 func TestProbeIsBoundedByTimeout(t *testing.T) {
 	const probeTimeout = 10 * time.Second
 	clk := clock.NewFake(epoch)
 	var probes atomic.Int32
 	entered := make(chan struct{}, 4)
-	b := NewBreaker(BreakerConfig{FailureThreshold: 5, BaseDelay: testBase, MaxDelay: testMax, ProbeTimeout: probeTimeout}, clk,
+	b := NewBreaker(BreakerConfig{FailureThreshold: 5, BaseDelay: testBase, MaxDelay: testMax}, clk,
 		func(ctx context.Context) error {
 			probes.Add(1)
 			entered <- struct{}{}
 			<-ctx.Done()
 			return ctx.Err()
 		}, nil)
+	b.probeTimeout = probeTimeout
 	var maxes []time.Duration
 	var mmu sync.Mutex
 	b.jitter = func(max time.Duration) time.Duration {
@@ -453,7 +454,7 @@ func TestProbeIsBoundedByTimeout(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("hung probe was not cancelled by ProbeTimeout")
+			t.Fatal("hung probe was not cancelled by the probe timeout")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -461,5 +462,142 @@ func TestProbeIsBoundedByTimeout(t *testing.T) {
 	defer mmu.Unlock()
 	if maxes[1] != 2*testBase {
 		t.Fatalf("delay bound after timed-out probe = %v, want %v", maxes[1], 2*testBase)
+	}
+}
+
+// TestProbeTimeoutDefault pins the internal 30 s probe bound; it is not a
+// BreakerConfig knob because design §6.3 defines only failure_threshold,
+// base_delay and max_delay.
+func TestProbeTimeoutDefault(t *testing.T) {
+	b := NewBreaker(BreakerConfig{}, clock.NewFake(epoch), nil, nil)
+	if b.probeTimeout != 30*time.Second {
+		t.Fatalf("probeTimeout = %v, want 30s", b.probeTimeout)
+	}
+}
+
+// TestNewBreakerDefaults pins the design §6.3 defaults (threshold 5, base 1 s,
+// max 5 min) that apply when BreakerConfig is zero, and the MaxDelay clamp.
+func TestNewBreakerDefaults(t *testing.T) {
+	clk := clock.NewFake(epoch)
+	var probes atomic.Int32
+	b := NewBreaker(BreakerConfig{}, clk, func(ctx context.Context) error {
+		probes.Add(1)
+		return errors.New("still down")
+	}, nil)
+	if b.cfg.FailureThreshold != 5 || b.cfg.BaseDelay != time.Second || b.cfg.MaxDelay != 5*time.Minute {
+		t.Fatalf("defaults = %+v, want {5 1s 5m0s}", b.cfg)
+	}
+	var mmu sync.Mutex
+	var maxes []time.Duration
+	b.jitter = func(max time.Duration) time.Duration {
+		mmu.Lock()
+		maxes = append(maxes, max)
+		mmu.Unlock()
+		return max
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { b.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	for range 4 {
+		b.Failure(false)
+	}
+	if s, _ := b.State(); s != Closed {
+		t.Fatalf("after 4 transient failures state = %d, want Closed", s)
+	}
+	b.Failure(false)
+	if s, _ := b.State(); s != Open {
+		t.Fatalf("after 5 transient failures state = %d, want Open", s)
+	}
+
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second,
+		32 * time.Second, 64 * time.Second, 128 * time.Second, 256 * time.Second, 5 * time.Minute, 5 * time.Minute}
+	for i, w := range want {
+		deadline := time.Now().Add(10 * time.Second)
+		for clk.Pending() != 1 {
+			if time.Now().After(deadline) {
+				t.Fatalf("cycle %d: breaker never armed its delay timer", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		mmu.Lock()
+		got := maxes[len(maxes)-1]
+		mmu.Unlock()
+		if got != w {
+			t.Fatalf("cycle %d: jitter bound = %v, want %v", i, got, w)
+		}
+		clk.Advance(w)
+		for probes.Load() != int32(i+1) {
+			if time.Now().After(deadline) {
+				t.Fatalf("cycle %d: probe never ran", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		for s, _ := b.State(); s != Open; s, _ = b.State() {
+			if time.Now().After(deadline) {
+				t.Fatalf("cycle %d: breaker never reopened", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestNewBreakerClampsMaxDelayToBase(t *testing.T) {
+	b := NewBreaker(BreakerConfig{BaseDelay: 10 * time.Second, MaxDelay: 2 * time.Second}, clock.NewFake(epoch), nil, nil)
+	if b.cfg.MaxDelay != 10*time.Second {
+		t.Fatalf("MaxDelay = %v, want clamped up to BaseDelay 10s", b.cfg.MaxDelay)
+	}
+}
+
+// TestOnChangePanicDoesNotSilenceLaterTransitions: a panicking onChange that
+// is recovered by the caller must not leave the notifier flag stuck, or every
+// later transition would go undelivered.
+func TestOnChangePanicDoesNotSilenceLaterTransitions(t *testing.T) {
+	clk := clock.NewFake(epoch)
+	var mu sync.Mutex
+	var got []BreakerState
+	first := true
+	b := NewBreaker(BreakerConfig{FailureThreshold: 5, BaseDelay: testBase, MaxDelay: testMax}, clk,
+		func(context.Context) error { return nil },
+		func(s BreakerState) {
+			mu.Lock()
+			if first {
+				first = false
+				mu.Unlock()
+				panic("boom")
+			}
+			got = append(got, s)
+			mu.Unlock()
+		})
+	func() {
+		defer func() { _ = recover() }()
+		b.Failure(true) // Open; onChange panics
+	}()
+	// Back to Closed by hand is not possible without Run, so drive a second
+	// transition the only other way: a fresh Run cycle.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { b.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	deadline := time.Now().Add(10 * time.Second)
+	for clk.Pending() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("breaker never armed its delay timer")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	clk.Advance(testBase)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("later transitions not delivered after a recovered panic; got %v", got)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
