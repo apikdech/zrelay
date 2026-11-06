@@ -105,7 +105,9 @@ const isAbort = (e: unknown): boolean => e instanceof DOMException && e.name ===
  * await on the worker. Throws ExportDisabledError for a clip that failed
  * verification, ExportTooLargeError past blob_max, and whatever the worker
  * throws when a chunk fails to authenticate (a streamed file is aborted then,
- * so no partial file stays behind).
+ * so no partial file stays behind). An incomplete clip ends in a chunk the
+ * worker reports as ErrTruncated: export stops there and saves the verified
+ * chunks before it (ui-spec §4.8).
  */
 export async function exportClip(o: ExportOptions): Promise<ExportResult> {
   if (!canExport(o.integrity)) throw new ExportDisabledError();
@@ -134,7 +136,14 @@ export async function exportClip(o: ExportOptions): Promise<ExportResult> {
     const read = (chunk: number) => client.call<ClipReadResult>({ type: 'clip.read', clipId, chunk });
     let pending = read(0);
     for (let i = 0; i < open.numChunks; i++) {
-      const r = await pending;
+      let r: ClipReadResult;
+      try {
+        r = await pending;
+      } catch (e) {
+        // An interrupted recording ends in a chunk that cannot be read: keep the verified portion (ui-spec §4.8).
+        if (o.integrity === 'incomplete' && e instanceof Error && e.name === 'ErrTruncated' && total > 0) break;
+        throw e;
+      }
       total += r.plaintext.byteLength;
       if (!out && total > o.blobMax) throw new ExportTooLargeError();
       // One chunk ahead, so the network and the write overlap.

@@ -48,6 +48,8 @@ const ID = '01M6RXRJAQRJY105FSDF0QRBH0';
 class FakeClient {
   calls: Request[] = [];
   failAt: number | null = null;
+  /** Like a real incomplete clip: this chunk (the last one) cannot be read and is reported as truncated. */
+  truncateAt: number | null = null;
   constructor(
     private readonly chunks: Uint8Array[],
     private readonly size: number | null = chunks.reduce((n, c) => n + c.length, 0),
@@ -58,6 +60,9 @@ class FakeClient {
       return { numChunks: this.chunks.length, plaintextSizeBytes: this.size } as unknown as T;
     }
     if (msg.type === 'clip.read') {
+      if (this.truncateAt === msg.chunk) {
+        throw Object.assign(new Error(`final chunk missing after chunk ${msg.chunk - 1}`), { name: 'ErrTruncated' });
+      }
       if (this.failAt === msg.chunk) throw Object.assign(new Error('chunk failed authentication'), { name: 'ErrAuth' });
       const c = this.chunks[msg.chunk]!;
       const r: ClipReadResult = { plaintext: c.slice().buffer, final: msg.chunk === this.chunks.length - 1 };
@@ -213,6 +218,70 @@ describe('exportClip', () => {
     const res = await exportClip({ ...base, integrity: 'incomplete', filename: 'c_20260101-000000-incomplete.mp4', client, env: e });
     expect(res).toMatchObject({ kind: 'saved', bytes: 200 });
     expect(e.downloads[0]!.name).toBe('c_20260101-000000-incomplete.mp4');
+  });
+
+  describe('an incomplete clip, whose last chunk is truncated', () => {
+    const incomplete = { ...base, integrity: 'incomplete' as const, filename: 'c_20260101-000000-incomplete.mp4' };
+
+    it('saves the verified chunks through the picker and closes the file', async () => {
+      const client = new FakeClient(chunks(4, 100), null);
+      client.truncateAt = 3;
+      const handle = new FakeHandle();
+      let name = '';
+      const e = env({
+        showSaveFilePicker: async (o) => {
+          name = o.suggestedName;
+          return handle;
+        },
+      });
+      const res = await exportClip({ ...incomplete, client, env: e });
+      expect(res).toEqual({ kind: 'saved', method: 'picker', bytes: 300 });
+      expect(name).toBe('c_20260101-000000-incomplete.mp4');
+      expect(handle.writes.map((w) => w[0])).toEqual([1, 2, 3]);
+      expect(handle.closed).toBe(true);
+      expect(handle.aborted).toBe(false);
+    });
+
+    it('builds the Blob from the verified chunks under the -incomplete name', async () => {
+      const client = new FakeClient(chunks(4, 100), null);
+      client.truncateAt = 3;
+      const e = env();
+      const res = await exportClip({ ...incomplete, client, env: e });
+      expect(res).toEqual({ kind: 'saved', method: 'download', bytes: 300 });
+      expect(e.downloads).toHaveLength(1);
+      expect(e.downloads[0]!.name).toBe('c_20260101-000000-incomplete.mp4');
+      expect(e.downloads[0]!.blob.size).toBe(300);
+    });
+
+    it('still fails when nothing verified could be read', async () => {
+      const client = new FakeClient(chunks(2, 100), null);
+      client.truncateAt = 0;
+      const handle = new FakeHandle();
+      await expect(exportClip({ ...incomplete, client, env: env({ showSaveFilePicker: async () => handle }) })).rejects.toMatchObject({
+        name: 'ErrTruncated',
+      });
+      expect(handle.aborted).toBe(true);
+      expect(handle.closed).toBe(false);
+    });
+
+    it('still aborts on an authentication failure', async () => {
+      const client = new FakeClient(chunks(4, 100), null);
+      client.failAt = 2;
+      const handle = new FakeHandle();
+      await expect(exportClip({ ...incomplete, client, env: env({ showSaveFilePicker: async () => handle }) })).rejects.toMatchObject({
+        name: 'ErrAuth',
+      });
+      expect(handle.aborted).toBe(true);
+      expect(handle.closed).toBe(false);
+    });
+  });
+
+  it('does not hide a truncation in a clip that is not marked incomplete', async () => {
+    const client = new FakeClient(chunks(3, 100), null);
+    client.truncateAt = 2;
+    const e = env();
+    await expect(exportClip({ ...base, client, env: e })).rejects.toMatchObject({ name: 'ErrTruncated' });
+    expect(e.downloads).toEqual([]);
   });
 
   it('never reads more chunks than the clip has', async () => {

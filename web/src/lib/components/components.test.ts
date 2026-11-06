@@ -143,6 +143,61 @@ describe('ExportDialog', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('boom');
     expect(screen.getByRole('dialog')).toHaveTextContent('1.4 MiB');
   });
+
+  describe('focus trap', () => {
+    const open = (over: Record<string, unknown> = {}) => {
+      render(ExportDialog, { filename: 'a.mp4', busy: false, bytes: 0, error: '', onConfirm: () => {}, onCancel: () => {}, ...over });
+      return {
+        dialog: screen.getByRole('dialog'),
+        cancel: screen.getByRole('button', { name: 'Cancel' }),
+        save: screen.getByRole('button', { name: /sav/i }),
+      };
+    };
+
+    it('takes focus when it opens', () => {
+      const { dialog } = open();
+      expect(document.activeElement).toBe(dialog);
+    });
+
+    it('Tab from the last button wraps to the first', async () => {
+      const { save, cancel } = open();
+      save.focus();
+      const ev = await fireEvent.keyDown(save, { key: 'Tab' });
+      expect(document.activeElement).toBe(cancel);
+      expect(ev).toBe(false); // default prevented: the browser must not move focus out
+    });
+
+    it('Shift+Tab from the first button wraps to the last', async () => {
+      const { save, cancel } = open();
+      cancel.focus();
+      await fireEvent.keyDown(cancel, { key: 'Tab', shiftKey: true });
+      expect(document.activeElement).toBe(save);
+    });
+
+    it('Shift+Tab from the dialog itself goes to the last button, Tab to the first', async () => {
+      const { dialog, save, cancel } = open();
+      await fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true });
+      expect(document.activeElement).toBe(save);
+      dialog.focus();
+      await fireEvent.keyDown(dialog, { key: 'Tab' });
+      expect(document.activeElement).toBe(cancel);
+    });
+
+    it('lets Tab move normally between the buttons inside the dialog', async () => {
+      const { cancel } = open();
+      cancel.focus();
+      const notPrevented = await fireEvent.keyDown(cancel, { key: 'Tab' });
+      expect(notPrevented).toBe(true);
+    });
+
+    it('keeps focus on the dialog while both buttons are disabled', async () => {
+      const { dialog, cancel } = open({ busy: true });
+      expect(cancel).toBeDisabled();
+      const ev = await fireEvent.keyDown(dialog, { key: 'Tab' });
+      expect(ev).toBe(false);
+      expect(document.activeElement).toBe(dialog);
+    });
+  });
 });
 
 describe('Player', () => {
@@ -273,6 +328,87 @@ describe('Player', () => {
     await fireEvent.click(btn);
     await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByRole('dialog')).toHaveTextContent(/network down/);
+  });
+
+  describe('transport', () => {
+    type Handle = { togglePlay(): void; skip(ms: number): void };
+    /** A video whose paused flag and clock the test controls. */
+    function stubVideo(paused: boolean, currentTimeSec = 0) {
+      const v = screen.getByTestId('player') as HTMLVideoElement;
+      let isPaused = paused;
+      Object.defineProperty(v, 'paused', { get: () => isPaused, configurable: true });
+      Object.defineProperty(v, 'currentTime', { get: () => currentTimeSec, configurable: true });
+      const play = vi.fn(() => {
+        isPaused = false;
+        return Promise.resolve();
+      });
+      const pause = vi.fn(() => {
+        isPaused = true;
+      });
+      v.play = play;
+      v.pause = pause;
+      return { v, play, pause };
+    }
+    const mount = async (over: Record<string, unknown> = {}) => {
+      const r = render(Player, props({ cue: null, ...over }));
+      await waitFor(() => expect(FakePlayer.instances).toHaveLength(1));
+      return { ...r, handle: r.component as unknown as Handle, engine: FakePlayer.instances[0]! };
+    };
+
+    it('togglePlay plays a paused video', async () => {
+      const { handle } = await mount();
+      const { play, pause } = stubVideo(true);
+      handle.togglePlay();
+      expect(play).toHaveBeenCalledTimes(1);
+      expect(pause).not.toHaveBeenCalled();
+    });
+
+    it('togglePlay pauses a playing video', async () => {
+      const { handle } = await mount();
+      const { play, pause } = stubVideo(false);
+      handle.togglePlay();
+      expect(pause).toHaveBeenCalledTimes(1);
+      expect(play).not.toHaveBeenCalled();
+    });
+
+    it('togglePlay twice plays, then pauses', async () => {
+      const { handle } = await mount();
+      const { play, pause } = stubVideo(true);
+      handle.togglePlay();
+      handle.togglePlay();
+      expect(play).toHaveBeenCalledTimes(1);
+      expect(pause).toHaveBeenCalledTimes(1);
+    });
+
+    it('togglePlay shows no error when the browser refuses autoplay', async () => {
+      const { handle } = await mount();
+      const { v } = stubVideo(true);
+      v.play = vi.fn(() => Promise.reject(new DOMException('blocked', 'NotAllowedError')));
+      handle.togglePlay();
+      await Promise.resolve();
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('skip(+10 s) seeks the engine 10 s past the playhead', async () => {
+      const { handle, engine } = await mount();
+      stubVideo(false, 42.5);
+      handle.skip(10_000);
+      expect(engine.seeks).toEqual([52_500]);
+    });
+
+    it('skip(-10 s) seeks 10 s before the playhead', async () => {
+      const { handle, engine } = await mount();
+      stubVideo(false, 42.5);
+      handle.skip(-10_000);
+      expect(engine.seeks).toEqual([32_500]);
+    });
+
+    it('skip never goes before the start', async () => {
+      const { handle, engine } = await mount();
+      stubVideo(false, 4);
+      handle.skip(-10_000);
+      expect(engine.seeks).toEqual([0]);
+    });
   });
 
   it('destroys the engine on unmount', async () => {

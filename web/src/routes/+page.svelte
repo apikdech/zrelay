@@ -176,6 +176,8 @@
   }
 
   function onkeydown(e: KeyboardEvent): void {
+    // A modal dialog (the export confirmation) owns the keyboard: nothing behind it may react.
+    if (document.querySelector('[aria-modal="true"]')) return;
     const cmd = commandFor(e);
     if (cmd === null) return;
     e.preventDefault();

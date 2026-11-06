@@ -16,6 +16,24 @@
   let dialog: HTMLDivElement;
   onMount(() => dialog.focus());
 
+  /** Keeps Tab inside the dialog: it wraps between the enabled buttons, and stays on the dialog when there are none. */
+  function trapTab(e: KeyboardEvent): void {
+    const items = [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled)')];
+    const first = items[0];
+    const last = items[items.length - 1];
+    const at = document.activeElement;
+    if (!first || !last) {
+      e.preventDefault();
+      dialog.focus();
+    } else if (e.shiftKey && (at === first || at === dialog)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (at === last || at === dialog)) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   const mib = (n: number): string => `${(n / (1 << 20)).toFixed(1)} MiB`;
 </script>
 
@@ -27,6 +45,7 @@
     aria-labelledby="export-title"
     tabindex="-1"
     onkeydown={(e) => {
+      if (e.key === 'Tab') trapTab(e);
       if (e.key === 'Escape' && !busy) {
         e.stopPropagation();
         onCancel();
