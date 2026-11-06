@@ -650,6 +650,46 @@ func TestRunTranslatesHubAndTrackerIntoMachineInputs(t *testing.T) {
 	}
 }
 
+func TestRunShortEventBeforeSyncStillOpensClip(t *testing.T) {
+	fc := clock.NewFake(t0)
+	hub := camera.NewHub(cameraID)
+	sub := hub.Subscribe(camera.ClassRecorder, 4096)
+	tracker := events.NewTracker(time.Minute, fc)
+	out := &fakeOutput{}
+	rg := ring.New(time.Second, 64<<20, nil)
+	m := clip.New(clip.Config{Camera: cameraID, PostRoll: 5 * time.Second}, fc, rg, out)
+
+	// Pre-roll is already in the ring and the event has come and gone (one
+	// PullMessages reply carrying true then false) before the recorder
+	// goroutine ever looks at the tracker.
+	c, gops := fixture(t, t0)
+	m.OnCodec(c, camera.TimeSourceRTCP)
+	for _, g := range gops[:2] {
+		for _, au := range g.AUs {
+			m.OnVideo(au)
+		}
+	}
+	tracker.Apply(events.Signal{Camera: cameraID, Kind: events.KindPerson, Active: true, At: time.Now()})
+	tracker.Apply(events.Signal{Camera: cameraID, Kind: events.KindPerson, Active: false, At: time.Now()})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { recorder.Run(ctx, sub, tracker, m); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	eventually(t, "state PostRoll", func() bool { return m.State() == "PostRoll" })
+	w := out.last()
+	if w == nil {
+		t.Fatal("no clip opened for an event that ended before the recorder synced")
+	}
+	fc.Advance(6 * time.Second)
+	eventually(t, "clip finalized by Tick", func() bool { return w.finalInfo() != nil })
+	f := w.finalInfo()
+	if len(f.Triggers) != 1 || f.Triggers[0].Kind != events.KindPerson {
+		t.Errorf("triggers = %+v, want one person trigger", f.Triggers)
+	}
+}
+
 func TestRunShutdownFinalizesOpenClip(t *testing.T) {
 	fc := clock.NewFake(t0)
 	hub := camera.NewHub(cameraID)

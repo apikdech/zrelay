@@ -19,12 +19,16 @@ type Tracker struct {
 	mu sync.Mutex
 	// lastActive holds each active kind and when it was last seen active.
 	lastActive map[Kind]time.Time
+	// activated latches each kind that went active since TakeActivated was
+	// last called, even if it has gone inactive again since, so a short
+	// event is not lost between two reads of the snapshot.
+	activated map[Kind]struct{}
 }
 
 // NewTracker returns a Tracker that forces a kind inactive timeout after its
 // last active signal.
 func NewTracker(timeout time.Duration, clk clock.Clock) *Tracker {
-	return &Tracker{timeout: timeout, clk: clk, changes: make(chan struct{}, 1), lastActive: map[Kind]time.Time{}}
+	return &Tracker{timeout: timeout, clk: clk, changes: make(chan struct{}, 1), lastActive: map[Kind]time.Time{}, activated: map[Kind]struct{}{}}
 }
 
 // Apply records s. An active signal activates its kind, or refreshes its
@@ -38,6 +42,7 @@ func (t *Tracker) Apply(s Signal) {
 	case s.Active:
 		t.lastActive[s.Kind] = t.clk.Now()
 		if !was {
+			t.activated[s.Kind] = struct{}{}
 			t.notify()
 		}
 	case s.Initialized:
@@ -86,6 +91,22 @@ func (t *Tracker) Active() []Kind {
 	for k := range t.lastActive {
 		out = append(out, k)
 	}
+	slices.Sort(out)
+	return out
+}
+
+// TakeActivated returns, sorted, every kind that went active since the last
+// call, including those already inactive again, and clears the latch. It lets
+// the recorder see an event that started and ended between two reads of
+// Active (relay-spec §4.4: every event with an active state starts a clip).
+func (t *Tracker) TakeActivated() []Kind {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]Kind, 0, len(t.activated))
+	for k := range t.activated {
+		out = append(out, k)
+	}
+	clear(t.activated)
 	slices.Sort(out)
 	return out
 }

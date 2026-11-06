@@ -124,3 +124,25 @@ func TestResetAll(t *testing.T) {
 		t.Fatal("ResetAll with nothing active signalled a change")
 	}
 }
+
+func TestTrackerTakeActivatedLatchesShortEvent(t *testing.T) {
+	tr := events.NewTracker(60*time.Second, clock.NewFake(t0))
+	tr.Apply(signal(events.KindPerson, true, false, t0))
+	tr.Apply(signal(events.KindPerson, false, false, t0))
+	tr.Apply(signal(events.KindMotion, true, false, t0))
+	if got := tr.Active(); !slices.Equal(got, []events.Kind{events.KindMotion}) {
+		t.Fatalf("Active() = %v, want only motion", got)
+	}
+	// person went active then inactive before anyone looked: still reported.
+	if got, want := tr.TakeActivated(), []events.Kind{events.KindMotion, events.KindPerson}; !slices.Equal(got, want) {
+		t.Fatalf("TakeActivated() = %v, want %v", got, want)
+	}
+	if got := tr.TakeActivated(); len(got) != 0 {
+		t.Fatalf("second TakeActivated() = %v, want none (latch consumed)", got)
+	}
+	// A refresh of an already-active kind is not a new activation.
+	tr.Apply(signal(events.KindMotion, true, false, t0))
+	if got := tr.TakeActivated(); len(got) != 0 {
+		t.Fatalf("TakeActivated() after refresh = %v, want none", got)
+	}
+}
