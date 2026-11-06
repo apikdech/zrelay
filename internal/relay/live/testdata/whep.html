@@ -1,0 +1,63 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WHEP test page</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; max-width: 720px; }
+  textarea, input { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+  video { width: 100%; background: #000; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>WHEP test page</h1>
+<p>Serve this file from the same origin as <code>/live/*</code> (for example through the
+zview-server proxy), or open it against a signaling port you can reach.</p>
+<label>Bearer token (unpadded base64url of K_api)
+  <textarea id="token" rows="2" autocomplete="off" spellcheck="false"></textarea>
+</label>
+<label>Camera id <input id="camera" value="tapo-c220"></label>
+<button id="start">Start</button> <button id="stop" disabled>Stop</button>
+<video id="video" autoplay muted playsinline controls></video>
+<pre id="log"></pre>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let pc = null, resource = null;
+  const log = (m) => { $('log').textContent += m + '\n'; };
+
+  async function start() {
+    const token = $('token').value.trim(), cam = $('camera').value.trim();
+    pc = new RTCPeerConnection();
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.ontrack = (e) => { $('video').srcObject = e.streams[0] || new MediaStream([e.track]); };
+    pc.oniceconnectionstatechange = () => log('ice: ' + pc.iceConnectionState);
+    await pc.setLocalDescription(await pc.createOffer());
+    // Non-trickle: wait for gathering to finish before posting.
+    await new Promise((res) => {
+      if (pc.iceGatheringState === 'complete') return res();
+      pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && res();
+    });
+    const r = await fetch('/live/' + encodeURIComponent(cam), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp', 'Authorization': 'Bearer ' + token },
+      body: pc.localDescription.sdp,
+    });
+    if (r.status !== 201) { log('POST failed: ' + r.status + ' ' + await r.text()); pc.close(); return; }
+    resource = r.headers.get('Location');
+    await pc.setRemoteDescription({ type: 'answer', sdp: await r.text() });
+    log('connected, resource ' + resource);
+    $('start').disabled = true; $('stop').disabled = false;
+  }
+
+  async function stop() {
+    if (resource) {
+      await fetch(resource, { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + $('token').value.trim() } });
+    }
+    if (pc) pc.close();
+    pc = resource = null;
+    $('start').disabled = false; $('stop').disabled = true;
+    log('stopped');
+  }
+
+  $('start').onclick = () => start().catch((e) => log('error: ' + e));
+  $('stop').onclick = () => stop().catch((e) => log('error: ' + e));
+</script>

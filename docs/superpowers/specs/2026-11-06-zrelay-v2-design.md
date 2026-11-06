@@ -395,11 +395,11 @@ ring_bytes    = B × (pre_roll_seconds + G) × 1.25
 active_bytes  = 2 × chunk_size + B × G + part_size_mib × MiB
 queue_bytes   = (recorder_queue_frames + viewer_queue_frames × live.max_viewers) × B / fps_est   # fps_est = 15
 camera_bytes  = ring_bytes + active_bytes + queue_bytes
-live_bytes    = live.max_viewers × 2 MiB                                   # pion buffers, estimate
+live_bytes    = live.max_viewers × 3 MiB                                   # pion buffers; measured ≈ 2.2 MiB/viewer (Task 11)
 total         = Σ camera_bytes + live_bytes + egress_backlog_mb + 32 MiB
 ```
 
-`config check` fails if `total > 0.8 × max_memory_mb`. The per-viewer queue term is a coarse estimate. Phase 2 measures real usage and adjusts the constant.
+`config check` fails if `total > 0.8 × max_memory_mb`. The per-viewer queue term is a coarse estimate. The live constant was measured in Task 11 (`BenchmarkViewerMemory`: four in-process-server viewers at 400 KiB/s, clients in separate processes): about 2.2 MiB of heap and stacks per additional viewer, so `LivePerViewerBytes` is 3 MiB. Queued access units are shared by pointer between subscribers, so a lagging viewer adds no copy; the `queue_bytes` term (frames × B / `fps_est`) overstates real use and stays as a conservative bound.
 
 ### 8.2 `zview-server` (`ui-spec §3.6` amended)
 
