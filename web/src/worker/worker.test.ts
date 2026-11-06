@@ -25,6 +25,7 @@ function harness(opts: Partial<ServerOpts> = {}, idb = new IDBFactory()) {
   const server = mockServer({ token, ...opts });
   const worker = createWorker({ fetch: server.fetch, indexedDB: idb });
   const replies: unknown[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const call = async <T = any>(msg: Request): Promise<T> => {
     const { result, transfer } = await worker.handle(msg);
     const copy = structuredClone(result, { transfer });
@@ -265,7 +266,10 @@ describe('clip.read', () => {
     }
     const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
     let off = 0;
-    for (const p of parts) (all.set(p, off), (off += p.length));
+    for (const p of parts) {
+      all.set(p, off);
+      off += p.length;
+    }
     expect(await sha256Hex(all)).toBe(manifest.positive.find((p) => p.name === 'two-and-half-chunks')!.plaintext_sha256_hex);
   });
 
@@ -291,11 +295,19 @@ describe('clip.read', () => {
     expect((err as ErrAuth).chunk).toBe(1);
   });
 
-  it('treats a recovered clip tail as truncated, not corrupt, when the sidecar says incomplete', async () => {
-    const h = harness({ video: loadVector('neg-bitflip-chunk.zrec'), sidecar: sidecarFor(131072, 1, { status: 'incomplete', end_time: null, duration_ms: null, end_reason: 'recovered' }, { plaintext_size_bytes: null, seek_index: [] }) });
+  it('reports a damaged last chunk as truncated when the sidecar says incomplete', async () => {
+    const video = loadVector('pos-two-chunks.zrec').slice();
+    video[video.length - 1] = video[video.length - 1]! ^ 0xff;
+    const incomplete = sidecarFor(131072, 1, { status: 'incomplete', end_time: null, duration_ms: null, end_reason: 'recovered' }, { plaintext_size_bytes: null, seek_index: [] });
+    const h = harness({ video, sidecar: incomplete });
     await importVectorKey(h);
     await h.call({ type: 'clip.open', clipId: CLIP });
     await expect(h.call({ type: 'clip.read', clipId: CLIP, chunk: 1 })).rejects.toMatchObject({ name: 'ErrTruncated' });
+
+    const complete = harness({ video, sidecar: sidecarFor(131072, 1) });
+    await importVectorKey(complete);
+    await complete.call({ type: 'clip.open', clipId: CLIP });
+    await expect(complete.call({ type: 'clip.read', clipId: CLIP, chunk: 1 })).rejects.toMatchObject({ name: 'ErrAuth' });
   });
 
   it('rejects an out-of-range chunk index', async () => {

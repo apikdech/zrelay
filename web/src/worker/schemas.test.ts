@@ -73,7 +73,7 @@ describe('parseSidecar', () => {
   });
 
   it('accepts an incomplete clip with null end, duration and plaintext size', () => {
-    const s = { ...good(), status: 'incomplete', end_time: null, duration_ms: null, end_reason: 'recovered' };
+    const s: Record<string, unknown> = { ...good(), status: 'incomplete', end_time: null, duration_ms: null, end_reason: 'recovered' };
     s.video = { ...(s.video as object), plaintext_size_bytes: null, seek_index: [] };
     expect(parseSidecar(s).status).toBe('incomplete');
   });
