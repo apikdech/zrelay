@@ -26,36 +26,96 @@ const MinIOImage = "pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc
 // MinIOBucket is the bucket StartMinIO creates.
 const MinIOBucket = "zrelay-test"
 
+// MinIO is a running MinIO container started by StartRestartableMinIO.
+type MinIO struct {
+	// Endpoint is an http:// URL on the host's mapped port. Restart may
+	// change it, because Docker can map the container port anew.
+	Endpoint  string
+	AccessKey string
+	SecretKey string
+	Bucket    string
+
+	ctr *minio.MinioContainer
+}
+
 // StartMinIO runs a throwaway MinIO container (Docker required) with fresh
 // random root credentials and an empty bucket, and terminates it when the
 // test ends. endpoint is an http:// URL on the host's mapped port.
 func StartMinIO(t *testing.T) (endpoint, accessKey, secretKey, bucket string) {
 	t.Helper()
+	m := StartRestartableMinIO(t)
+	return m.Endpoint, m.AccessKey, m.SecretKey, m.Bucket
+}
+
+// StartRestartableMinIO is StartMinIO for tests that restart the server: the
+// returned MinIO offers Restart.
+func StartRestartableMinIO(t *testing.T) *MinIO {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	accessKey, secretKey = "zrelay-"+randomHex(t, 4), randomHex(t, 20)
-	ctr, err := minio.Run(ctx, MinIOImage, minio.WithUsername(accessKey), minio.WithPassword(secretKey))
+	m := &MinIO{AccessKey: "zrelay-" + randomHex(t, 4), SecretKey: randomHex(t, 20), Bucket: MinIOBucket}
+	ctr, err := minio.Run(ctx, MinIOImage, minio.WithUsername(m.AccessKey), minio.WithPassword(m.SecretKey))
 	testcontainers.CleanupContainer(t, ctr)
 	if err != nil {
 		t.Fatalf("start MinIO: %v", err)
 	}
-	hostPort, err := ctr.ConnectionString(ctx)
+	m.ctr = ctr
+	m.Endpoint = m.endpoint(ctx, t)
+
+	if _, err := m.client().CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(m.Bucket)}); err != nil {
+		t.Fatalf("create MinIO bucket: %v", err)
+	}
+	return m
+}
+
+func (m *MinIO) endpoint(ctx context.Context, t *testing.T) string {
+	t.Helper()
+	hostPort, err := m.ctr.ConnectionString(ctx)
 	if err != nil {
 		t.Fatalf("MinIO endpoint: %v", err)
 	}
-	endpoint = "http://" + hostPort
+	return "http://" + hostPort
+}
 
-	client := awss3.New(awss3.Options{
-		BaseEndpoint: aws.String(endpoint),
+func (m *MinIO) client() *awss3.Client {
+	return awss3.New(awss3.Options{
+		BaseEndpoint: aws.String(m.Endpoint),
 		Region:       "us-east-1",
 		UsePathStyle: true,
-		Credentials:  credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
+		Credentials:  credentials.NewStaticCredentialsProvider(m.AccessKey, m.SecretKey, ""),
 	})
-	if _, err := client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(MinIOBucket)}); err != nil {
-		t.Fatalf("create MinIO bucket: %v", err)
+}
+
+// Restart stops and starts the container, as a power cut and reboot of the
+// NAS would: data on disk survives, the server process's memory (including
+// its cache of in-progress multipart uploads) does not. It returns once the
+// bucket answers again. Endpoint is updated, so callers must rebuild their
+// clients from it.
+func (m *MinIO) Restart(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	grace := 10 * time.Second
+	if err := m.ctr.Stop(ctx, &grace); err != nil {
+		t.Fatalf("stop MinIO: %v", err)
 	}
-	return endpoint, accessKey, secretKey, MinIOBucket
+	if err := m.ctr.Start(ctx); err != nil {
+		t.Fatalf("start MinIO again: %v", err)
+	}
+	m.Endpoint = m.endpoint(ctx, t)
+	c := m.client()
+	for {
+		_, err := c.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(m.Bucket)})
+		if err == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("MinIO bucket not ready after restart: %v", err)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func randomHex(t *testing.T, n int) string {
