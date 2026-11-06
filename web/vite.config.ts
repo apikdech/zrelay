@@ -3,16 +3,18 @@ import tailwindcss from '@tailwindcss/vite';
 import { svelteTesting } from '@testing-library/svelte/vite';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
+import { fsAllow } from './vite-fs-allow.ts';
 import { serviceWorkerPlugin } from './vite-sw-plugin.ts';
 
-// The cross-language zrec vectors live at <repo>/testdata, outside web/.
-const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+// The cross-language zrec vectors live at <repo>/testdata, outside web/; only
+// that directory is allowed beyond the web root (see vite-fs-allow.ts).
+const webRoot = fileURLToPath(new URL('.', import.meta.url));
 
 export default defineConfig({
   // static/ holds the PWA manifest and icons, served at the root.
   publicDir: 'static',
   plugins: [tailwindcss(), svelte(), svelteTesting(), serviceWorkerPlugin()],
-  server: { fs: { allow: [repoRoot] } },
+  server: { fs: { allow: fsAllow(webRoot) } },
   test: {
     include: ['src/**/*.test.ts', 'test-support/**/*.test.ts', '*.test.ts'],
     environment: 'node',
