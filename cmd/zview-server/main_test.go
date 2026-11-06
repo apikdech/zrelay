@@ -3,8 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,5 +132,68 @@ func TestServesAndShutsDownOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("server did not stop after the context was cancelled")
+	}
+}
+
+// The live proxy is mounted: an authorized offer reaches live.upstream.
+func TestMountsLiveProxyOnConfiguredUpstream(t *testing.T) {
+	raw := bytes.Repeat([]byte{7}, 32)
+	sum := sha256.Sum256(raw)
+	auth := "Bearer " + base64.RawURLEncoding.EncodeToString(raw)
+
+	var gotAuth, gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotAuth, gotBody = r.Header.Get("Authorization"), string(b)
+		w.Header().Set("Location", "/live/front/s1")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer upstream.Close()
+
+	cfg := writeConfig(t, "127.0.0.1:0")
+	b, _ := os.ReadFile(cfg)
+	b = []byte(strings.Replace(string(b), tokenHash, hex.EncodeToString(sum[:]), 1))
+	b = append(b, []byte("live:\n  upstream: "+upstream.URL+"\n")...)
+	if err := os.WriteFile(cfg, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addrCh := make(chan string, 1)
+	done := make(chan int, 1)
+	var errb bytes.Buffer
+	go func() {
+		done <- run(ctx, []string{"--config", cfg}, &bytes.Buffer{}, &errb, func(addr string) { addrCh <- addr })
+	}()
+	var addr string
+	select {
+	case addr = <-addrCh:
+	case code := <-done:
+		t.Fatalf("run returned %d before listening: %s", code, errb.String())
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not start")
+	}
+
+	req, _ := http.NewRequest("POST", "http://"+addr+"/live/front", strings.NewReader("v=0\r\n"))
+	req.Header.Set("Authorization", auth)
+	req.Header.Set("Content-Type", "application/sdp")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || resp.Header.Get("Location") != "/live/front/s1" {
+		t.Errorf("POST /live/front = %d, Location %q; want 201 from the upstream", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if gotAuth != auth || gotBody != "v=0\r\n" {
+		t.Errorf("upstream saw auth %q body %q", gotAuth, gotBody)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not stop")
 	}
 }

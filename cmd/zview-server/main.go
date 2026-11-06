@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/apikdech/zrelay-v2/internal/bearer"
 	"github.com/apikdech/zrelay-v2/internal/clock"
 	"github.com/apikdech/zrelay-v2/internal/zview"
 	"github.com/apikdech/zrelay-v2/pkg/secretref"
@@ -87,9 +88,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 	defer store.Close()
 
 	idx := zview.NewIndex(store, cfg.Index, clock.Real)
-	// The live proxy (design §7.1) is mounted by passing its handler here; a
-	// nil handler leaves /live/ answering 404.
-	handler := zview.NewServer(cfg, idx, store, nil)
+	// The live proxy (design §7.1) forwards WHEP signaling to zrelay.
+	// LoadConfig has already validated the hashes, so bearer.New cannot fail.
+	verifier, _ := bearer.New(cfg.Server.APITokenSHA256)
+	handler := zview.NewServer(cfg, idx, store, zview.NewLiveProxy(cfg.Live.Upstream, verifier))
 
 	ln, err := net.Listen("tcp", cfg.Server.Listen)
 	if err != nil {

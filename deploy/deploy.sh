@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build and start the zrelay containers (design §8.3).
+# Build and start the zrelay and zview-server containers (design §8.3).
 # TAILSCALE_IP is taken from `tailscale ip -4` when it is not set.
 set -eu
 cd "$(dirname "$0")/.."
@@ -13,4 +13,14 @@ if [ -z "$TAILSCALE_IP" ]; then
 fi
 export TAILSCALE_IP
 
+# Both services need their config and secrets before they can start.
+for f in .env zrelay.yaml zview.yaml secrets/zrelay_master secrets/s3_secret_key \
+	secrets/api_token_sha256 secrets/s3_ro_secret_key; do
+	if [ ! -e "deploy/$f" ]; then
+		echo "deploy.sh: deploy/$f is missing (see the header of deploy/compose.yaml)" >&2
+		exit 1
+	fi
+done
+
+# Builds and starts zrelay and zview-server.
 docker compose -f deploy/compose.yaml up -d --build
