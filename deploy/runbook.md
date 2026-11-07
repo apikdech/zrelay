@@ -115,9 +115,12 @@ what zview-server needs:
 
 ```sh
 # Master key into the file the container reads (no trailing newline needed).
+# Paste the key at the silent prompt: it is never typed into a command line,
+# so it stays out of shell history and `ps` output.
 umask 077
 mkdir -p deploy/secrets
-printf '%s' 'zk1-...' > deploy/secrets/zrelay_master
+echo "Paste the master key, then press Enter (nothing is echoed):"
+read -rs KEY && printf '%s' "$KEY" > deploy/secrets/zrelay_master; unset KEY
 
 # Hash of the API credential, for the live-view and API bearer check.
 ZR_KEY=$(cat deploy/secrets/zrelay_master) \
@@ -132,6 +135,9 @@ zview-server read it from the same file. To rotate the credential, put two hashe
 (`api_token_sha256` accepts up to two) while the family switches over.
 
 Every `--key` flag takes a reference (`ENV:NAME` or `FILE:/path`), never the literal key.
+Likewise never paste the key into any shell command: it would persist in `~/.zsh_history` or
+`~/.bash_history`, a plaintext copy outside `deploy/secrets` that `chmod 600` does not cover. If
+you did, delete that history entry (and any synced or backed-up copy of the history file).
 
 ## 5. Docker secrets and the environment file
 
