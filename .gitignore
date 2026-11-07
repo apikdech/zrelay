@@ -20,3 +20,5 @@ web/playwright-report/
 deploy/secrets/
 deploy/zrelay.yaml
 deploy/zview.yaml
+
+.claude/
