@@ -132,7 +132,7 @@ func writeFiles(dir, appDir string, m zrec.MasterKey, rtspPort, onvifPort int) e
 		{"secrets/api_token_sha256", hex.EncodeToString(sum[:]) + "\n"},
 		{".env", fmt.Sprintf("CAMERA_IP=127.0.0.1\nCAMERA_USERNAME=%s\nCAMERA_PASSWORD=%s\nRESTREAM_USER=%s\nRESTREAM_PASS=%s\n",
 			cameraUser, cameraPass, restreamUser, restreamPass)},
-		{"zrelay.yaml", fmt.Sprintf(`# Written by the demo helper; rewritten on every start (the camera ports change).
+		{"zrelay.yaml", fmt.Sprintf(`# The demo helper writes this file again at each start, because the camera ports change.
 version: 2
 relay:
   id: "demo"
@@ -145,7 +145,7 @@ encryption:
   master_key: "FILE:%[1]s/zrelay_master"
   chunk_size_kib: 1024
 storage:
-  driver: "local"               # production uses s3 (MinIO); see deploy/zrelay.example.yaml
+  driver: "local"               # production uses s3 (MinIO). See deploy/zrelay.example.yaml.
   root: "zrelay"
   local:
     base_dir: %[2]q
@@ -174,7 +174,7 @@ cameras:
     rtsp: { port: %[4]d, path: "/stream1" }
     events: { source: "onvif", port: %[5]d }
 `, secrets, archive, cameraID, rtspPort, onvifPort)},
-		{"zview.yaml", fmt.Sprintf(`# Written by the demo helper.
+		{"zview.yaml", fmt.Sprintf(`# The demo helper writes this file.
 version: 2
 server:
   listen: "127.0.0.1:8080"
@@ -215,7 +215,7 @@ func trigger(ctx context.Context, cam *testutil.FakeONVIF, every, active time.Du
 			return
 		case <-tick.C:
 		}
-		fmt.Fprintf(stderr, "demo: %s motion + person for %s\n", time.Now().UTC().Format(time.TimeOnly), active)
+		fmt.Fprintf(stderr, "demo: %s: the camera reports motion and a person for %s\n", time.Now().UTC().Format(time.TimeOnly), active)
 		set(true)
 		select {
 		case <-ctx.Done():
@@ -241,11 +241,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 		return 2
 	}
 	if fs.NArg() != 0 || *every <= 0 || *active <= 0 || *active >= *every {
-		fmt.Fprintln(stderr, "usage: demo [--dir .demo] [--every 60s] [--active 8s] (active < every)")
+		fmt.Fprintln(stderr, "usage: demo [--dir .demo] [--every 60s] [--active 8s] (--active must be less than --every)")
 		return 2
 	}
 	if _, err := os.Stat(*fixture); err != nil {
-		fmt.Fprintf(stderr, "demo: %v (run from the repository root)\n", err)
+		fmt.Fprintf(stderr, "demo: %v (run the demo from the repository root)\n", err)
 		return 2
 	}
 	absDir, err := filepath.Abs(*dir)
@@ -307,21 +307,27 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, ready fun
 	}()
 
 	d := *dir
-	fmt.Fprintf(stdout, `Demo camera %q is running: RTSP on 127.0.0.1:%d, ONVIF on 127.0.0.1:%d.
-It reports motion and a person every %s for %s. Configs and secrets are in %s.
+	fmt.Fprintf(stdout, `The demo camera %q runs. RTSP: 127.0.0.1:%d. ONVIF: 127.0.0.1:%d.
+Every %s, it reports motion and a person for %s.
+The configuration files and the secrets are in %s.
 
-1. Start the relay (second terminal, repository root):
+1. In a second terminal, go to the repository root. Start the relay:
      go run ./cmd/zrelay --env-file %s/.env run --config %s/zrelay.yaml
-2. Build the web app once, then start the viewer (third terminal):
+2. Build the web app one time:
      (cd web && pnpm install && pnpm build)
+3. In a third terminal, start the viewer:
      go run ./cmd/zview-server --config %s/zview.yaml
-3. Open http://127.0.0.1:8080 and import this throwaway demo master key:
+4. Open http://127.0.0.1:8080.
+5. Import this temporary demo master key:
      %s
-   Clips appear on the Timeline after the first event; the Live tab shows the camera.
-4. Optional: the RTSP restream plays in VLC at rtsp://%s:%s@127.0.0.1:8554/%s
+6. Look at the Timeline. The first clip shows after the first event.
+   The Live tab shows the camera.
+7. Optional: play the RTSP restream in VLC:
+     rtsp://%s:%s@127.0.0.1:8554/%s
 
-Clips are written under %s/archive. Ctrl-C stops the camera. The key is kept
-across runs; restart zrelay after restarting the demo (the camera ports change).
+The clips are in %s/archive. Push Ctrl-C to stop the camera.
+The next run uses the same key. After you start the demo again, start zrelay
+again, because the camera ports change.
 `, cameraID, rtspPort, cam.Port, *every, *active, d, d, d, d, master.String(), restreamUser, restreamPass, cameraID, d)
 
 	if ready != nil {

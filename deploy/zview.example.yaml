@@ -4,7 +4,7 @@ version: 2
 server:
   listen: "0.0.0.0:8080"              # behind tailscale serve
   api_token_sha256: ["FILE:/run/secrets/api_token_sha256"]   # one or two hex SHA-256(K_api) hashes
-  app_dir: "/app"                     # built SPA, baked into the image
+  app_dir: "/app"                     # the built web app, which is in the image
 
 storage:
   driver: "s3"                        # s3 | local (tests)
@@ -20,11 +20,11 @@ storage:
   #   base_dir: "/tmp/zrelay-test"
 
 index:
-  hot_refresh_seconds: 30             # yesterday, today and tomorrow (UTC) are re-listed at most this often
-  cold_cache_days: 60                 # LRU of older day indexes
-  assumed_max_clip_seconds: 300       # bounds an incomplete clip's end time
-  retention_days: 30                  # match the MinIO ILM --expire-days (design §6.7)
-  cameras_fallback: []                # used only when status/relay.json is missing or stale
+  hot_refresh_seconds: 30             # zview lists yesterday, today and tomorrow (UTC) again at most this often
+  cold_cache_days: 60                 # number of older day indexes in the cache (LRU)
+  assumed_max_clip_seconds: 300       # the maximum end time of an incomplete clip
+  retention_days: 30                  # use the same value as the MinIO ILM --expire-days (design §6.7)
+  cameras_fallback: []                # zview uses this list only if status/relay.json is missing or old
 
 live:
   upstream: "http://zrelay:9465"

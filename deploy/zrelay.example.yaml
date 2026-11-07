@@ -16,7 +16,7 @@ storage:
   driver: "s3"                        # s3 | local (tests)
   root: "zrelay"
   s3:
-    endpoint: "ENV:S3_ENDPOINT"       # e.g. https://nas.<tailnet>.ts.net:9000
+    endpoint: "ENV:S3_ENDPOINT"       # for example https://nas.<tailnet>.ts.net:9000
     region: "us-east-1"
     bucket: "cctv"
     use_path_style: true
@@ -55,7 +55,7 @@ defaults:
 cameras:
   - id: "tapo-c220"
     name: "Tapo C220"
-    brand: "tapo"                     # tapo + no rules → built-in rules (§4.3)
+    brand: "tapo"                     # tapo without rules: zrelay uses the built-in rules (design §4.3)
     tags: ["interior"]
     host: "ENV:CAMERA_IP"
     credentials:
