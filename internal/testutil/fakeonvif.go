@@ -23,6 +23,17 @@ type FakeONVIFOpts struct {
 	// Username and Password are the credentials the WS-UsernameToken digest
 	// is checked against. They default to "admin" and "secret".
 	Username, Password string
+	// EventPath, if set, is the only path that serves the event service
+	// (CreatePullPointSubscription, GetEventProperties); any other path
+	// answers 404. The fake then also answers GetCapabilities and
+	// GetServices at "/onvif/device_service", naming the event service by an
+	// XAddr on EventPath at the camera's own address 192.0.2.77 (not the
+	// configured host). Empty, every path serves every operation and the
+	// discovery operations are unsupported, like a Tapo camera.
+	EventPath string
+	// NoGetCapabilities makes GetCapabilities a SOAP fault, so that only
+	// GetServices discovers the event service.
+	NoGetCapabilities bool
 }
 
 // RecordedRequest is one SOAP request the fake camera received.
@@ -275,9 +286,28 @@ func (f *FakeONVIF) serve(w http.ResponseWriter, r *http.Request) {
 		writeFault(w, http.StatusBadRequest, "ter:NotAuthorized", "Sender not authorized")
 		return
 	}
+	if f.opts.EventPath != "" && r.URL.Path != f.opts.EventPath && (op == "CreatePullPointSubscription" || op == "GetEventProperties") {
+		w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
 	switch op {
 	case "GetSystemDateAndTime":
 		writeEnvelope(w, systemDateAndTime(camNow))
+	case "GetCapabilities":
+		if f.opts.EventPath == "" || f.opts.NoGetCapabilities || r.URL.Path != "/onvif/device_service" {
+			writeFault(w, http.StatusBadRequest, "ter:ActionNotSupported", "unsupported")
+			return
+		}
+		writeEnvelope(w, fmt.Sprintf(`<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events><tt:XAddr>%s</tt:XAddr><tt:WSSubscriptionPolicySupport>true</tt:WSSubscriptionPolicySupport></tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse>`,
+			escape(f.eventXAddr())))
+	case "GetServices":
+		if f.opts.EventPath == "" || r.URL.Path != "/onvif/device_service" {
+			writeFault(w, http.StatusBadRequest, "ter:ActionNotSupported", "unsupported")
+			return
+		}
+		writeEnvelope(w, fmt.Sprintf(`<tds:GetServicesResponse><tds:Service><tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace><tds:XAddr>http://192.0.2.77:%d/onvif/device_service</tds:XAddr></tds:Service><tds:Service><tds:Namespace>http://www.onvif.org/ver10/events/wsdl</tds:Namespace><tds:XAddr>%s</tds:XAddr></tds:Service></tds:GetServicesResponse>`,
+			f.Port, escape(f.eventXAddr())))
 	case "CreatePullPointSubscription":
 		f.mu.Lock()
 		f.subSeq++
@@ -302,6 +332,12 @@ func (f *FakeONVIF) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeFault(w, http.StatusBadRequest, "ter:ActionNotSupported", "unsupported")
 	}
+}
+
+// eventXAddr is the event service address the fake advertises: the camera's
+// own address, not the one the relay was configured with.
+func (f *FakeONVIF) eventXAddr() string {
+	return fmt.Sprintf("http://192.0.2.77:%d%s", f.Port, f.opts.EventPath)
 }
 
 // eventProperties renders the topic set as a Tapo camera does: the first

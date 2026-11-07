@@ -627,3 +627,155 @@ func TestResponseCappedAt1MiB(t *testing.T) {
 		t.Fatalf("oversized reply counted as %d transport retries", got)
 	}
 }
+
+// A camera that accepts CreatePullPointSubscription but rejects every
+// PullMessages must not be resubscribed every 6 s: the backoff keeps growing
+// 5, 10, 20, 40, 60, 60 s, because a subscription that never pulled
+// successfully is not healthy (design §4.3).
+func TestResubscribeBackoffGrowsWhenCreateWorksButPullFails(t *testing.T) {
+	h := newHarness(t)
+	for range 6 {
+		h.fake.Fault("PullMessages")
+	}
+	h.start()
+	for i, d := range []time.Duration{5, 10, 20, 40, 60, 60} {
+		d *= time.Second
+		h.following()
+		h.clk.Advance(time.Second) // the pull that fails
+		h.waitFor("Unsubscribe", func() bool { return h.fake.Count("Unsubscribe") == i+1 })
+		h.blockUntil(1) // the backoff sleep
+		h.clk.Advance(d - time.Millisecond)
+		if h.clk.Pending() != 1 {
+			t.Fatalf("cycle %d: backoff shorter than %v", i+1, d)
+		}
+		h.clk.Advance(time.Millisecond)
+		h.waitFor("next create attempt", func() bool { return h.fake.Count("CreatePullPointSubscription") == i+2 })
+	}
+}
+
+// newDiscoveryHarness is a harness whose fake camera serves its event
+// service only at /onvif/event_service, reachable by GetCapabilities or
+// GetServices on the device service.
+func newDiscoveryHarness(t *testing.T, opts testutil.FakeONVIFOpts) *harness {
+	t.Helper()
+	opts.Username, opts.Password = "admin", "s3cret"
+	opts.EventPath = "/onvif/event_service"
+	h := newHarness(t)
+	h.fake = testutil.StartFakeONVIF(t, opts)
+	h.pp.Host, h.pp.Port = h.fake.Host, h.fake.Port
+	return h
+}
+
+// checkDiscovered fails unless the event service was found at the camera's
+// advertised path on the configured host and port, never on the host the
+// camera named, and was not looked up again.
+func checkDiscovered(t *testing.T, h *harness, lookup string) {
+	t.Helper()
+	h.following()
+	if n := h.fake.Count("CreatePullPointSubscription"); n < 2 {
+		t.Fatalf("%d CreatePullPointSubscription requests, want a failure at the default path and a success", n)
+	}
+	last := lastRequest(t, h.fake, "CreatePullPointSubscription")
+	if last.Path != "/onvif/event_service" || last.Host != fmt.Sprintf("%s:%d", h.fake.Host, h.fake.Port) {
+		t.Fatalf("subscribed at %s%s, want the configured host with /onvif/event_service", last.Host, last.Path)
+	}
+	for _, r := range h.fake.Requests() {
+		if strings.Contains(r.Host, "192.0.2.77") {
+			t.Fatalf("%s sent to the camera-named host %s", r.Op, r.Host)
+		}
+	}
+	if n := h.fake.Count(lookup); n != 1 {
+		t.Fatalf("%d %s requests, want 1", n, lookup)
+	}
+	if got := h.gotReady(); !slices.Equal(got, []bool{true}) {
+		t.Fatalf("ready calls = %v, want [true]", got)
+	}
+}
+
+// With events.service_path unset and the default path failing, the event
+// service is found with GetCapabilities (design §4.3).
+func TestEndpointDiscoveredByGetCapabilities(t *testing.T) {
+	h := newDiscoveryHarness(t, testutil.FakeONVIFOpts{})
+	h.start()
+	checkDiscovered(t, h, "GetCapabilities")
+	dev := lastRequest(t, h.fake, "GetCapabilities")
+	if dev.Path != "/onvif/device_service" || !strings.Contains(dev.Body, "Events") {
+		t.Fatalf("GetCapabilities to %s with body %q, want the device service asking for Events", dev.Path, dev.Body)
+	}
+}
+
+// GetServices is the fallback when GetCapabilities is refused.
+func TestEndpointDiscoveredByGetServicesFallback(t *testing.T) {
+	h := newDiscoveryHarness(t, testutil.FakeONVIFOpts{NoGetCapabilities: true})
+	h.start()
+	checkDiscovered(t, h, "GetServices")
+}
+
+// The discovered endpoint is cached for the session: a resubscribe goes
+// straight to it.
+func TestDiscoveredEndpointCachedAcrossResubscribe(t *testing.T) {
+	h := newDiscoveryHarness(t, testutil.FakeONVIFOpts{})
+	h.start()
+	checkDiscovered(t, h, "GetCapabilities")
+	creates := h.fake.Count("CreatePullPointSubscription")
+	h.fake.FailRenew()
+	h.clk.Advance(60 * time.Second)
+	h.waitFor("Unsubscribe", func() bool { return h.fake.Count("Unsubscribe") == 1 })
+	h.blockUntil(1)
+	h.clk.Advance(5 * time.Second)
+	h.following()
+	if n := h.fake.Count("CreatePullPointSubscription") - creates; n != 1 {
+		t.Fatalf("%d creates after resubscribe, want 1 (no default-path retry)", n)
+	}
+	if n := h.fake.Count("GetCapabilities"); n != 1 {
+		t.Fatalf("%d GetCapabilities requests, want 1", n)
+	}
+}
+
+// An explicit service_path is never second-guessed, and a working default
+// needs no discovery.
+func TestNoDiscoveryWhenPathConfiguredOrDefaultWorks(t *testing.T) {
+	h := newDiscoveryHarness(t, testutil.FakeONVIFOpts{})
+	h.pp.ServicePath = "/onvif/wrong"
+	h.start()
+	h.blockUntil(1)
+	h.waitFor("create attempt", func() bool { return h.fake.Count("CreatePullPointSubscription") == 1 })
+	if n := h.fake.Count("GetCapabilities") + h.fake.Count("GetServices"); n != 0 {
+		t.Fatalf("%d discovery requests with service_path set", n)
+	}
+
+	h2 := newHarness(t)
+	h2.start()
+	h2.following()
+	if n := h2.fake.Count("GetCapabilities") + h2.fake.Count("GetServices"); n != 0 {
+		t.Fatalf("%d discovery requests with a working default path", n)
+	}
+}
+
+// A subscription that has pulled successfully is healthy: when it later
+// fails, the retry is after 5 s again.
+func TestBackoffResetsAfterHealthySubscription(t *testing.T) {
+	h := newHarness(t)
+	for range 3 {
+		h.fake.Fault("PullMessages")
+	}
+	h.start()
+	for i, d := range []time.Duration{5, 10, 20} {
+		h.following()
+		h.clk.Advance(time.Second)
+		h.waitFor("Unsubscribe", func() bool { return h.fake.Count("Unsubscribe") == i+1 })
+		h.blockUntil(1)
+		h.clk.Advance(d * time.Second)
+	}
+	h.following()
+	h.pull() // a good pull
+	h.fake.FailRenew()
+	h.clk.Advance(60 * time.Second)
+	h.waitFor("Unsubscribe", func() bool { return h.fake.Count("Unsubscribe") == 4 })
+	h.blockUntil(1)
+	h.clk.Advance(5 * time.Second)
+	h.following()
+	if n := h.fake.Count("CreatePullPointSubscription"); n != 5 {
+		t.Fatalf("%d create attempts, want 5 (backoff reset after a healthy subscription)", n)
+	}
+}
