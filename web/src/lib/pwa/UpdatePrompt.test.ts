@@ -34,8 +34,10 @@ function fakeUpdater(available: boolean) {
 }
 
 /** A <video> in the document that reports itself as playing or not. */
-function video(playing: boolean): HTMLVideoElement {
+function video(playing: boolean, kind: 'clip' | 'live' = 'clip'): HTMLVideoElement {
   const v = document.createElement('video');
+  // Player.svelte marks its <video> as clip playback; live tiles carry no mark.
+  if (kind === 'clip') v.setAttribute('data-clip-player', '');
   Object.defineProperty(v, 'paused', { value: !playing, configurable: true });
   Object.defineProperty(v, 'ended', { value: false, configurable: true });
   document.body.append(v);
@@ -72,5 +74,21 @@ describe('UpdatePrompt', () => {
     Object.defineProperty(v, 'paused', { value: true, configurable: true });
     v.dispatchEvent(new Event('pause'));
     await vi.waitFor(() => expect(btn).toBeEnabled());
+  });
+
+  it('does not count a playing live tile as a clip playing', () => {
+    const f = fakeUpdater(true);
+    video(true, 'live');
+    render(UpdatePrompt, { updater: f.u });
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeEnabled();
+    expect(screen.queryByText(/Pause the video to update/)).toBeNull();
+  });
+
+  it('still holds the button when a clip plays next to a live tile', () => {
+    const f = fakeUpdater(true);
+    video(true, 'live');
+    video(true, 'clip');
+    render(UpdatePrompt, { updater: f.u });
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeDisabled();
   });
 });

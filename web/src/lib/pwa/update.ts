@@ -69,7 +69,11 @@ export function createUpdater(o: UpdaterOptions): Updater {
   };
 }
 
-/** Whether any video in the document is playing. */
+/**
+ * Whether a clip is playing. Only clip-playback videos (marked data-clip-player)
+ * count: live tiles autoplay muted with no pause control, so counting them would
+ * hold the Reload button for as long as the Live view is open.
+ */
 export function anyVideoPlaying(doc: Document): boolean {
-  return [...doc.querySelectorAll('video')].some((v) => !v.paused && !v.ended);
+  return [...doc.querySelectorAll('video[data-clip-player]')].some((v) => v instanceof HTMLVideoElement && !v.paused && !v.ended);
 }
