@@ -110,6 +110,17 @@ func New(cfg Config) *Egress {
 	if cfg.Classify == nil {
 		cfg.Classify = func(error) storage.ErrorClass { return storage.Transient }
 	}
+	// A driver that reports a vanished upload through storage.ErrUploadGone
+	// (the s3 driver's Commit does, with a Permanent class) was answered by
+	// storage, so it is NotFound here: Do reports the breaker a success, not a
+	// permanent failure, and persist ends the attempt with errUploadGone.
+	classify := cfg.Classify
+	cfg.Classify = func(err error) storage.ErrorClass {
+		if errors.Is(err, storage.ErrUploadGone) {
+			return storage.NotFound
+		}
+		return classify(err)
+	}
 	e := &Egress{
 		cfg:  cfg,
 		jobs: make(map[*Clip]*job),
