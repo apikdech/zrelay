@@ -24,7 +24,9 @@ type CoverageTracker struct {
 
 	mu        sync.Mutex
 	closed    []span // ascending, non-overlapping, non-touching
-	open      bool   // currently ready
+	open      bool   // currently ready (camera ready and not suppressed)
+	camReady  bool   // the camera itself is ready
+	suppress  bool   // the clip machine is Suppressed: triggers are ignored
 	openStart time.Time
 	last      time.Time // latest SetReady transition; later calls never go backwards
 	drops     []sidecar.Dropped
@@ -38,11 +40,30 @@ func NewCoverageTracker(clk clock.Clock) *CoverageTracker {
 
 // SetReady records that the camera became ready (true) or not ready (false)
 // at the given time. Repeating the current state is a no-op. A transition
-// timestamped before the previous one is moved forward to it.
+// timestamped before the previous one is moved forward to it. A camera that
+// is suppressed (see SetSuppressed) stays out of the ready intervals.
 func (t *CoverageTracker) SetReady(ready bool, at time.Time) {
-	at = at.UTC()
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.camReady = ready
+	t.update(at.UTC())
+}
+
+// SetSuppressed records that the clip machine entered (true) or left (false)
+// the Suppressed state at the given time. A suppressed camera ignores
+// triggers and records nothing, so an event in that time would not have been
+// captured: readiness is the camera being ready and not suppressed.
+func (t *CoverageTracker) SetSuppressed(suppressed bool, at time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.suppress = suppressed
+	t.update(at.UTC())
+}
+
+// update applies the combined readiness at the given time. The caller holds
+// t.mu.
+func (t *CoverageTracker) update(at time.Time) {
+	ready := t.camReady && !t.suppress
 	if at.Before(t.last) {
 		at = t.last
 	}

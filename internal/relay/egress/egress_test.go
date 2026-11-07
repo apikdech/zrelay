@@ -78,6 +78,10 @@ type fakeStore struct {
 	// endpoint); hangWrites does the same for Write. Both count the calls
 	// that entered in hungPuts and hungWrites.
 	hangPuts, hangWrites bool
+	// hangAborts makes Abort block until its ctx ends (a black-holed
+	// endpoint), counted in hungAborts.
+	hangAborts           bool
+	hungAborts           int
 	hungPuts, hungWrites int
 
 	writeCalls, writeErrs, resumes, partAttempts int
@@ -294,6 +298,12 @@ func (o *fakeObj) Commit(ctx context.Context) error {
 func (o *fakeObj) Abort(ctx context.Context) error {
 	s := o.s
 	s.mu.Lock()
+	if s.hangAborts {
+		s.hungAborts++
+		s.mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	defer s.mu.Unlock()
 	s.record("abort", o.key)
 	o.aborted = true
@@ -696,6 +706,57 @@ func TestShutdownWithOpenBreakerExitsWithinGrace(t *testing.T) {
 	}
 	if _, err := r.e.Begin(&recorder.PendingClip{Keys: a.pc.Keys}); err == nil {
 		t.Fatal("Begin succeeded after Shutdown")
+	}
+}
+
+// TestShutdownBoundsTheAbortPhase: the abort of an upload into a black hole
+// hangs until its context ends. ShutdownWithin gives the whole abort phase a
+// budget, so a caller that reserved that time for it (the app, which must
+// leave room for its status flush and the ONVIF unsubscribe) gets control
+// back inside it instead of after the 5 s a single abort may take.
+func TestShutdownBoundsTheAbortPhase(t *testing.T) {
+	st := newFakeStore()
+	st.durableStep = 1 << 30
+	r := newEgressRig(t, 2, 1<<30, st)
+	a := r.begin("front", "A")
+	b := r.begin("back", "B")
+	a.write(t, make([]byte, 100))
+	b.write(t, make([]byte, 100))
+	eventually(t, "both created", func() bool { return st.count("create") == 2 })
+	st.mu.Lock()
+	st.down = true
+	st.hangAborts = true
+	st.mu.Unlock()
+	r.br.Failure(true)
+	a.write(t, make([]byte, 100))
+	b.write(t, make([]byte, 100))
+	eventually(t, "both workers saw the outage", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.writeErrs >= 2
+	})
+
+	const budget = 300 * time.Millisecond
+	res := make(chan int, 1)
+	t0 := time.Now()
+	go func() { res <- r.e.ShutdownWithin(30*time.Second, budget) }()
+	r.clk.BlockUntil(1)
+	r.clk.Advance(30 * time.Second)
+	select {
+	case n := <-res:
+		if n != 2 {
+			t.Fatalf("Shutdown dropped %d clips, want 2", n)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ShutdownWithin did not return within its abort budget")
+	}
+	if took := time.Since(t0); took > budget+250*time.Millisecond {
+		t.Fatalf("abort phase took %v, want about the %v budget", took, budget)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.hungAborts != 2 {
+		t.Fatalf("hung aborts = %d, want both uploads aborted", st.hungAborts)
 	}
 }
 

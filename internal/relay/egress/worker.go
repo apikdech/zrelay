@@ -303,7 +303,7 @@ func (e *Egress) abort(j *job, ow storage.ObjectWriter, staged bool, err error) 
 
 	// A fresh context: the clip's own is already cancelled. Real-time bound,
 	// since storage is likely unreachable.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(e.hctx), abortTimeout)
+	ctx, cancel := e.abortContext()
 	defer cancel()
 	if ow != nil {
 		if aerr := ow.Abort(ctx); aerr != nil {
@@ -341,7 +341,7 @@ func (e *Egress) abortWriter(j *job, ow storage.ObjectWriter) {
 	if ow == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(e.hctx), abortTimeout)
+	ctx, cancel := e.abortContext()
 	defer cancel()
 	if aerr := ow.Abort(ctx); aerr != nil {
 		slog.Warn("egress: abort failed", "key", j.clip.Keys.Video, "error", aerr)
@@ -375,7 +375,7 @@ func (e *Egress) success() {
 func (e *Egress) failure(err error) {
 	e.uploadError(err)
 	if e.cfg.Breaker != nil {
-		e.cfg.Breaker.Failure(e.cfg.Classify(err) == storage.Permanent)
+		e.cfg.Breaker.FailureErr(err, e.cfg.Classify(err) == storage.Permanent)
 	}
 }
 

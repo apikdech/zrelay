@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go"
+
 	"github.com/apikdech/zrelay-v2/internal/clock"
 	"github.com/apikdech/zrelay-v2/internal/relay/app"
 	"github.com/apikdech/zrelay-v2/internal/relay/config"
@@ -277,6 +279,11 @@ type downStorage struct {
 	down atomic.Bool
 	// recoveryFails makes the recovery scan fail while writes still work.
 	recoveryFails atomic.Bool
+	// blackholeAbort makes Abort of an upload that was created while up hang
+	// until its context ends, like a request into a black-holed endpoint.
+	blackholeAbort atomic.Bool
+	// denied makes small writes fail with S3's AccessDenied.
+	denied atomic.Bool
 
 	mu          sync.Mutex
 	healthCalls int
@@ -285,6 +292,11 @@ type downStorage struct {
 }
 
 var errDown = errors.New("connection refused")
+
+// errDenied is what S3 answers for a rotated secret key or a policy that
+// denies the write; the driver classifies it as permanent.
+var errDenied = fmt.Errorf("operation error S3: PutObject, %w",
+	&smithy.GenericAPIError{Code: "AccessDenied", Message: "Access Denied.", Fault: smithy.FaultClient})
 
 func newDown(t *testing.T, base string) *downStorage {
 	t.Helper()
@@ -301,12 +313,41 @@ func (s *downStorage) Create(ctx context.Context, key string) (storage.ObjectWri
 	if s.down.Load() {
 		return nil, errDown
 	}
-	return s.Provider.Create(ctx, key)
+	w, err := s.Provider.Create(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return &downWriter{ObjectWriter: w, s: s}, nil
+}
+
+// downWriter is an upload that fails its writes while the storage is down
+// and may hang its Abort.
+type downWriter struct {
+	storage.ObjectWriter
+	s *downStorage
+}
+
+func (w *downWriter) Write(p []byte) (int, error) {
+	if w.s.down.Load() {
+		return 0, errDown
+	}
+	return w.ObjectWriter.Write(p)
+}
+
+func (w *downWriter) Abort(ctx context.Context) error {
+	if w.s.blackholeAbort.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return w.ObjectWriter.Abort(ctx)
 }
 
 func (s *downStorage) PutSmall(ctx context.Context, key string, data []byte, ct string) error {
 	if s.down.Load() {
 		return errDown
+	}
+	if s.denied.Load() {
+		return errDenied
 	}
 	return s.Provider.PutSmall(ctx, key, data, ct)
 }
@@ -376,6 +417,7 @@ func (s *downStorage) opts(t *testing.T) app.Options {
 type logCapture struct {
 	mu   sync.Mutex
 	recs []string
+	errs []string // the records of level error
 }
 
 func (l *logCapture) Enabled(context.Context, slog.Level) bool { return true }
@@ -388,11 +430,19 @@ func (l *logCapture) Handle(_ context.Context, r slog.Record) error {
 	})
 	l.mu.Lock()
 	l.recs = append(l.recs, b.String())
+	if r.Level >= slog.LevelError {
+		l.errs = append(l.errs, b.String())
+	}
 	l.mu.Unlock()
 	return nil
 }
 func (l *logCapture) WithAttrs([]slog.Attr) slog.Handler { return l }
 func (l *logCapture) WithGroup(string) slog.Handler      { return l }
+func (l *logCapture) errorText() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.errs, "\n")
+}
 func (l *logCapture) text() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()

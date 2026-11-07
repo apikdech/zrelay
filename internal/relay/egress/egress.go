@@ -23,6 +23,9 @@ const (
 	// abortTimeout bounds the Abort and staging cleanup of a dropped clip, in
 	// real time: it runs when storage may be unreachable.
 	abortTimeout = 5 * time.Second
+	// safetySlack is how long past the abort budget Shutdown waits for the
+	// workers, whose requests end on the same deadline, to report back.
+	safetySlack = 50 * time.Millisecond
 	// deleteStagingTries bounds the outer retries of the staging delete.
 	deleteStagingTries = 3
 )
@@ -74,6 +77,11 @@ type Egress struct {
 	// period, or when Run's context ends.
 	hctx    context.Context
 	hcancel context.CancelFunc
+
+	// abortBy is the real-time deadline (UnixNano) of the shutdown abort
+	// phase, or 0 while no shutdown is past its drain. Aborts started after
+	// that point end by it instead of after abortTimeout.
+	abortBy atomic.Int64
 
 	mu    sync.Mutex
 	queue []*job
@@ -289,8 +297,19 @@ func (e *Egress) Run(ctx context.Context) {
 // Shutdown stops accepting clips and waits up to grace for every queued clip
 // to finish. Clips still unfinished then are aborted by their owning workers
 // and recorded as dropped with reason "shutdown"; it returns how many. Run
-// should still be running while Shutdown executes.
+// should still be running while Shutdown executes. The abort phase may take
+// up to abortTimeout; see ShutdownWithin to bound it.
 func (e *Egress) Shutdown(grace time.Duration) (dropped int) {
+	return e.ShutdownWithin(grace, abortTimeout)
+}
+
+// ShutdownWithin is Shutdown with a budget for the abort phase that follows
+// the drain: every abort started after the grace ends by abort (at most
+// abortTimeout) from the end of the grace, and Shutdown returns by then even
+// if a worker is still hung in a request into an unreachable endpoint. A
+// caller that must exit within shutdown_grace_seconds reserves abort for it.
+func (e *Egress) ShutdownWithin(grace, abort time.Duration) (dropped int) {
+	abort = min(abort, abortTimeout)
 	e.mu.Lock()
 	e.shut = true
 	pending := make([]*job, 0, len(e.jobs))
@@ -314,8 +333,12 @@ func (e *Egress) Shutdown(grace time.Duration) (dropped int) {
 	case <-timer.C():
 	}
 
-	// Grace is over. Evict first (that is what makes the owning worker abort
-	// and is what counts the drop), then cancel in-flight requests.
+	// Grace is over. The abort phase has a real-time budget (storage is
+	// probably unreachable). Evict first (that is what makes the owning
+	// worker abort and is what counts the drop), then cancel in-flight
+	// requests.
+	abortEnd := time.Now().Add(abort)
+	e.abortBy.Store(abortEnd.UnixNano())
 	for _, j := range pending {
 		select {
 		case <-j.done:
@@ -337,7 +360,7 @@ func (e *Egress) Shutdown(grace time.Duration) (dropped int) {
 		}
 	}
 	// Workers abort with bounded contexts; do not wait for a hung one forever.
-	safety := time.NewTimer(abortTimeout + 2*time.Second)
+	safety := time.NewTimer(time.Until(abortEnd) + safetySlack)
 	defer safety.Stop()
 	for _, j := range pending {
 		select {
@@ -348,6 +371,30 @@ func (e *Egress) Shutdown(grace time.Duration) (dropped int) {
 		}
 	}
 	return dropped
+}
+
+// InFlight reports whether key is the video or staging sidecar key of a clip
+// this Egress is still writing. Startup recovery uses it to leave the
+// process's own uploads alone.
+func (e *Egress) InFlight(key string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for c := range e.jobs {
+		if key == c.Keys.Video || key == c.Keys.StagingSidecar {
+			return true
+		}
+	}
+	return false
+}
+
+// abortContext returns the bounded fresh context of an abort or cleanup
+// request. During the shutdown abort phase it ends by that phase's deadline.
+func (e *Egress) abortContext() (context.Context, context.CancelFunc) {
+	ctx := context.WithoutCancel(e.hctx)
+	if by := e.abortBy.Load(); by != 0 {
+		return context.WithDeadline(ctx, time.Unix(0, by))
+	}
+	return context.WithTimeout(ctx, abortTimeout)
 }
 
 // finish releases j's accounting and wakes waiters. It is idempotent.

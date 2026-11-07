@@ -161,7 +161,7 @@ func (sess *session) start(video, audio sampleWriter, audioCodec string) {
 	}
 	sess.started = true
 	hub := sess.srv.cfg.Hubs[sess.camera]
-	sess.sub = hub.Subscribe(camera.ClassViewer, sess.srv.cfg.ViewerQueue)
+	sess.sub = hub.Subscribe(camera.ClassViewer, sess.srv.viewerQueue(sess.camera))
 	v := newViewer(sess.sub, video, audio, audioCodec)
 	sess.srv.wg.Add(1)
 	go func() {

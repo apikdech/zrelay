@@ -107,3 +107,38 @@ func TestTrackerTakeIsDestructive(t *testing.T) {
 		t.Fatalf("second take = %+v, want empty (memory is released)", c)
 	}
 }
+
+// A camera suppressed by the backlog policy records no event, so its
+// suppressed time is not an interval in which an event would have been
+// captured, even though the camera itself is ready (Contract §7.5).
+func TestTrackerExcludesSuppressedTimeFromReady(t *testing.T) {
+	clk := clock.NewFake(utc(14, 30, 0))
+	tr := status.NewCoverageTracker(clk)
+	tr.SetReady(true, utc(14, 0, 0))
+	tr.SetSuppressed(true, utc(14, 10, 0))
+	tr.SetSuppressed(true, utc(14, 12, 0)) // already suppressed: no-op
+	tr.SetSuppressed(false, utc(14, 20, 0))
+
+	wantIvs(t, tr.TakeHour(hourStart(14)),
+		[2]time.Time{utc(14, 0, 0), utc(14, 10, 0)},
+		[2]time.Time{utc(14, 20, 0), utc(14, 30, 0)})
+}
+
+// Readiness is the AND of the camera being ready and not being suppressed:
+// leaving suppression while the camera is down, or the camera coming back
+// while suppressed, does not open an interval.
+func TestTrackerReadinessIsCameraReadyAndNotSuppressed(t *testing.T) {
+	clk := clock.NewFake(utc(15, 30, 0))
+	tr := status.NewCoverageTracker(clk)
+	tr.SetReady(true, utc(15, 0, 0))
+	tr.SetSuppressed(true, utc(15, 5, 0))
+	tr.SetReady(false, utc(15, 10, 0))      // camera drops while suppressed
+	tr.SetSuppressed(false, utc(15, 15, 0)) // still down: not ready
+	tr.SetReady(true, utc(15, 20, 0))       // back and not suppressed
+	tr.SetSuppressed(true, utc(15, 25, 0))
+	tr.SetReady(true, utc(15, 26, 0)) // no change while suppressed
+
+	wantIvs(t, tr.TakeHour(hourStart(15)),
+		[2]time.Time{utc(15, 0, 0), utc(15, 5, 0)},
+		[2]time.Time{utc(15, 20, 0), utc(15, 25, 0)})
+}

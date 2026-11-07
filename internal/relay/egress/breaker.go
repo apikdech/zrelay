@@ -37,6 +37,12 @@ type BreakerConfig struct {
 	FailureThreshold int
 	BaseDelay        time.Duration
 	MaxDelay         time.Duration
+	// OnPermanent, when not nil, is called with the cause each time a
+	// permanent failure (see Breaker.FailureErr) opens the breaker, so the
+	// operator can tell a rejected credential from an outage (design §6.3).
+	// It runs on the failing goroutine, without a breaker lock held, and must
+	// not block.
+	OnPermanent func(err error)
 }
 
 // Breaker is the circuit breaker for one storage endpoint. It is safe for
@@ -153,6 +159,12 @@ func (b *Breaker) Success() {
 // reported while it is already open (late results of in-flight requests) are
 // ignored.
 func (b *Breaker) Failure(permanent bool) {
+	b.FailureErr(nil, permanent)
+}
+
+// FailureErr is Failure that also tells the breaker's OnPermanent callback
+// the error behind a permanent failure that opens it.
+func (b *Breaker) FailureErr(err error, permanent bool) {
 	b.mu.Lock()
 	if b.state != Closed {
 		b.mu.Unlock()
@@ -167,6 +179,9 @@ func (b *Breaker) Failure(permanent bool) {
 	b.bound = b.cfg.BaseDelay
 	b.transitionLocked(Open)
 	b.mu.Unlock()
+	if permanent && b.cfg.OnPermanent != nil {
+		b.cfg.OnPermanent(err)
+	}
 	b.notify()
 }
 

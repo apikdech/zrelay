@@ -51,7 +51,7 @@ func Do(ctx context.Context, clk clock.Clock, classify func(error) storage.Error
 		switch classify(err) {
 		case storage.Permanent:
 			if b != nil {
-				b.Failure(true)
+				b.FailureErr(err, true)
 			}
 			return err
 		case storage.NotFound:

@@ -26,3 +26,7 @@ func SetRecoveryRetryEvery(d time.Duration) (restore func()) {
 
 // GCPercent is the garbage collector target Run sets.
 const GCPercent = gcPercent
+
+// ViewerQueues is the per-camera viewer queue map Run hands to live view and
+// restream.
+var ViewerQueues = viewerQueues
