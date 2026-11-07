@@ -2,6 +2,7 @@ package zrec_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
@@ -131,6 +132,17 @@ func TestRewrapDoesNotTouchDamagedChunks(t *testing.T) {
 	}
 }
 
+// oversizedHeader is a clip whose camera_id_len (100) exceeds 64 while
+// header_len (205) is consistent with it.
+func oversizedHeader(t *testing.T) []byte {
+	t.Helper()
+	clip, _ := sealClip(t, testKeys(0), 1000)
+	b := bytes.Clone(clip)
+	b[36] = 100
+	binary.BigEndian.PutUint16(b[6:8], 105+100)
+	return b
+}
+
 func TestRewrapErrors(t *testing.T) {
 	from, to := testKeys(0), testKeys(50)
 	clip, _ := sealClip(t, from, 1000)
@@ -146,6 +158,7 @@ func TestRewrapErrors(t *testing.T) {
 		{"unknown from key", clip, zrec.Keyring{to.ID: to}, &seqReader{}, zrec.ErrUnknownKey},
 		{"empty keyring", clip, zrec.Keyring{}, &seqReader{}, zrec.ErrUnknownKey},
 		{"bad format", append([]byte("XXXX"), clip[4:]...), zrec.Keyring{from.ID: from}, &seqReader{}, zrec.ErrFormat},
+		{"camera_id_len 100", oversizedHeader(t), zrec.Keyring{from.ID: from}, &seqReader{}, zrec.ErrFormat},
 		{"truncated header", clip[:hdr.HeaderLen-1], zrec.Keyring{from.ID: from}, &seqReader{}, zrec.ErrTruncated},
 		{"wrapped DEK damaged", func() []byte {
 			b := bytes.Clone(clip)

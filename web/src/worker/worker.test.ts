@@ -196,6 +196,26 @@ describe('clip.open', () => {
     expect(r.status).toBe('complete');
   });
 
+  it('labels a header with camera_id_len 100 as malformed (ErrFormat), not truncated', async () => {
+    const full = loadVector('pos-one-byte.zrec');
+    const bad = new Uint8Array(200_000);
+    bad.set(full.subarray(0, 37));
+    bad[6] = 0;
+    bad[7] = 205;
+    bad[36] = 100;
+    const h = harness({
+      routes: {
+        ['GET /api/v1/clips/' + CLIP + '/video']: () =>
+          new Response(bad.slice(0, 169), {
+            status: 206,
+            headers: { 'Content-Range': 'bytes 0-168/200000' },
+          }),
+      },
+    });
+    await importVectorKey(h);
+    await expect(h.call({ type: 'clip.open', clipId: CLIP })).rejects.toMatchObject({ name: 'ErrFormat' });
+  });
+
   it.each([1, 123, 10 ** 12])('ignores a sidecar size_bytes lie (%i)', async (lie) => {
     const h = harness({ sidecar: sidecarFor(163840, lie) });
     await importVectorKey(h);

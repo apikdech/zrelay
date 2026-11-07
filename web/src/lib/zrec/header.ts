@@ -62,6 +62,9 @@ export function parseHeader(b: Uint8Array): Header {
   if (headerLen !== DESCRIPTOR_FIXED_LEN + n + KEY_BLOCK_LEN) {
     throw new ErrFormat(`header_len ${headerLen} inconsistent with camera_id_len ${n}`);
   }
+  // Contract §4.1: camera_id_len is 1..64. Checked before the truncation test so a
+  // bounded fetch (bytes=0-168) classifies an oversized value as malformed, not truncated.
+  if (n < 1 || n > 64) throw new ErrFormat(`camera_id_len ${n} out of range 1..64`);
   if (b.length < headerLen) throw new ErrTruncated(`header needs ${headerLen} bytes, got ${b.length}`);
 
   const chunkSize = dv.getUint32(8);
