@@ -3,16 +3,12 @@
 import type { Request } from '../../worker/protocol';
 import type { Coverage as ApiCoverage, Sidecar } from '../../worker/schemas';
 import type { Coverage, TimelineClip } from '../timeline/model';
-import { localDayRange, zoneOffsetMs } from '../timeline/timezone';
+import { localDayOf, localDayRange } from '../timeline/timezone';
 
 /** ui-spec §3.4 `assumed_max_clip_seconds` default (300): bounds an incomplete clip that has no end. */
 export const ASSUMED_MAX_CLIP_MS = 300_000;
 
-/** The calendar day (YYYY-MM-DD) that instant `ms` falls on in `zone`. */
-export function localDayOf(ms: number, zone: string): string {
-  const whole = Math.floor(ms / 1000) * 1000;
-  return new Date(whole + zoneOffsetMs(whole, zone)).toISOString().slice(0, 10);
-}
+export { localDayOf };
 
 export function toTimelineClip(c: Sidecar): TimelineClip {
   const startMs = Date.parse(c.start_time);
