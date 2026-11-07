@@ -91,8 +91,10 @@ type Breaker struct {
 	MaxDelay         time.Duration `yaml:"max_delay"`
 }
 
-// Live is the live view block. MaxViewers 0 disables live view; only then
-// are AdvertiseIP and APITokenSHA256 left unresolved.
+// Live is the live view block. Listen, ICEUDPPort and MaxViewers default
+// per design §5.1, so a config that omits the block must supply AdvertiseIP
+// and APITokenSHA256. MaxViewers 0 disables live view; only then are
+// AdvertiseIP and APITokenSHA256 left unresolved.
 type Live struct {
 	Listen         string   `yaml:"listen"`
 	AdvertiseIP    string   `yaml:"advertise_ip"`
@@ -101,8 +103,9 @@ type Live struct {
 	APITokenSHA256 []string `yaml:"api_token_sha256"`
 }
 
-// Restream is the RTSP restream block. An empty Listen disables the
-// restream; otherwise Username and Password hold resolved values after Load.
+// Restream is the RTSP restream block. Listen defaults to :8554 (design
+// §5.2), so Username and Password are required unless the block sets
+// listen: "" to disable the restream; otherwise Username and Password hold resolved values after Load.
 type Restream struct {
 	Listen   string `yaml:"listen"`
 	Username string `yaml:"username"`
@@ -224,6 +227,10 @@ const (
 	defaultTriggerTimeout      = 60
 	defaultRecorderQueueFrames = 256
 	defaultViewerQueueFrames   = 64
+	defaultLiveListen          = "0.0.0.0:9465"
+	defaultLiveICEUDPPort      = 8189
+	defaultLiveMaxViewers      = 4
+	defaultRestreamListen      = ":8554"
 )
 
 // newDefault returns a Config holding every default. The file is decoded
@@ -247,6 +254,12 @@ func newDefault() *Config {
 				MaxDelay:         defaultBreakerMaxDelay,
 			},
 		},
+		Live: Live{
+			Listen:     defaultLiveListen,
+			ICEUDPPort: defaultLiveICEUDPPort,
+			MaxViewers: defaultLiveMaxViewers,
+		},
+		Restream: Restream{Listen: defaultRestreamListen},
 		Defaults: CameraDefaults{
 			PreRollSeconds:        defaultPreRollSeconds,
 			PostRollSeconds:       defaultPostRollSeconds,

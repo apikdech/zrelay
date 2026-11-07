@@ -109,6 +109,9 @@ defaults:
   post_roll_seconds: 1
   max_clip_seconds: 60
   trigger_timeout_seconds: 120
+# live and restream default ON (design §5); these rigs run without them.
+live: { max_viewers: 0 }
+restream: { listen: "" }
 cameras:
   - id: "cam-1"
     name: "Camera One"

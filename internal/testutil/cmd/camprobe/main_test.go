@@ -20,7 +20,8 @@ const h264Fixture = "../../../../testdata/video/h264-640x360-gop2-10s.h264"
 // probeConfig writes a config for one camera on the local fakes.
 func probeConfig(t *testing.T, rtspURL string, onvifPort int) string {
 	t.Helper()
-	return probeConfigWith(t, rtspURL, onvifPort, "")
+	// live and restream default ON (design §5); the plain probe turns both off.
+	return probeConfigWith(t, rtspURL, onvifPort, "live: { max_viewers: 0 }\nrestream: { listen: \"\" }\n")
 }
 
 // probeConfigWith is probeConfig plus extra top-level YAML (live, restream).

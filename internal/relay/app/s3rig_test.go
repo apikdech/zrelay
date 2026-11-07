@@ -129,6 +129,9 @@ defaults:
   max_gop_seconds: 2
   recorder_queue_frames: 64
   trigger_timeout_seconds: 120
+# live and restream default ON (design §5); these rigs run without them.
+live: { max_viewers: 0 }
+restream: { listen: "" }
 cameras:
 %s`, o.MaxMemoryMB, o.BacklogMB, o.GraceSeconds, o.HTTPListen, o.MasterKey.String(),
 		o.Endpoint, o.Bucket, o.AccessKey, o.SecretKey, o.MaxClipSeconds, cams.String())

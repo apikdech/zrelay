@@ -215,11 +215,20 @@ func TestKeychainRefIsUnsupported(t *testing.T) {
 
 // minimalCamera is a config fragment around one camera block.
 func minimalConfig(camera string) string {
+	return minimalConfigWith(`live: { max_viewers: 0 }
+restream: { listen: "" }
+`, camera)
+}
+
+// minimalConfigWith is minimalConfig with caller-chosen live/restream
+// blocks (they default to ON, design §5.1/§5.2, so tests that do not
+// exercise them switch both off explicitly).
+func minimalConfigWith(liveRestream, camera string) string {
 	return `version: 2
 relay: { id: "test", max_memory_mb: 768, egress_backlog_mb: 64 }
 encryption: { master_key: "ENV:ZR_TEST_MASTER" }
 storage: { driver: "local", root: "zrelay", local: { base_dir: "/x/archive" } }
-cameras:
+` + liveRestream + `cameras:
 ` + camera
 }
 
