@@ -33,10 +33,12 @@ export function createWorker(deps: WorkerDeps): Worker {
           return { result: await keys.list() };
         case 'key.forget':
           await keys.forget(String(req.keyId));
+          authFetch.reset();
           clips.closeAll();
           return { result: await keys.list() };
         case 'key.lock':
           keys.lock();
+          authFetch.reset();
           clips.closeAll();
           return { result: await keys.list() };
         case 'api.get':

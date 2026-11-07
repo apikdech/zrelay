@@ -568,6 +568,33 @@ describe('token fallback', () => {
   });
 });
 
+describe('token memory after lock and forget', () => {
+  /** Pin the vector token, lock or forget, re-import both keys, and report the first token tried. */
+  async function firstTokenAfter(action: 'key.lock' | 'key.forget') {
+    const h = harness();
+    const { keyId } = await importVectorKey(h);
+    await h.call({ type: 'key.import', encoded: await keyText('ee'.repeat(32)), remember: false });
+    await h.call({ type: 'api.get', path: `/api/v1/clips/${CLIP}`, query: {} }); // pins the vector token
+    if (action === 'key.lock') await h.call({ type: 'key.lock' });
+    else await h.call({ type: 'key.forget', keyId });
+    await h.call({ type: 'key.lock' });
+    // Re-import: the unaccepted key is newest, so a stale pin would show as the vector token first.
+    await importVectorKey(h);
+    await h.call({ type: 'key.import', encoded: await keyText('ee'.repeat(32)), remember: false });
+    const before = h.server.calls.length;
+    await h.call({ type: 'api.get', path: `/api/v1/clips/${CLIP}`, query: {} });
+    return h.server.calls[before]!.headers.get('Authorization');
+  }
+
+  it('key.lock drops the pinned token, so the next request starts from the newest key', async () => {
+    expect(await firstTokenAfter('key.lock')).not.toBe(`Bearer ${token}`);
+  });
+
+  it('key.forget drops the pinned token', async () => {
+    expect(await firstTokenAfter('key.forget')).not.toBe(`Bearer ${token}`);
+  });
+});
+
 describe('response size caps', () => {
   /** A very long body; counts how much was pulled and whether it was cancelled. */
   function endless(chunkBytes: number) {
