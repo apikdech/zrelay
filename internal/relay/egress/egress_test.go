@@ -65,6 +65,12 @@ type fakeStore struct {
 	// That upload fails while down is set, which breaks the writer until
 	// Resume (local, always succeeds). Bytes become durable per part.
 	partSize int
+	// failFinalPart makes the next N Commit calls that have a buffered tail
+	// fail that final part upload (partSize mode). A strict driver treats the
+	// failure like a failed Write: the writer is broken, Commit returns a
+	// writer-state error (Transient class) until Resume, and Resume drops the tail so
+	// the caller must re-send it.
+	failFinalPart int
 	// commitIgnoresCtx makes a gated Commit succeed even if ctx ended while it
 	// waited (the server completed the upload but the caller gave up).
 	commitIgnoresCtx bool
@@ -251,6 +257,20 @@ func (o *fakeObj) Commit(ctx context.Context) error {
 	if cerr != nil {
 		return cerr
 	}
+	s.mu.Lock()
+	if o.broken {
+		s.mu.Unlock()
+		return errors.New("writer needs Resume") // Transient, like s3.Classify
+	}
+	if s.partSize > 0 && len(o.pending) > 0 && s.failFinalPart > 0 {
+		s.failFinalPart--
+		s.partAttempts++
+		s.writeErrs++
+		o.broken = true
+		s.mu.Unlock()
+		return errTransient
+	}
+	s.mu.Unlock()
 	if gate != nil {
 		select {
 		case <-gate:
@@ -1116,6 +1136,35 @@ func TestBufferedWritesBackOffPartUploads(t *testing.T) {
 	st.mu.Unlock()
 	if n > 2 {
 		t.Fatalf("%d part uploads in 50 ms of real time without the clock advancing: no backoff", n)
+	}
+}
+
+// A transient failure of the final part inside Commit (every clip end) must
+// not wedge the clip: the worker resumes the writer, re-sends the tail from
+// the ring and commits. The breaker must not see a permanent failure.
+func TestFinalPartFailureInCommitResumesAndResendsTail(t *testing.T) {
+	st := newFakeStore()
+	st.partSize = 4 * copyBufSize
+	st.failFinalPart = 1
+	r := newEgressRig(t, 1, 1<<30, st)
+	c := r.begin("front", "A")
+	payload := randBytes(10*copyBufSize+123, 33)
+	c.write(t, payload)
+	c.finish()
+	advanceUntil(t, r.clk, "commit after a failed final part", func() bool { return st.count("commit") == 1 })
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !bytes.Equal(st.objects[c.pc.Keys.Video], payload) {
+		t.Fatalf("object differs from the stream (%d bytes, want %d)", len(st.objects[c.pc.Keys.Video]), len(payload))
+	}
+	if st.resumes < 1 {
+		t.Fatalf("resumes = %d, want the worker to Resume after the failed Commit", st.resumes)
+	}
+	if ds := r.dropList(); len(ds) != 0 {
+		t.Fatalf("drops = %+v, want none", ds)
+	}
+	if s, _ := r.br.State(); s == Open {
+		t.Fatal("breaker is open after one transient final-part failure")
 	}
 }
 

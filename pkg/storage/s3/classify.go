@@ -22,6 +22,8 @@ var errNoSuchBucket = errors.New("s3: NoSuchBucket")
 //
 //   - Transient: network and transport errors, deadlines and cancellation,
 //     5xx, 429, RequestTimeout and SlowDown.
+//   - Transient also covers a writer that needs Resume after a failed part
+//     (writer state, repaired by Resume).
 //   - Permanent: 403, NoSuchBucket, InvalidAccessKeyId, SignatureDoesNotMatch,
 //     any other 4xx, invalid keys, driver misuse (a closed writer, Write after
 //     CompleteMultipartUpload was sent), an upload that is gone without its
@@ -36,6 +38,12 @@ func Classify(err error) storage.ErrorClass {
 		errors.Is(err, errUnpublished), errors.Is(err, errAbortCommitted),
 		errors.Is(err, errCompleting):
 		return storage.Permanent
+	}
+
+	// Writer state, not a storage verdict: Resume repairs it, so it must
+	// never open the breaker as a permanent storage failure.
+	if errors.Is(err, errNeedsResume) {
+		return storage.Transient
 	}
 
 	var apiErr smithy.APIError

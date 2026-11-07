@@ -40,6 +40,9 @@ type fakeS3 struct {
 	failHead   int
 	headStatus int
 	headCode   string
+	// failPart maps a part number to how many UploadPart requests for it
+	// are answered with 503 before the part is accepted.
+	failPart map[int]int
 }
 
 type fakeUpload struct {
@@ -90,6 +93,17 @@ func (f *fakeS3) failHeadObject(n, status int, code string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failHead, f.headStatus, f.headCode = n, status, code
+}
+
+// failPartUpload answers the next n UploadPart requests for part number num
+// with 503 ServiceUnavailable.
+func (f *fakeS3) failPartUpload(num, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failPart == nil {
+		f.failPart = map[int]int{}
+	}
+	f.failPart[num] = n
 }
 
 func (f *fakeS3) failWith(status int, code string) {
@@ -168,6 +182,11 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.uploads[id] = &fakeUpload{key: key, parts: map[int][]byte{}}
 		fmt.Fprintf(w, `<InitiateMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, bucket, key, id)
 	case "part":
+		if pn, _ := strconv.Atoi(q.Get("partNumber")); f.failPart[pn] > 0 {
+			f.failPart[pn]--
+			writeS3Error(w, r, http.StatusServiceUnavailable, "ServiceUnavailable")
+			return
+		}
 		u, ok := f.uploads[q.Get("uploadId")]
 		if !ok {
 			writeS3Error(w, r, http.StatusNotFound, "NoSuchUpload")

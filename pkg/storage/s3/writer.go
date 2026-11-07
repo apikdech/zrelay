@@ -143,6 +143,9 @@ func (w *objectWriter) Resume(ctx context.Context) (int64, error) {
 // (usually Transient), so the caller retries Commit; if the object is missing
 // or has the wrong size, the error is Permanent.
 //
+// A failed final part is retryable by calling Commit again: the tail stays
+// buffered. Only a failed part inside Write breaks the writer until Resume.
+//
 // Once CompleteMultipartUpload has been sent the part list is final, so Write
 // is refused from then on, even after Resume; only Commit and Abort remain.
 func (w *objectWriter) Commit(ctx context.Context) error {
@@ -156,8 +159,11 @@ func (w *objectWriter) Commit(ctx context.Context) error {
 		return fmt.Errorf("s3: commit %q: zero-byte object", w.key)
 	}
 	if len(w.buf) > 0 {
+		// A failed final part leaves the buffer and the part list untouched,
+		// so the writer is not broken: a retried Commit re-sends the same
+		// part number. (Resume still works: it drops the tail and the caller
+		// re-sends it.)
 		if err := w.uploadPart(ctx); err != nil {
-			w.broken = true
 			return err
 		}
 	}

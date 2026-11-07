@@ -151,7 +151,34 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 			}
 		}
 		if rerr == io.EOF {
-			break
+			// Commit uploads the final (short) part, so it can fail like a
+			// Write. Do retried it in place; if that is exhausted, treat it
+			// like a failed Write: the driver repositions itself with Resume
+			// (dropping the unconfirmed tail), and the tail is re-sent from
+			// the stream before Commit is tried again. A clip is abandoned
+			// only by the backlog policy or at shutdown (relay-spec §4.8).
+			cerr := e.do(ctx, func(ctx context.Context) error {
+				defer e.track(j)()
+				return w.Commit(ctx)
+			})
+			if cerr == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if e.cfg.Classify(cerr) == storage.NotFound {
+				return errors.Join(errUploadGone, cerr)
+			}
+			fails++
+			roff, err := e.resume(ctx, w, &fails)
+			if err != nil {
+				return err
+			}
+			off = roff
+			counted = e.countDurable(counted, w.DurableOffset())
+			c.Stream.Release(w.DurableOffset())
+			continue
 		}
 		if n == 0 {
 			if err := c.Stream.Wait(ctx, off); err != nil {
@@ -160,9 +187,6 @@ func (e *Egress) upload(ctx context.Context, j *job, ow *storage.ObjectWriter, s
 		}
 	}
 
-	if err := e.persist(ctx, j, w.Commit); err != nil {
-		return err
-	}
 	e.countDurable(counted, off) // the tail that only Commit makes durable
 	// The video is durable: mark it first so the accountant skips the clip,
 	// then release its tail so it no longer counts as backlog. Neither the
