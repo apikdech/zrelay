@@ -388,11 +388,31 @@ func Run(ctx context.Context, sub *camera.Sub, tracker *events.Tracker, m *clip.
 	active := map[events.Kind]bool{}
 	syncTriggers := func() {
 		now := time.Now().UTC()
+		// Take the latch before the snapshot: a kind that activates in
+		// between is then merely seen as active, never as a short event.
+		latched := tracker.TakeActivated()
 		cur := tracker.Active()
+		var short []events.Kind // went active and inactive between two syncs
+		for _, k := range latched {
+			if !active[k] && !slices.Contains(cur, k) {
+				short = append(short, k)
+			}
+		}
 		for _, k := range cur {
 			if !active[k] {
 				active[k] = true
 				m.OnSignal(events.Signal{Kind: k, Active: true, At: now})
+			}
+		}
+		if len(short) > 0 {
+			// Replay the whole event so the clip opens and then ends after
+			// its post-roll.
+			for _, k := range short {
+				m.OnSignal(events.Signal{Kind: k, Active: true, At: now})
+			}
+			m.OnTriggered(true)
+			for _, k := range short {
+				m.OnSignal(events.Signal{Kind: k, Active: false, At: now})
 			}
 		}
 		for k := range active {
