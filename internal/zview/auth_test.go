@@ -70,6 +70,44 @@ func TestAuthFailuresAreRateLimitedPerIP(t *testing.T) {
 	}
 }
 
+// Behind tailscale serve every client arrives from the proxy's address, so the
+// peer alone would make the limit global: one stale device would turn every
+// other device's 401 into 429. The proxy names the user in Tailscale-User-Login.
+func TestAuthFailureLimitIsPerTailscaleUserBehindProxy(t *testing.T) {
+	e := newEnv(t)
+	const proxy = "127.0.0.1:5000"
+	stale := []string{"Tailscale-User-Login", "stale@example.com"}
+	for i := 1; i <= 10; i++ {
+		if rec := e.doFrom(proxy, "GET", "/api/v1/status", "Bearer nope", stale...); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d, want 401", i, rec.Code)
+		}
+	}
+	wantProblem(t, e.doFrom(proxy, "GET", "/api/v1/status", "Bearer nope", stale...), http.StatusTooManyRequests)
+	if rec := e.doFrom(proxy, "GET", "/api/v1/status", "Bearer nope", "Tailscale-User-Login", "other@example.com"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("another user behind the same proxy = %d, want 401", rec.Code)
+	}
+	// A request without the header falls back to the peer address.
+	if rec := e.doFrom(proxy, "GET", "/api/v1/status", "Bearer nope"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("headerless request behind the proxy = %d, want 401", rec.Code)
+	}
+}
+
+// Any client can send the header, so it is believed only from a proxy-like
+// peer (loopback or private); from anywhere else it must not buy a fresh
+// failure budget.
+func TestTailscaleUserHeaderIgnoredFromPublicPeer(t *testing.T) {
+	e := newEnv(t)
+	const peer = "203.0.113.9:5000"
+	for i := 1; i <= 10; i++ {
+		hdr := []string{"Tailscale-User-Login", fmt.Sprintf("u%d@example.com", i)}
+		if rec := e.doFrom(peer, "GET", "/api/v1/status", "Bearer nope", hdr...); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d, want 401", i, rec.Code)
+		}
+	}
+	rec := e.doFrom(peer, "GET", "/api/v1/status", "Bearer nope", "Tailscale-User-Login", "fresh@example.com")
+	wantProblem(t, rec, http.StatusTooManyRequests)
+}
+
 func TestLiveRouteIsBehindBearerAuth(t *testing.T) {
 	e := newEnv(t)
 	wantProblem(t, e.do("POST", "/live/front", "-"), http.StatusUnauthorized)

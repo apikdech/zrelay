@@ -97,18 +97,7 @@ var s3ResponseTimeout = 30 * time.Second
 // forever and never report the failure the circuit breaker opens on. A
 // request body may take as long as the link needs; only the wait for the
 // answer, and connection setup, are bounded.
-func s3HTTPClient() *http.Client {
-	return &http.Client{Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: s3ResponseTimeout,
-		ExpectContinueTimeout: time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConnsPerHost:   4,
-	}}
-}
+func s3HTTPClient() *http.Client { return s3.NewHTTPClient(s3ResponseTimeout) }
 
 // DefaultStorage builds the driver cfg selects.
 func DefaultStorage(cfg *config.Config) (storage.Provider, storage.Recoverer, error) {
