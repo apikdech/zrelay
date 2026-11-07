@@ -416,7 +416,18 @@ func TestRunShutdownWithStorageDownExitsWithinGrace(t *testing.T) {
 	logs := captureLogs(t)
 	r := newRig(t, "")
 	st := newDown(t, r.base)
+	// Storage is reachable at startup and goes down once the camera is up: the
+	// status publisher reports to the breaker too, so a store that is down from
+	// the first write opens it before the camera is ready to record a clip.
+	st.down.Store(false)
 	run := start(t, r.cfg, st.opts(t))
+	eventually(t, "camera up", 30*time.Second, func() bool {
+		b := scrape(t, r.cfg.Relay.HTTPListen)
+		rtsp, _ := sample(b, `zrelay_camera_rtsp_up{camera="cam-1"}`)
+		ev, _ := sample(b, `zrelay_camera_events_up{camera="cam-1"}`)
+		return rtsp == 1 && ev == 1
+	})
+	st.down.Store(true)
 
 	r.motion(true)
 	eventually(t, "the breaker to open", 60*time.Second, func() bool {

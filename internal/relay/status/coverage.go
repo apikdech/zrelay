@@ -150,3 +150,55 @@ func (t *CoverageTracker) TakeHour(hour time.Time) sidecar.Coverage {
 		Dropped:   dropped,
 	}
 }
+
+// mergeCoverage combines the coverage already stored for an hour with newly
+// taken coverage of the same camera and hour: ready intervals are united
+// (overlapping or touching ones coalesce) and dropped entries are
+// concatenated, without exact duplicates, in ascending order of At. A process
+// that restarts mid-hour, or a Flush followed by the hour-end write, thus
+// extends what is stored instead of replacing it (Contract §7.5.2: every drop
+// is visible in coverage).
+func mergeCoverage(stored, taken sidecar.Coverage) sidecar.Coverage {
+	hour := taken.HourStart.UTC()
+	end := hour.Add(time.Hour)
+
+	all := make([]sidecar.Interval, 0, len(stored.Ready)+len(taken.Ready))
+	all = append(all, stored.Ready...)
+	all = append(all, taken.Ready...)
+	slices.SortStableFunc(all, func(a, b sidecar.Interval) int { return a[0].Compare(b[0].Time) })
+
+	ready := []sidecar.Interval{}
+	for _, iv := range all {
+		s, e := iv[0].Time, iv[1].Time
+		if s.Before(hour) {
+			s = hour
+		}
+		if e.After(end) {
+			e = end
+		}
+		if !s.Before(e) {
+			continue
+		}
+		if n := len(ready); n > 0 && !s.After(ready[n-1][1].Time) {
+			if e.After(ready[n-1][1].Time) {
+				ready[n-1][1] = sidecar.Time{Time: e}
+			}
+			continue
+		}
+		ready = append(ready, sidecar.Interval{{Time: s}, {Time: e}})
+	}
+
+	dropped := []sidecar.Dropped{}
+	for _, d := range append(slices.Clone(stored.Dropped), taken.Dropped...) {
+		if !slices.ContainsFunc(dropped, func(o sidecar.Dropped) bool {
+			return o.At.Equal(d.At.Time) && o.Reason == d.Reason && o.ApproxMs == d.ApproxMs
+		}) {
+			dropped = append(dropped, d)
+		}
+	}
+	slices.SortStableFunc(dropped, func(a, b sidecar.Dropped) int { return a.At.Compare(b.At.Time) })
+
+	taken.Ready = ready
+	taken.Dropped = dropped
+	return taken
+}
