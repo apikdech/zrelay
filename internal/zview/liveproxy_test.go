@@ -304,10 +304,15 @@ func TestLiveProxyOnlyPostAndDelete(t *testing.T) {
 		if rec.Header().Get("Allow") == "" {
 			t.Errorf("%s %s: no Allow header", tc.method, tc.target)
 		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+			t.Errorf("%s %s: Content-Type = %q, want application/problem+json", tc.method, tc.target, ct)
+		}
 	}
-	for _, target := range []string{"/", "/live", "/live/", "/live/front/sess1/extra", "/api/v1/status"} {
+	for _, target := range []string{"/", "/live", "/live/", "/live/front/sess1/extra", "/live/a/b/c", "/api/v1/status"} {
 		if rec := proxyDo(h, "POST", target, auth, "application/sdp", strings.NewReader(sdpOffer)); rec.Code != http.StatusNotFound {
 			t.Errorf("POST %s: status = %d, want 404", target, rec.Code)
+		} else if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+			t.Errorf("POST %s: Content-Type = %q, want application/problem+json", target, ct)
 		}
 	}
 	if n := len(up.got()); n != 0 {

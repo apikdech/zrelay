@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -109,6 +110,21 @@ func NewLiveProxy(upstream string, v *bearer.Verifier) http.Handler {
 		r.ContentLength = 0
 		rp.ServeHTTP(w, r)
 	}))
+	// Everything the method patterns above did not take. The mux's own
+	// replies are text/plain, so answer 404 and 405 as problem+json here.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		segs := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+		if segs[0] == "live" && len(segs) >= 2 && len(segs) <= 3 && !slices.Contains(segs, "") {
+			allow := http.MethodPost
+			if len(segs) == 3 {
+				allow = http.MethodDelete
+			}
+			w.Header().Set("Allow", allow)
+			writeProblem(w, r, http.StatusMethodNotAllowed, "")
+			return
+		}
+		writeProblem(w, r, http.StatusNotFound, "")
+	})
 	return mux
 }
 
