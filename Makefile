@@ -1,4 +1,4 @@
-.PHONY: test vet integration chaos vectors web web-e2e
+.PHONY: test vet integration chaos vectors web web-e2e demo
 
 # Unit tests with the race detector.
 test:
@@ -29,3 +29,8 @@ web:
 # SPA browser tests (Chromium and WebKit); needs `pnpm exec playwright install chromium webkit`.
 web-e2e:
 	cd web && pnpm exec playwright test
+
+# Local demo without a camera or a NAS: a fake Tapo camera plus ready-made
+# configs and a throwaway key in .demo/ (README "Try it locally").
+demo:
+	go run ./internal/testutil/cmd/demo --dir .demo

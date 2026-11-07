@@ -1,6 +1,7 @@
 # Secrets: never commit env files or key material.
 .env
 .env.*
+!.env.example
 
 # Go build and test output
 /bin/
@@ -22,3 +23,6 @@ deploy/zrelay.yaml
 deploy/zview.yaml
 
 .claude/
+
+# Local demo (make demo): generated configs, throwaway key, recorded clips
+.demo/

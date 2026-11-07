@@ -127,7 +127,8 @@ ZR_KEY=$(cat deploy/secrets/zrelay_master) \
   docker run --rm --entrypoint /zrelay -e ZR_KEY zrelay:local key api-token-hash --key ENV:ZR_KEY \
   > deploy/secrets/api_token_sha256
 
-docker run --rm --entrypoint /zrelay -e ZR_KEY zrelay:local key fingerprint --key ENV:ZR_KEY
+ZR_KEY=$(cat deploy/secrets/zrelay_master) \
+  docker run --rm --entrypoint /zrelay -e ZR_KEY zrelay:local key fingerprint --key ENV:ZR_KEY
 ```
 
 `api-token-hash` prints `hex(SHA-256(K_api))`. Both zrelay (`live.api_token_sha256`) and
