@@ -73,6 +73,13 @@ type runner struct {
 	olderThan time.Duration
 	rep       Report
 	errs      []error
+	// pending counts, per final video key, the candidate uploads not yet
+	// concluded. Several uploads can exist for one key (a lost
+	// CreateMultipartUpload response, then a retry); they share one staging
+	// sidecar, which must outlive all of them.
+	pending map[string]int
+	// settled holds the staging sidecars already deleted.
+	settled map[string]bool
 }
 
 // Run performs startup recovery for every configured camera. A failure on one
@@ -87,7 +94,7 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	if cfg.Now.IsZero() {
 		return Report{}, errors.New("recovery: Now is required")
 	}
-	r := &runner{cfg: cfg, olderThan: cfg.OlderThan}
+	r := &runner{cfg: cfg, olderThan: cfg.OlderThan, pending: map[string]int{}, settled: map[string]bool{}}
 	if r.olderThan == 0 {
 		r.olderThan = DefaultOlderThan
 	}
@@ -152,6 +159,9 @@ func (r *runner) scan(ctx context.Context, prefix string) error {
 
 	paired := map[string]bool{}
 	for _, inc := range incs {
+		r.pending[inc.Key]++
+	}
+	for _, inc := range incs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -168,11 +178,15 @@ func (r *runner) scan(ctx context.Context, prefix string) error {
 		if hasStaging {
 			if err := r.recoverPair(ctx, inc, s); err != nil {
 				r.fail(err)
+			} else {
+				r.pending[inc.Key]--
 			}
 			continue
 		}
 		if err := r.discardIncomplete(ctx, inc); err != nil {
 			r.fail(err)
+		} else {
+			r.pending[inc.Key]--
 		}
 	}
 
@@ -231,7 +245,13 @@ func (r *runner) recoverPair(ctx context.Context, inc storage.Incomplete, s stag
 	}
 	info, err := r.cfg.Recoverer.RecoverCommit(ctx, inc)
 	if errors.Is(err, storage.ErrNothingToRecover) {
-		// The driver found no durable byte, so no descriptor either.
+		// The driver found no durable byte, so no descriptor either. Another
+		// upload for the same key may still hold the clip's data and need the
+		// staging sidecar (or have used it already): only the last candidate
+		// to conclude may delete it.
+		if r.settled[s.info.Key] || r.pending[inc.Key] > 1 {
+			return nil
+		}
 		return r.deleteStaging(ctx, s, &r.rep.Discarded)
 	}
 	if err != nil {
@@ -311,6 +331,7 @@ func (r *runner) deleteStaging(ctx context.Context, s staged, counter *int) erro
 	if err := r.cfg.Provider.Delete(ctx, s.info.Key); err != nil {
 		return fmt.Errorf("recovery: delete staging sidecar %q: %w", s.info.Key, err)
 	}
+	r.settled[s.info.Key] = true
 	*counter++
 	return nil
 }
