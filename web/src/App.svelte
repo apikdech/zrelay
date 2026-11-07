@@ -5,9 +5,18 @@
   import DemoPage from './routes/demo/+page.svelte';
   import UpdatePrompt from './lib/pwa/UpdatePrompt.svelte';
   import type { Updater } from './lib/pwa/update';
+  import { onMount } from 'svelte';
+  import { workerClient } from './lib/workerClient';
+  import { acquireIdleLock, type LockClient } from './routes/onboarding/idleService';
 
   /** The service worker's update state; null where there is no service worker. */
-  let { updater = null }: { updater?: Updater | null } = $props();
+  let { updater = null, client = workerClient }: { updater?: Updater | null; client?: LockClient } = $props();
+
+  // Idle auto-lock (ui-spec §4.1) applies on every view, not only the Key page.
+  onMount(() => {
+    const idle = acquireIdleLock(client);
+    return () => idle.release();
+  });
 
   // Top-level views (design §7.2). The timeline is the home view.
   // `#/demo?clip=<id>` is the playback engine's demo page.

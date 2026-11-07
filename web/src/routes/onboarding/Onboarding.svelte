@@ -3,7 +3,7 @@
   import type { Camera, Decoder } from '../../lib/qr/scan';
   import { workerClient } from '../../lib/workerClient';
   import type { ImportResult, KeyListResult, Request } from '../../worker/protocol';
-  import { createIdleLock, type IdleLock } from './idleLock';
+  import { acquireIdleLock, IDLE_CHOICES, savedIdleMinutes, type IdleHandle } from './idleService';
   import { checkKeyInput, fingerprint } from './keyInput';
   import { keyMismatch, type ClipKeyRef, type Mismatch } from './mismatch';
   import Scanner from './Scanner.svelte';
@@ -18,18 +18,7 @@
 
   let { client = workerClient, now = Date.now, scanner = {} }: Props = $props();
 
-  const IDLE_KEY = 'zview.idleLockMinutes';
-  const IDLE_CHOICES = [0, 1, 5, 15, 30, 60];
   const DAY_MS = 86_400_000;
-
-  function savedIdleMinutes(): number {
-    try {
-      const n = Number(localStorage.getItem(IDLE_KEY));
-      return IDLE_CHOICES.includes(n) ? n : 0;
-    } catch {
-      return 0; // storage blocked: the setting simply does not persist
-    }
-  }
 
   let text = $state('');
   let remember = $state(false);
@@ -41,7 +30,7 @@
   let check: '' | 'checking' | 'failed' | 'rejected' = $state('');
   let actionError = $state('');
   let idleMinutes = $state(savedIdleMinutes());
-  let idle: IdleLock | undefined;
+  let idle: IdleHandle | undefined;
   let checkSeq = 0;
 
   const input = $derived(checkKeyInput(text));
@@ -124,12 +113,7 @@
 
   function setIdle(e: Event) {
     idleMinutes = Number((e.currentTarget as HTMLSelectElement).value);
-    idle?.setMinutes(idleMinutes);
-    try {
-      localStorage.setItem(IDLE_KEY, String(idleMinutes));
-    } catch {
-      /* not persisted */
-    }
+    idle?.setMinutes(idleMinutes); // persists, and applies app-wide
   }
 
   function onScanned(scanned: string) {
@@ -138,10 +122,21 @@
   }
 
   onMount(() => {
-    idle = createIdleLock({ doc: document, lock: () => void doLock() });
-    idle.setMinutes(idleMinutes);
+    // The lock itself is app-level (App holds it); this page only changes the
+    // setting and mirrors an idle lock that happens while it is open.
+    idle = acquireIdleLock(client, {
+      onLocked: (result) => {
+        actionError = '';
+        cancelCheck();
+        void refresh(result);
+        locked = true;
+      },
+      onError: () => {
+        actionError = 'Could not lock. Try again.';
+      },
+    });
     void refresh();
-    return () => idle?.dispose();
+    return () => idle?.release();
   });
 </script>
 

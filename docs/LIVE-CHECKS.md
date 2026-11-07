@@ -833,4 +833,12 @@ This section supersedes the chaos results of "Task 29" (270.0 MiB peak, "breaker
 3. On the NAS, `docker pause` the MinIO container, open the Timeline for today from two phones, wait 40 s, then `docker unpause`.
 **Expected result:** step 2: a different user's wrong key still gets 401 (devices of the same Tailscale user share one budget, by design), the valid key always gets 200; step 3: both phones show a load error within about 35 s instead of spinning, and the Timeline loads after unpause.
 **If the result differs, update:** `clientKey`/`proxyPeer` in `internal/zview/auth.go` with `auth_test.go` (for example if `tailscale serve` sends the header from a public-looking address, or Docker maps the peer to an address `proxyPeer` rejects); `s3ResponseTimeout` in `cmd/zview-server/main.go`.
+## Task 38 fix — App-level idle auto-lock
+**Automated in this task:** the idle lock is now shared and held by `App.svelte` for the page's lifetime (`web/src/routes/onboarding/idleService.ts`), so the saved `zview.idleLockMinutes` applies on Timeline, Live and Demo as well as Key; the Key page only changes the setting and mirrors a lock that happens while it is open. Tests first (red, then green): `App.test.ts` ("App-level idle auto-lock", hides the document on `#/timeline`, `#/live` and `#/demo` and expects `key.lock`) and `routes/onboarding/idleService.test.ts`. Not exercised: real mobile browsers freezing background timers or locking the phone.
+**Manual steps:**
+1. On a real phone, open the app, go to Key, import the key and set Auto-lock to 1 minute. Go to Timeline and play a clip, then lock the phone (or switch to another app) for over a minute.
+2. Return to the app: playback of new clips must fail until the key is pasted again, and Key shows "Locked: session keys were discarded."
+3. Repeat from the Live tab, and on an iPhone in the home-screen app.
+**Expected result:** the worker discards its derived keys after the set time with the app hidden, whichever view was open; coming back before the time cancels the lock.
+**If the result differs, update:** `createIdleLock` in `web/src/routes/onboarding/idleLock.ts` (browser visibility or timer behaviour) and `idleService.ts`, with their tests.
 **Status:** not run

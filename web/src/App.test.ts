@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { Request } from './worker/protocol';
 
 // The pages need the worker and the browser APIs; only the routing is under test.
 vi.mock('./routes/+page.svelte', () => import('../test-support/routes/Timeline.svelte'));
@@ -66,5 +67,49 @@ describe('App routing', () => {
     location.hash = '#/bogus';
     await fireEvent(window, new HashChangeEvent('hashchange'));
     await waitFor(() => expect(shown()).toEqual(['timeline']));
+  });
+});
+
+describe('App-level idle auto-lock', () => {
+  const setHidden = (hidden: boolean) => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+    document.dispatchEvent(new Event('visibilitychange'));
+  };
+  afterEach(() => {
+    setHidden(false);
+    localStorage.clear();
+    vi.useRealTimers();
+  });
+
+  for (const route of ['#/timeline', '#/live', '#/demo']) {
+    it(`locks the worker from ${route} when the saved idle time passes with the tab hidden`, async () => {
+      vi.useFakeTimers();
+      localStorage.setItem('zview.idleLockMinutes', '5');
+      const calls: Request[] = [];
+      const client = {
+        async call<T>(msg: Request): Promise<T> {
+          calls.push(msg);
+          return { keys: [] } as T;
+        },
+      };
+      location.hash = route;
+      render(App, { client });
+      setHidden(true);
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      expect(calls.some((c) => c.type === 'key.lock')).toBe(false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(calls.filter((c) => c.type === 'key.lock')).toHaveLength(1);
+    });
+  }
+
+  it('does not lock when the setting is off', async () => {
+    vi.useFakeTimers();
+    const calls: Request[] = [];
+    const client = { async call<T>(msg: Request): Promise<T> { calls.push(msg); return { keys: [] } as T; } };
+    location.hash = '#/timeline';
+    render(App, { client });
+    setHidden(true);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(calls).toEqual([]);
   });
 });
