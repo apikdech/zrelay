@@ -362,6 +362,20 @@ func (e *Egress) ShutdownWithin(grace, abort time.Duration) (dropped int) {
 	return dropped
 }
 
+// InFlight reports whether key is the video or staging sidecar key of a clip
+// this Egress is still writing. Startup recovery uses it to leave the
+// process's own uploads alone.
+func (e *Egress) InFlight(key string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for c := range e.jobs {
+		if key == c.Keys.Video || key == c.Keys.StagingSidecar {
+			return true
+		}
+	}
+	return false
+}
+
 // abortContext returns the bounded fresh context of an abort or cleanup
 // request. During the shutdown abort phase it ends by that phase's deadline.
 func (e *Egress) abortContext() (context.Context, context.CancelFunc) {

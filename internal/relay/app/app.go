@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +61,11 @@ type Options struct {
 // at once (design §6.5); this keeps a quiet relay, which never opens its
 // breaker, from staying unrecovered. A variable so tests can shorten it.
 var recoveryRetryEvery = time.Minute
+
+// recoverySkewMargin is added to the recovery age filter when scheduling the
+// rescan of clips that were too young at startup, to absorb a storage clock
+// that runs behind this host's.
+const recoverySkewMargin = 10 * time.Second
 
 // healthBreakerOpen is how long the storage breaker may stay out of the
 // closed state before /healthz turns unhealthy (design §6.3).
@@ -311,21 +317,12 @@ func (a *app) start() error {
 		FailureThreshold: cfg.Storage.Breaker.FailureThreshold,
 		BaseDelay:        cfg.Storage.Breaker.BaseDelay,
 		MaxDelay:         cfg.Storage.Breaker.MaxDelay,
+		OnPermanent:      a.onPermanent,
 	}, a.clk, a.prov.HealthCheck, a.onBreaker)
 	var brkCtx context.Context
 	brkCtx, a.brkCancel = context.WithCancel(context.Background())
 	a.brkDone = make(chan struct{})
 	go func() { defer close(a.brkDone); a.breaker.Run(brkCtx) }()
-
-	// Crash recovery, retried on each breaker close until it succeeds once.
-	ids := make([]string, len(a.cams))
-	for i, cm := range a.cams {
-		ids[i] = cm.cfg.ID
-	}
-	var rcvCtx context.Context
-	rcvCtx, a.rcvCancel = context.WithCancel(context.Background())
-	a.rcvDone = make(chan struct{})
-	go func() { defer close(a.rcvDone); a.recoverLoop(rcvCtx, ids) }()
 
 	backlogLimit := int64(cfg.Relay.EgressBacklogMB) << 20
 	a.eg = egress.New(egress.Config{
@@ -360,6 +357,17 @@ func (a *app) start() error {
 
 	a.m.SetBacklogSource(a.eg.BacklogBytes)
 
+	// Crash recovery, retried on each breaker close until it succeeds once.
+	// It needs the egress to know which uploads are this process's own.
+	ids := make([]string, len(a.cams))
+	for i, cm := range a.cams {
+		ids[i] = cm.cfg.ID
+	}
+	var rcvCtx context.Context
+	rcvCtx, a.rcvCancel = context.WithCancel(context.Background())
+	a.rcvDone = make(chan struct{})
+	go func() { defer close(a.rcvDone); a.recoverLoop(rcvCtx, ids) }()
+
 	// Cameras: supervisor, recorder and clip machine each.
 	var camCtx context.Context
 	camCtx, a.camCancel = context.WithCancel(context.Background())
@@ -379,14 +387,15 @@ func (a *app) start() error {
 			return fmt.Errorf("live.api_token_sha256: %w", err)
 		}
 		a.live, err = live.NewServer(live.Config{
-			Listen:      cfg.Live.Listen,
-			AdvertiseIP: cfg.Live.AdvertiseIP,
-			ICEUDPPort:  cfg.Live.ICEUDPPort,
-			MaxViewers:  cfg.Live.MaxViewers,
-			Verifier:    v,
-			Hubs:        hubs,
-			ViewerQueue: cfg.Defaults.ViewerQueueFrames,
-			Clock:       a.clk,
+			Listen:       cfg.Live.Listen,
+			AdvertiseIP:  cfg.Live.AdvertiseIP,
+			ICEUDPPort:   cfg.Live.ICEUDPPort,
+			MaxViewers:   cfg.Live.MaxViewers,
+			Verifier:     v,
+			Hubs:         hubs,
+			ViewerQueue:  cfg.Defaults.ViewerQueueFrames,
+			ViewerQueues: viewerQueues(cfg),
+			Clock:        a.clk,
 		})
 		if err != nil {
 			return fmt.Errorf("live: %w", err)
@@ -399,11 +408,12 @@ func (a *app) start() error {
 	// RTSP restream.
 	if cfg.Restream.Listen != "" {
 		a.rs, err = restream.New(restream.Config{
-			Listen:      cfg.Restream.Listen,
-			Username:    cfg.Restream.Username,
-			Password:    cfg.Restream.Password,
-			Hubs:        hubs,
-			ViewerQueue: cfg.Defaults.ViewerQueueFrames,
+			Listen:       cfg.Restream.Listen,
+			Username:     cfg.Restream.Username,
+			Password:     cfg.Restream.Password,
+			Hubs:         hubs,
+			ViewerQueue:  cfg.Defaults.ViewerQueueFrames,
+			ViewerQueues: viewerQueues(cfg),
 		})
 		if err != nil {
 			return fmt.Errorf("restream: %w", err)
@@ -539,6 +549,16 @@ func (a *app) startCamera(ctx context.Context, cm *cam, keys zrec.Keys) error {
 	return nil
 }
 
+// viewerQueues is each camera's resolved viewer_queue_frames, the value the
+// memory budget counts for it.
+func viewerQueues(cfg *config.Config) map[string]int {
+	out := make(map[string]int, len(cfg.Cameras))
+	for _, c := range cfg.Cameras {
+		out[c.ID] = c.ViewerQueueFrames
+	}
+	return out
+}
+
 // cameraStatus is the publisher's camera list.
 func (a *app) cameraStatus() []sidecar.CameraStatus {
 	out := make([]sidecar.CameraStatus, 0, len(a.cams))
@@ -568,6 +588,28 @@ func (a *app) onBreaker(s egress.BreakerState) {
 		}
 	}
 	slog.Warn("storage breaker", "state", breakerName(s))
+}
+
+// onPermanent logs, once per breaker opening, the permanent storage failure
+// behind it (design §6.3): a rotated secret key or a denying policy looks
+// like an outage in the breaker state alone.
+func (a *app) onPermanent(err error) {
+	slog.Error("storage permanent failure; the breaker opened and will keep retrying",
+		"error", a.redact(err))
+}
+
+// redact is err's message with the configured storage credentials removed.
+func (a *app) redact(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	msg := err.Error()
+	for _, secret := range []string{a.cfg.Storage.S3.SecretKey, a.cfg.Storage.S3.AccessKey} {
+		if secret != "" {
+			msg = strings.ReplaceAll(msg, secret, "[redacted]")
+		}
+	}
+	return msg
 }
 
 func breakerName(s egress.BreakerState) string {
@@ -670,25 +712,39 @@ func (w *countingWriter) Finalize(f clip.FinalInfo) error {
 // on every breaker close, until it has succeeded once. It only runs while
 // the breaker is closed.
 func (a *app) recoverLoop(ctx context.Context, ids []string) {
-	// Recovery is for the leftovers of a previous process. Every attempt
-	// measures candidate ages against the start of this one, so a retry
-	// minutes later never takes this process's own in-flight uploads, which
-	// are younger than the start, for crashed ones.
+	// Recovery is for the leftovers of a previous process: only candidates
+	// last modified before this process started are considered (Before), and
+	// never a key the egress is writing (InFlight), so a retry minutes later
+	// never takes this process's own uploads for crashed ones.
+	//
+	// A clip interrupted seconds before the restart is younger than the age
+	// filter on the first scan. Such a scan is not the recovery: it is
+	// repeated once those candidates have aged, which every one of them has
+	// by deferredDue (they were all modified before the start).
 	startedAt := a.clk.Now()
+	deferredDue := startedAt.Add(recovery.DefaultOlderThan + recoverySkewMargin)
+	deferred := false
 	for {
-		if st, _ := a.breaker.State(); st == egress.Closed {
-			rep, err := recovery.Run(ctx, recovery.Config{
-				Provider: a.prov, Recoverer: a.rec, Cameras: ids, Now: startedAt,
+		if st, _ := a.breaker.State(); st == egress.Closed && (!deferred || !a.clk.Now().Before(deferredDue)) {
+			res, err := recovery.RunDetailed(ctx, recovery.Config{
+				Provider: a.prov, Recoverer: a.rec, Cameras: ids,
+				Now: a.clk.Now(), Before: startedAt, InFlight: a.eg.InFlight,
 			})
 			if ctx.Err() != nil {
 				return
 			}
-			if err == nil {
+			switch {
+			case err != nil:
+				slog.Warn("startup recovery failed; retrying when storage is reachable", "err", err)
+			case res.Deferred > 0:
+				deferred = true
+				slog.Info("startup recovery: clips from before the start are too young; scanning again once they have aged",
+					"deferred", res.Deferred)
+			default:
 				slog.Info("startup recovery done",
-					"recovered", rep.Recovered, "promoted", rep.Promoted, "discarded", rep.Discarded, "orphaned", rep.Orphaned)
+					"recovered", res.Recovered, "promoted", res.Promoted, "discarded", res.Discarded, "orphaned", res.Orphaned)
 				return
 			}
-			slog.Warn("startup recovery failed; retrying when storage is reachable", "err", err)
 		}
 		t := a.clk.NewTimer(recoveryRetryEvery)
 		select {

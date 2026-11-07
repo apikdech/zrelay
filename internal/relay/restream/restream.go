@@ -44,6 +44,17 @@ type Config struct {
 	// ViewerQueue is the size of each camera subscription's queue
 	// (default 256). A viewer that falls behind resynchronizes at the next IDR.
 	ViewerQueue int
+	// ViewerQueues overrides ViewerQueue per camera id (viewer_queue_frames
+	// of that camera).
+	ViewerQueues map[string]int
+}
+
+// viewerQueue is the subscription queue length of camera.
+func (s *Server) viewerQueue(camera string) int {
+	if n := s.cfg.ViewerQueues[camera]; n > 0 {
+		return n
+	}
+	return s.cfg.ViewerQueue
 }
 
 // Server serves the cameras of one Config. It offers TCP only: UDP would need
@@ -116,7 +127,7 @@ func (s *Server) Start() error {
 	}
 	s.started = true
 	for name, hub := range s.cfg.Hubs {
-		p := &publisher{srv: s, name: name, sub: hub.Subscribe(camera.ClassViewer, s.cfg.ViewerQueue)}
+		p := &publisher{srv: s, name: name, sub: hub.Subscribe(camera.ClassViewer, s.viewerQueue(name))}
 		s.pubs = append(s.pubs, p)
 		s.wg.Add(1)
 		go func() {

@@ -43,6 +43,27 @@ type Config struct {
 	Now time.Time
 	// OlderThan is the minimum age of a candidate; zero means DefaultOlderThan.
 	OlderThan time.Duration
+	// Before, when not zero, is the start of the running process: candidates
+	// last modified at or after it were written by this process's own
+	// writers, not by a crashed predecessor, and are left alone (they are not
+	// counted as deferred either). With it, Now can be the current time
+	// instead of the start, so a candidate that was too young at startup is
+	// recovered by a later scan.
+	Before time.Time
+	// InFlight, when not nil, reports the keys of clips this process is
+	// writing (video and staging sidecar); they are never touched. It guards
+	// against a skewed storage clock making Before misjudge them.
+	InFlight func(key string) bool
+}
+
+// Result is what RunDetailed did.
+type Result struct {
+	Report
+	// Deferred counts candidates (clips, and staging sidecars without a
+	// video) left alone because they were younger than OlderThan. They may
+	// belong to a crash seconds before this scan: scan again once they have
+	// aged.
+	Deferred int
 }
 
 // Report counts what Run did, one count per clip.
@@ -72,8 +93,27 @@ type runner struct {
 	cfg       Config
 	olderThan time.Duration
 	rep       Report
+	deferred  int
 	errs      []error
 }
+
+// own reports whether a candidate written at modTime under the given keys
+// belongs to this process (Config.Before, Config.InFlight).
+func (r *runner) own(modTime time.Time, keys ...string) bool {
+	if !r.cfg.Before.IsZero() && !modTime.Before(r.cfg.Before) {
+		return true
+	}
+	if r.cfg.InFlight != nil {
+		for _, k := range keys {
+			if r.cfg.InFlight(k) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (r *runner) result() Result { return Result{Report: r.rep, Deferred: r.deferred} }
 
 // Run performs startup recovery for every configured camera. A failure on one
 // clip is recorded and the remaining clips are still processed; the returned
@@ -81,11 +121,18 @@ type runner struct {
 // counts what was done. Run is idempotent: a clip handled once leaves nothing
 // for a second Run, and an interrupted Run is completed by the next.
 func Run(ctx context.Context, cfg Config) (Report, error) {
+	res, err := RunDetailed(ctx, cfg)
+	return res.Report, err
+}
+
+// RunDetailed is Run that also reports how many candidates it deferred for
+// being younger than the age filter.
+func RunDetailed(ctx context.Context, cfg Config) (Result, error) {
 	if cfg.Provider == nil || cfg.Recoverer == nil {
-		return Report{}, errors.New("recovery: Provider and Recoverer are required")
+		return Result{}, errors.New("recovery: Provider and Recoverer are required")
 	}
 	if cfg.Now.IsZero() {
-		return Report{}, errors.New("recovery: Now is required")
+		return Result{}, errors.New("recovery: Now is required")
 	}
 	r := &runner{cfg: cfg, olderThan: cfg.OlderThan}
 	if r.olderThan == 0 {
@@ -96,14 +143,14 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	for _, cam := range cfg.Cameras {
 		for _, day := range days {
 			if err := ctx.Err(); err != nil {
-				return r.rep, errors.Join(append(r.errs, err)...)
+				return r.result(), errors.Join(append(r.errs, err)...)
 			}
 			if err := r.scan(ctx, sidecar.DayPrefix(cam, day)); err != nil {
 				r.errs = append(r.errs, err)
 			}
 		}
 	}
-	return r.rep, errors.Join(r.errs...)
+	return r.result(), errors.Join(r.errs...)
 }
 
 // staged is one staging sidecar and the keys derived from it.
@@ -162,7 +209,11 @@ func (r *runner) scan(ctx context.Context, prefix string) error {
 		if hasStaging {
 			paired[inc.Key] = true // handled, even if left alone below
 		}
+		if r.own(inc.ModTime, inc.Key, s.info.Key) {
+			continue // written by this process, not by a crashed one
+		}
 		if r.cfg.Now.Sub(inc.ModTime) < r.olderThan {
+			r.deferred++
 			continue // too young: the clip may still be being written
 		}
 		if hasStaging {
@@ -183,7 +234,11 @@ func (r *runner) scan(ctx context.Context, prefix string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if r.own(s.info.ModTime, s.info.Key, s.video) {
+			continue // written by this process, not by a crashed one
+		}
 		if r.cfg.Now.Sub(s.info.ModTime) < r.olderThan {
+			r.deferred++
 			continue // too young: may belong to a clip still being written
 		}
 		if err := r.unpaired(ctx, s); err != nil {

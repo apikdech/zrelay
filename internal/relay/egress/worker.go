@@ -325,7 +325,7 @@ func (e *Egress) success() {
 func (e *Egress) failure(err error) {
 	e.uploadError(err)
 	if e.cfg.Breaker != nil {
-		e.cfg.Breaker.Failure(e.cfg.Classify(err) == storage.Permanent)
+		e.cfg.Breaker.FailureErr(err, e.cfg.Classify(err) == storage.Permanent)
 	}
 }
 

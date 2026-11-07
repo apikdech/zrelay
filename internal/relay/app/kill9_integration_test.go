@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apikdech/zrelay-v2/internal/clock"
 	"github.com/apikdech/zrelay-v2/internal/relay/app"
 	"github.com/apikdech/zrelay-v2/pkg/sidecar"
 	"github.com/apikdech/zrelay-v2/pkg/storage"
@@ -122,10 +121,11 @@ func TestKill9ProducesIncomplete(t *testing.T) {
 		}
 	}
 
-	// Second life: recovery only recovers candidates older than two minutes
-	// (Contract §7.4). A fake clock three minutes ahead makes the crashed
-	// upload old enough without waiting; the cameras are unreachable so
-	// nothing new is recorded.
+	// Second life, restarted at once on the real clock, as Docker or systemd
+	// would: the crashed upload is only seconds old, younger than the two
+	// minutes recovery waits for (Contract §7.4), so the first scan leaves
+	// it and the relay must scan again once it has aged. The cameras are
+	// unreachable so nothing new is recorded.
 	dead := writeS3Config(t, dir, s3Opts{
 		Endpoint: endpoint, AccessKey: ak, SecretKey: sk, Bucket: bucket, MasterKey: mk,
 		HTTPListen: freePort(t), BacklogMB: 64, MaxMemoryMB: 768, GraceSeconds: 3,
@@ -134,10 +134,7 @@ func TestKill9ProducesIncomplete(t *testing.T) {
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- app.Run(runCtx, loadConfig(t, dead), app.Options{
-			Version: "test",
-			Clock:   clock.NewFake(time.Now().Add(3 * time.Minute)),
-		})
+		done <- app.Run(runCtx, loadConfig(t, dead), app.Options{Version: "test"})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -148,7 +145,7 @@ func TestKill9ProducesIncomplete(t *testing.T) {
 	})
 
 	var scKey string
-	eventually(t, "the recovered sidecar", 60*time.Second, func() bool {
+	eventually(t, "the recovered sidecar", 240*time.Second, func() bool {
 		objs, err := listObjects(ctx, drv, "clips/cam-1")
 		if err != nil {
 			return false

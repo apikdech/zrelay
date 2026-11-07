@@ -60,7 +60,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	rest := fs.Args()
 	switch {
 	case len(rest) >= 1 && rest[0] == "run":
-		return runDaemon(rest[1:], stderr)
+		return runDaemon(rest[1:], stdout, stderr)
 	case len(rest) >= 2 && rest[0] == "config" && rest[1] == "check":
 		return configCheck(rest[2:], stdout, stderr)
 	case len(rest) >= 2 && rest[0] == "onvif" && rest[1] == "discover":
@@ -83,7 +83,7 @@ var runApp = app.Run
 // runDaemon implements "zrelay run" (relay-spec §6): load the config and run
 // the relay until SIGTERM or SIGINT, then shut down within
 // shutdown_grace_seconds.
-func runDaemon(args []string, stderr io.Writer) int {
+func runDaemon(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("zrelay run", stderr)
 	path := fs.String("config", "", "config file `path`")
 	envFile := fs.String("env-file", "", "load KEY=VALUE lines into the environment before resolving ENV: references")
@@ -94,6 +94,10 @@ func runDaemon(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: zrelay run --config <path>")
 		return exitInvalid
 	}
+	// Logs are structured JSON on stdout (relay-spec §4.12, design §8.3).
+	// slog.SetDefault also sends the standard log package's output, which
+	// libraries use, through the handler, so it joins the JSON stream.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(stdout, nil)))
 	if code, ok := loadEnvFile(*envFile, stderr); !ok {
 		return code
 	}

@@ -70,7 +70,18 @@ type Config struct {
 	Hubs map[string]*camera.Hub
 	// ViewerQueue is the per-viewer Hub queue in events (0 means 64).
 	ViewerQueue int
-	Clock       clock.Clock
+	// ViewerQueues overrides ViewerQueue per camera id (viewer_queue_frames
+	// of that camera).
+	ViewerQueues map[string]int
+	Clock        clock.Clock
+}
+
+// viewerQueue is the Hub queue length of a viewer of camera.
+func (s *Server) viewerQueue(camera string) int {
+	if n := s.cfg.ViewerQueues[camera]; n > 0 {
+		return n
+	}
+	return s.cfg.ViewerQueue
 }
 
 // Server answers WHEP requests and streams Hub output to browsers.
