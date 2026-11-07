@@ -29,6 +29,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.zrelay
+      args:
+        VERSION: ${ZRELAY_VERSION:-dev}
     image: zrelay:local
     restart: unless-stopped
     read_only: true
